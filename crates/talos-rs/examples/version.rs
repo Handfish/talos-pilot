@@ -60,5 +60,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Get load average
+    println!("\nLoad Average:");
+    println!("{:-<60}", "");
+    let loads = client.load_avg().await?;
+    for load in &loads {
+        println!(
+            "{}: {:.2} {:.2} {:.2} (1/5/15 min)",
+            load.node, load.load1, load.load5, load.load15
+        );
+    }
+
+    // Get CPU info
+    println!("\nCPU Info:");
+    println!("{:-<60}", "");
+    let cpus = client.cpu_info().await?;
+    for cpu in &cpus {
+        println!(
+            "{}: {} cores @ {:.0} MHz - {}",
+            cpu.node, cpu.cpu_count, cpu.mhz, cpu.model_name
+        );
+    }
+
+    // Get logs for apid service (last 5 lines)
+    println!("\nLogs (apid, last 5 lines):");
+    println!("{:-<60}", "");
+    let logs = client.logs("apid", 5).await?;
+    for line in logs.lines().take(10) {
+        println!("{}", line);
+    }
+
     Ok(())
 }

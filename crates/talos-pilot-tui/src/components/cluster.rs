@@ -11,12 +11,17 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table},
     Frame,
 };
-use talos_rs::{MemInfo, NodeMemory, NodeServices, ServiceInfo, TalosClient, VersionInfo};
+use talos_rs::{
+    MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory, NodeServices, ServiceInfo, TalosClient,
+    VersionInfo,
+};
 
 /// Cluster component showing overview with node list
 pub struct ClusterComponent {
     /// Talos client for API calls
     client: Option<TalosClient>,
+    /// Context name to use (None = use default context)
+    context: Option<String>,
     /// Connection state
     state: ConnectionState,
     /// Version info from nodes
@@ -25,8 +30,14 @@ pub struct ClusterComponent {
     services: Vec<NodeServices>,
     /// Memory info from nodes
     memory: Vec<NodeMemory>,
+    /// Load average from nodes
+    load_avg: Vec<NodeLoadAvg>,
+    /// CPU info from nodes
+    cpu_info: Vec<NodeCpuInfo>,
     /// Currently selected node index
     selected: usize,
+    /// Currently selected service index within the node
+    selected_service: usize,
     /// List state for selection
     list_state: ListState,
     /// Error message if any
@@ -45,22 +56,26 @@ enum ConnectionState {
 
 impl Default for ClusterComponent {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl ClusterComponent {
-    pub fn new() -> Self {
+    pub fn new(context: Option<String>) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
 
         Self {
             client: None,
+            context,
             state: ConnectionState::Disconnected,
             versions: Vec::new(),
             services: Vec::new(),
             memory: Vec::new(),
+            load_avg: Vec::new(),
+            cpu_info: Vec::new(),
             selected: 0,
+            selected_service: 0,
             list_state,
             error: None,
             last_refresh: None,
@@ -74,7 +89,13 @@ impl ClusterComponent {
         // Install crypto provider (needed for rustls)
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        match TalosClient::from_default_config().await {
+        // Use named context if specified, otherwise default
+        let client_result = match &self.context {
+            Some(ctx_name) => TalosClient::from_named_context(ctx_name).await,
+            None => TalosClient::from_default_config().await,
+        };
+
+        match client_result {
             Ok(client) => {
                 self.client = Some(client);
                 self.state = ConnectionState::Connected;
@@ -106,6 +127,16 @@ impl ClusterComponent {
             match client.memory().await {
                 Ok(memory) => self.memory = memory,
                 Err(e) => self.error = Some(format!("Memory error: {}", e)),
+            }
+
+            match client.load_avg().await {
+                Ok(load_avg) => self.load_avg = load_avg,
+                Err(e) => self.error = Some(format!("LoadAvg error: {}", e)),
+            }
+
+            match client.cpu_info().await {
+                Ok(cpu_info) => self.cpu_info = cpu_info,
+                Err(e) => self.error = Some(format!("CPUInfo error: {}", e)),
             }
 
             self.last_refresh = Some(std::time::Instant::now());
@@ -145,6 +176,47 @@ impl ClusterComponent {
             .find(|m| m.node == node_name || (m.node.is_empty() && node_name.is_empty()))
             .and_then(|m| m.meminfo.as_ref())
     }
+
+    /// Get load average for a node
+    fn get_node_load_avg(&self, node_name: &str) -> Option<&NodeLoadAvg> {
+        self.load_avg
+            .iter()
+            .find(|l| l.node == node_name || (l.node.is_empty() && node_name.is_empty()))
+    }
+
+    /// Get CPU info for a node
+    fn get_node_cpu_info(&self, node_name: &str) -> Option<&NodeCpuInfo> {
+        self.cpu_info
+            .iter()
+            .find(|c| c.node == node_name || (c.node.is_empty() && node_name.is_empty()))
+    }
+
+    /// Get the currently selected service ID
+    pub fn selected_service_id(&self) -> Option<String> {
+        if self.versions.is_empty() {
+            return None;
+        }
+        let node_name = &self.versions[self.selected].node;
+        self.get_node_services(node_name)
+            .and_then(|services| services.get(self.selected_service))
+            .map(|s| s.id.clone())
+    }
+
+    /// Get a reference to the client for async operations
+    pub fn client(&self) -> Option<&TalosClient> {
+        self.client.as_ref()
+    }
+
+    /// Get service count for current node
+    fn current_service_count(&self) -> usize {
+        if self.versions.is_empty() {
+            return 0;
+        }
+        let node_name = &self.versions[self.selected].node;
+        self.get_node_services(node_name)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
 }
 
 impl Component for ClusterComponent {
@@ -154,11 +226,41 @@ impl Component for ClusterComponent {
             KeyCode::Char('r') => Ok(Some(Action::Refresh)),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_previous();
+                self.selected_service = 0; // Reset service selection when changing nodes
                 Ok(None)
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.select_next();
+                self.selected_service = 0; // Reset service selection when changing nodes
                 Ok(None)
+            }
+            KeyCode::Tab => {
+                // Cycle through services
+                let count = self.current_service_count();
+                if count > 0 {
+                    self.selected_service = (self.selected_service + 1) % count;
+                }
+                Ok(None)
+            }
+            KeyCode::BackTab => {
+                // Cycle through services backwards
+                let count = self.current_service_count();
+                if count > 0 {
+                    self.selected_service = if self.selected_service == 0 {
+                        count - 1
+                    } else {
+                        self.selected_service - 1
+                    };
+                }
+                Ok(None)
+            }
+            KeyCode::Enter | KeyCode::Char('l') => {
+                // View logs for selected service
+                if let Some(service_id) = self.selected_service_id() {
+                    Ok(Some(Action::ShowNodeDetails(String::new(), service_id)))
+                } else {
+                    Ok(None)
+                }
             }
             _ => Ok(None),
         }
@@ -226,8 +328,14 @@ impl Component for ClusterComponent {
             Span::raw("[r]").fg(Color::Yellow),
             Span::raw(" refresh").dim(),
             Span::raw("  "),
-            Span::raw("[↑↓/jk]").fg(Color::Yellow),
-            Span::raw(" navigate").dim(),
+            Span::raw("[↑↓]").fg(Color::Yellow),
+            Span::raw(" nodes").dim(),
+            Span::raw("  "),
+            Span::raw("[Tab]").fg(Color::Yellow),
+            Span::raw(" services").dim(),
+            Span::raw("  "),
+            Span::raw("[Enter]").fg(Color::Yellow),
+            Span::raw(" logs").dim(),
         ]))
         .block(
             Block::default()
@@ -333,8 +441,8 @@ impl ClusterComponent {
 
         // Build detail layout
         let detail_layout = Layout::vertical([
-            Constraint::Length(6), // Version info
-            Constraint::Length(4), // Resource usage
+            Constraint::Length(5), // Version info
+            Constraint::Length(6), // Resource usage (memory, load, cpu)
             Constraint::Min(0),    // Services
         ])
         .split(inner);
@@ -353,14 +461,13 @@ impl ClusterComponent {
                 Span::raw(" OS/Arch:  ").dim(),
                 Span::raw(format!("{}/{}", version.os, version.arch)).fg(Color::White),
             ]),
-            Line::from(vec![
-                Span::raw(" Go:       ").dim(),
-                Span::raw(&version.go_version).fg(Color::DarkGray),
-            ]),
         ];
         frame.render_widget(Paragraph::new(version_info), detail_layout[0]);
 
-        // Memory info
+        // Resource usage section
+        let mut resource_lines = Vec::new();
+
+        // Memory
         if let Some(mem) = self.get_node_memory(node_name) {
             let usage_pct = mem.usage_percent();
             let usage_color = if usage_pct > 90.0 {
@@ -371,26 +478,63 @@ impl ClusterComponent {
                 Color::Green
             };
 
-            let mem_info = vec![
-                Line::from(vec![
-                    Span::raw(" Memory:   ").dim(),
-                    Span::raw(format!("{:.1}%", usage_pct)).fg(usage_color),
-                    Span::raw(format!(
-                        " ({} MB / {} MB)",
-                        mem.mem_available / 1024 / 1024,
-                        mem.mem_total / 1024 / 1024
-                    ))
-                    .dim(),
-                ]),
-            ];
-            frame.render_widget(Paragraph::new(mem_info), detail_layout[1]);
+            resource_lines.push(Line::from(vec![
+                Span::raw(" Memory:   ").dim(),
+                Span::raw(format!("{:.1}%", usage_pct)).fg(usage_color),
+                Span::raw(format!(
+                    " ({} MB / {} MB)",
+                    mem.mem_available / 1024 / 1024,
+                    mem.mem_total / 1024 / 1024
+                ))
+                .dim(),
+            ]));
         }
+
+        // Load average
+        if let Some(load) = self.get_node_load_avg(node_name) {
+            let load_color = if load.load1 > 4.0 {
+                Color::Red
+            } else if load.load1 > 2.0 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+
+            resource_lines.push(Line::from(vec![
+                Span::raw(" Load:     ").dim(),
+                Span::raw(format!("{:.2}", load.load1)).fg(load_color),
+                Span::raw(format!(" {:.2} {:.2}", load.load5, load.load15)).dim(),
+                Span::raw(" (1/5/15m)").fg(Color::DarkGray),
+            ]));
+        }
+
+        // CPU info
+        if let Some(cpu) = self.get_node_cpu_info(node_name) {
+            resource_lines.push(Line::from(vec![
+                Span::raw(" CPU:      ").dim(),
+                Span::raw(format!("{} cores", cpu.cpu_count)).fg(Color::White),
+                Span::raw(format!(" @ {:.0} MHz", cpu.mhz)).dim(),
+            ]));
+            // Truncate model name if too long
+            let model = if cpu.model_name.len() > 35 {
+                format!("{}...", &cpu.model_name[..32])
+            } else {
+                cpu.model_name.clone()
+            };
+            resource_lines.push(Line::from(vec![
+                Span::raw("           ").dim(),
+                Span::raw(model).fg(Color::DarkGray),
+            ]));
+        }
+
+        frame.render_widget(Paragraph::new(resource_lines), detail_layout[1]);
 
         // Services list
         if let Some(services) = self.get_node_services(node_name) {
             let service_rows: Vec<Row> = services
                 .iter()
-                .map(|svc| {
+                .enumerate()
+                .map(|(i, svc)| {
                     let health_symbol = svc
                         .health
                         .as_ref()
@@ -402,11 +546,19 @@ impl ClusterComponent {
                         _ => Color::DarkGray,
                     };
 
+                    let is_selected = i == self.selected_service;
+                    let row_style = if is_selected {
+                        Style::default().bg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    };
+
                     Row::new(vec![
                         Span::raw(format!(" {} ", health_symbol)).fg(health_color),
                         Span::raw(&svc.id).fg(Color::White),
                         Span::raw(&svc.state).dim(),
                     ])
+                    .style(row_style)
                 })
                 .collect();
 
@@ -421,7 +573,7 @@ impl ClusterComponent {
             .header(
                 Row::new(vec![
                     Span::raw("").dim(),
-                    Span::raw("Service").dim(),
+                    Span::raw("Service [Tab]").dim(),
                     Span::raw("State").dim(),
                 ])
                 .style(Style::default().add_modifier(Modifier::UNDERLINED)),

@@ -60,8 +60,8 @@ async fn main() -> Result<()> {
         tracing::info!("Using context: {}", ctx);
     }
 
-    // Run the TUI
-    let mut app = App::new();
+    // Run the TUI with the specified context
+    let mut app = App::new(cli.context);
     app.run().await?;
 
     tracing::info!("Goodbye!");

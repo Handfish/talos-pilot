@@ -6,6 +6,8 @@ use crate::auth::create_channel;
 use crate::config::{Context, TalosConfig};
 use crate::error::TalosError;
 use crate::proto::machine::machine_service_client::MachineServiceClient;
+use crate::proto::machine::LogsRequest;
+use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -151,6 +153,90 @@ impl TalosClient {
 
         Ok(memories)
     }
+
+    /// Get load average from all configured nodes
+    pub async fn load_avg(&self) -> Result<Vec<NodeLoadAvg>, TalosError> {
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(()));
+
+        let response = client.load_avg(request).await?;
+        let inner = response.into_inner();
+
+        let loads: Vec<NodeLoadAvg> = inner
+            .messages
+            .into_iter()
+            .map(|msg| NodeLoadAvg {
+                node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                load1: msg.load1,
+                load5: msg.load5,
+                load15: msg.load15,
+            })
+            .collect();
+
+        Ok(loads)
+    }
+
+    /// Get CPU information from all configured nodes
+    pub async fn cpu_info(&self) -> Result<Vec<NodeCpuInfo>, TalosError> {
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(()));
+
+        let response = client.cpu_info(request).await?;
+        let inner = response.into_inner();
+
+        let cpus: Vec<NodeCpuInfo> = inner
+            .messages
+            .into_iter()
+            .map(|msg| {
+                let cpu_count = msg.cpu_info.len();
+                let model_name = msg.cpu_info.first().map(|c| c.model_name.clone()).unwrap_or_default();
+                let mhz = msg.cpu_info.first().map(|c| c.cpu_mhz).unwrap_or_default();
+
+                NodeCpuInfo {
+                    node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                    cpu_count,
+                    model_name,
+                    mhz,
+                }
+            })
+            .collect();
+
+        Ok(cpus)
+    }
+
+    /// Get logs for a service (non-streaming, returns last N lines)
+    pub async fn logs(&self, service_id: &str, tail_lines: i32) -> Result<String, TalosError> {
+        let mut client = self.machine_client();
+
+        let request = self.with_nodes(Request::new(LogsRequest {
+            namespace: "system".to_string(),
+            id: service_id.to_string(),
+            driver: 0, // CONTAINERD
+            follow: false,
+            tail_lines,
+        }));
+
+        let response = client.logs(request).await?;
+        let mut stream = response.into_inner();
+
+        let mut logs = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(data) => {
+                    if let Ok(text) = String::from_utf8(data.bytes) {
+                        logs.push_str(&text);
+                    }
+                }
+                Err(e) => {
+                    // Stop on error but return what we have
+                    tracing::warn!("Log stream error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        Ok(logs)
+    }
 }
 
 /// Version information for a node
@@ -214,4 +300,22 @@ impl MemInfo {
         let used = self.mem_total - self.mem_available;
         (used as f32 / self.mem_total as f32) * 100.0
     }
+}
+
+/// Load average for a node
+#[derive(Debug, Clone)]
+pub struct NodeLoadAvg {
+    pub node: String,
+    pub load1: f64,
+    pub load5: f64,
+    pub load15: f64,
+}
+
+/// CPU information for a node
+#[derive(Debug, Clone)]
+pub struct NodeCpuInfo {
+    pub node: String,
+    pub cpu_count: usize,
+    pub model_name: String,
+    pub mhz: f64,
 }

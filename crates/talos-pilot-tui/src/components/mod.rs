@@ -4,9 +4,11 @@
 
 pub mod cluster;
 pub mod home;
+pub mod logs;
 
 pub use cluster::ClusterComponent;
 pub use home::HomeComponent;
+pub use logs::LogsComponent;
 
 use crate::action::Action;
 use color_eyre::Result;

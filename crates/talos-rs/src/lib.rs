@@ -61,6 +61,9 @@ pub mod proto {
     }
 }
 
-pub use client::{MemInfo, NodeMemory, NodeServices, ServiceHealth, ServiceInfo, TalosClient, VersionInfo};
+pub use client::{
+    MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory, NodeServices, ServiceHealth, ServiceInfo,
+    TalosClient, VersionInfo,
+};
 pub use config::{Context, TalosConfig};
 pub use error::TalosError;

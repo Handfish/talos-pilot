@@ -1,23 +1,35 @@
 //! Application state and main loop
 
 use crate::action::Action;
-use crate::components::{ClusterComponent, Component};
+use crate::components::{ClusterComponent, Component, LogsComponent};
 use crate::tui::{self, Tui};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// Current view in the application
+#[derive(Debug, Clone, PartialEq)]
+enum View {
+    Cluster,
+    Logs,
+}
+
 /// Main application state
 pub struct App {
     /// Whether the application should quit
     should_quit: bool,
-    /// The active component
+    /// Current view
+    view: View,
+    /// Cluster component
     cluster: ClusterComponent,
+    /// Logs component (created when viewing logs)
+    logs: Option<LogsComponent>,
     /// Tick rate for animations (ms)
     tick_rate: Duration,
     /// Channel for async action results
     action_rx: mpsc::UnboundedReceiver<AsyncResult>,
+    #[allow(dead_code)] // Will be used for background log streaming
     action_tx: mpsc::UnboundedSender<AsyncResult>,
 }
 
@@ -27,21 +39,24 @@ pub struct App {
 enum AsyncResult {
     Connected,
     Refreshed,
+    LogsLoaded(String),
     Error(String),
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(context: Option<String>) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         Self {
             should_quit: false,
-            cluster: ClusterComponent::new(),
+            view: View::Cluster,
+            cluster: ClusterComponent::new(context),
+            logs: None,
             tick_rate: Duration::from_millis(100),
             action_rx,
             action_tx,
@@ -56,9 +71,6 @@ impl App {
         // Initialize terminal
         let mut terminal = tui::init()?;
 
-        // Start async connection
-        self.start_connect();
-
         // Main loop
         let result = self.main_loop(&mut terminal).await;
 
@@ -68,62 +80,42 @@ impl App {
         result
     }
 
-    /// Start async connection to Talos
-    fn start_connect(&self) {
-        let tx = self.action_tx.clone();
-        tokio::spawn(async move {
-            // Install crypto provider
-            let _ = rustls::crypto::ring::default_provider().install_default();
-
-            match talos_rs::TalosClient::from_default_config().await {
-                Ok(_) => {
-                    let _ = tx.send(AsyncResult::Connected);
-                }
-                Err(e) => {
-                    let _ = tx.send(AsyncResult::Error(e.to_string()));
-                }
-            }
-        });
-    }
-
-    /// Start async refresh (for background refresh without blocking UI)
-    #[allow(dead_code)]
-    fn start_refresh(&mut self) {
-        let tx = self.action_tx.clone();
-        tokio::spawn(async move {
-            // Install crypto provider (idempotent)
-            let _ = rustls::crypto::ring::default_provider().install_default();
-
-            match talos_rs::TalosClient::from_default_config().await {
-                Ok(client) => {
-                    // Fetch data - we'll send results back
-                    let _ = client.version().await;
-                    let _ = tx.send(AsyncResult::Refreshed);
-                }
-                Err(e) => {
-                    let _ = tx.send(AsyncResult::Error(e.to_string()));
-                }
-            }
-        });
-    }
-
     /// Main event loop
     async fn main_loop(&mut self, terminal: &mut Tui) -> Result<()> {
         // Connect on startup
         self.cluster.connect().await?;
 
         loop {
-            // Draw
+            // Draw current view
             terminal.draw(|frame| {
                 let area = frame.area();
-                let _ = self.cluster.draw(frame, area);
+                match self.view {
+                    View::Cluster => {
+                        let _ = self.cluster.draw(frame, area);
+                    }
+                    View::Logs => {
+                        if let Some(logs) = &mut self.logs {
+                            let _ = logs.draw(frame, area);
+                        }
+                    }
+                }
             })?;
 
             // Handle events with timeout
             if event::poll(self.tick_rate)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if let Some(action) = self.cluster.handle_key_event(key)? {
+                        let action = match self.view {
+                            View::Cluster => self.cluster.handle_key_event(key)?,
+                            View::Logs => {
+                                if let Some(logs) = &mut self.logs {
+                                    logs.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(action) = action {
                             self.handle_action(action).await?;
                         }
                     }
@@ -146,8 +138,16 @@ impl App {
                     AsyncResult::Refreshed => {
                         tracing::info!("Data refreshed");
                     }
+                    AsyncResult::LogsLoaded(content) => {
+                        if let Some(logs) = &mut self.logs {
+                            logs.set_logs(content);
+                        }
+                    }
                     AsyncResult::Error(e) => {
                         tracing::error!("Async error: {}", e);
+                        if let Some(logs) = &mut self.logs {
+                            logs.set_error(e);
+                        }
                     }
                 }
             }
@@ -167,10 +167,26 @@ impl App {
             Action::Quit => {
                 self.should_quit = true;
             }
+            Action::Back => {
+                // Return to cluster view
+                self.view = View::Cluster;
+                self.logs = None;
+            }
             Action::Tick => {
                 // Update animations, etc.
-                if let Some(next_action) = self.cluster.update(Action::Tick)? {
-                    Box::pin(self.handle_action(next_action)).await?;
+                match self.view {
+                    View::Cluster => {
+                        if let Some(next_action) = self.cluster.update(Action::Tick)? {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Logs => {
+                        if let Some(logs) = &mut self.logs
+                            && let Some(next_action) = logs.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
                 }
             }
             Action::Resize(_w, _h) => {
@@ -180,10 +196,43 @@ impl App {
                 tracing::info!("Refresh requested");
                 self.cluster.refresh().await?;
             }
+            Action::ShowNodeDetails(_node, service_id) => {
+                // Switch to logs view
+                tracing::info!("Viewing logs for service: {}", service_id);
+
+                // Create logs component
+                let mut logs_component = LogsComponent::new(service_id.clone());
+
+                // Fetch logs asynchronously
+                if let Some(client) = self.cluster.client() {
+                    match client.logs(&service_id, 100).await {
+                        Ok(content) => {
+                            logs_component.set_logs(content);
+                        }
+                        Err(e) => {
+                            logs_component.set_error(e.to_string());
+                        }
+                    }
+                }
+
+                self.logs = Some(logs_component);
+                self.view = View::Logs;
+            }
             _ => {
-                // Forward to component
-                if let Some(next_action) = self.cluster.update(action)? {
-                    Box::pin(self.handle_action(next_action)).await?;
+                // Forward to current component
+                match self.view {
+                    View::Cluster => {
+                        if let Some(next_action) = self.cluster.update(action)? {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Logs => {
+                        if let Some(logs) = &mut self.logs
+                            && let Some(next_action) = logs.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
                 }
             }
         }
