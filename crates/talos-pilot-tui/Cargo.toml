@@ -1,0 +1,28 @@
+[package]
+name = "talos-pilot-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Terminal UI for talos-pilot"
+
+[dependencies]
+talos-pilot-core.workspace = true
+talos-rs.workspace = true
+
+# TUI
+ratatui.workspace = true
+crossterm.workspace = true
+tachyonfx.workspace = true
+
+# Async
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+
+# Error handling
+color-eyre.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true

@@ -1,0 +1,75 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Ken Udovic"]
+license = "MIT"
+repository = "https://github.com/ken-udovic/talos-pilot"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# gRPC
+tonic = { version = "0.12", features = ["tls", "tls-roots", "channel"] }
+prost = "0.13"
+prost-types = "0.13"
+
+# TLS
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+tachyonfx = "0.9"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+base64 = "0.22"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+color-eyre = "0.6"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+dirs-next = "2"
+
+# Internal crates
+talos-rs = { path = "crates/talos-rs" }
+talos-pilot-core = { path = "crates/talos-pilot-core" }
+talos-pilot-tui = { path = "crates/talos-pilot-tui" }
+
+[package]
+name = "talos-pilot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A terminal UI for managing and monitoring Talos Linux Kubernetes clusters"
+
+[dependencies]
+talos-pilot-tui.workspace = true
+talos-rs.workspace = true
+clap.workspace = true
+tokio.workspace = true
+color-eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

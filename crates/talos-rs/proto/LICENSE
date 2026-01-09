@@ -1,0 +1,12 @@
+The proto files in this directory are vendored from the Talos project:
+https://github.com/siderolabs/talos
+
+These files are licensed under the Mozilla Public License Version 2.0 (MPL-2.0).
+
+Copyright (c) Sidero Labs, Inc.
+
+The full text of the MPL-2.0 license can be found at:
+https://www.mozilla.org/en-US/MPL/2.0/
+
+These proto files are used to generate gRPC client code for communicating
+with Talos Linux clusters via the Talos API.

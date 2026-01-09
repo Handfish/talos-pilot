@@ -1,0 +1,17 @@
+[package]
+name = "talos-pilot-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core business logic for talos-pilot"
+
+[dependencies]
+talos-rs.workspace = true
+
+# Serialization
+serde.workspace = true
+chrono.workspace = true
+
+# Error handling
+thiserror.workspace = true
