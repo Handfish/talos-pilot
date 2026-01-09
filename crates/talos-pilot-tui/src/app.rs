@@ -169,6 +169,10 @@ impl App {
                 self.should_quit = true;
             }
             Action::Back => {
+                // Stop streaming if active
+                if let Some(multi_logs) = &mut self.multi_logs {
+                    multi_logs.stop_streaming();
+                }
                 // Return to cluster view
                 self.view = View::Cluster;
                 self.multi_logs = None;
@@ -208,8 +212,11 @@ impl App {
                     service_ids.clone(),
                 );
 
-                // Fetch logs from all services in parallel
+                // Fetch logs from all services in parallel and set up client for streaming
                 if let Some(client) = self.cluster.client() {
+                    // Set the client for streaming capability
+                    multi_logs.set_client(client.clone(), self.tail_lines);
+
                     let service_refs: Vec<&str> = service_ids.iter().map(|s| s.as_str()).collect();
                     match client.logs_multi(&service_refs, self.tail_lines).await {
                         Ok(logs) => {

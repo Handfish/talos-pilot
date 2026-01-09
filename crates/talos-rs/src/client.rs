@@ -12,6 +12,7 @@ use tonic::transport::Channel;
 use tonic::Request;
 
 /// High-level client for Talos API
+#[derive(Clone)]
 pub struct TalosClient {
     channel: Channel,
     /// Target nodes for API requests
@@ -236,6 +237,56 @@ impl TalosClient {
         }
 
         Ok(logs)
+    }
+
+    /// Stream logs from a service (follow mode)
+    /// Returns a receiver that yields log lines as they arrive
+    pub async fn logs_stream(
+        &self,
+        service_id: &str,
+        tail_lines: i32,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<String>, TalosError> {
+        let mut client = self.machine_client();
+
+        let request = self.with_nodes(Request::new(LogsRequest {
+            namespace: "system".to_string(),
+            id: service_id.to_string(),
+            driver: 0, // CONTAINERD
+            follow: true, // Enable streaming
+            tail_lines,
+        }));
+
+        let response = client.logs(request).await?;
+        let mut stream = response.into_inner();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Spawn a task to read from the stream and send to channel
+        tokio::spawn(async move {
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(data) => {
+                        if let Ok(text) = String::from_utf8(data.bytes) {
+                            // Split into lines and send each
+                            for line in text.lines() {
+                                if !line.trim().is_empty()
+                                    && tx.send(line.to_string()).is_err()
+                                {
+                                    // Receiver dropped, stop streaming
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Log stream error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
     }
 
     /// Get logs for multiple services in parallel

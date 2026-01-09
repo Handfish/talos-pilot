@@ -193,6 +193,20 @@ pub struct MultiLogsComponent {
     match_order: Vec<usize>,
     /// Current match index
     current_match: usize,
+
+    /// Talos client for streaming
+    client: Option<talos_rs::TalosClient>,
+    /// Tail lines setting
+    tail_lines: i32,
+    /// Whether streaming is active
+    streaming: bool,
+    /// Channel to receive streamed log lines (service_id, line)
+    stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
+    /// Sender for stream aggregator (kept alive to prevent channel close)
+    #[allow(dead_code)]
+    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
+    /// Animation frame for pulsing indicator
+    pulse_frame: u8,
 }
 
 impl MultiLogsComponent {
@@ -246,6 +260,140 @@ impl MultiLogsComponent {
             match_set: HashSet::new(),
             match_order: Vec::new(),
             current_match: 0,
+            // Streaming fields
+            client: None,
+            tail_lines: 500,
+            streaming: false,
+            stream_rx: None,
+            stream_tx: None,
+            pulse_frame: 0,
+        }
+    }
+
+    /// Set the Talos client for streaming
+    pub fn set_client(&mut self, client: talos_rs::TalosClient, tail_lines: i32) {
+        self.client = Some(client);
+        self.tail_lines = tail_lines;
+    }
+
+    /// Start streaming logs from all active services
+    pub fn start_streaming(&mut self) {
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => return,
+        };
+
+        // Stop any existing streams
+        self.stop_streaming();
+
+        // Create aggregated channel
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        self.stream_tx = Some(tx.clone());
+        self.stream_rx = Some(rx);
+        self.streaming = true;
+
+        // Spawn stream tasks for each active service
+        for service in &self.services {
+            if !service.active {
+                continue;
+            }
+
+            let service_id = service.id.clone();
+            let client = client.clone();
+            let tx = tx.clone();
+            let tail_lines = self.tail_lines;
+
+            tokio::spawn(async move {
+                match client.logs_stream(&service_id, tail_lines).await {
+                    Ok(mut stream_rx) => {
+                        while let Some(line) = stream_rx.recv().await {
+                            if tx.send((service_id.clone(), line)).is_err() {
+                                // Channel closed, stop this stream
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to start log stream for {}: {}", service_id, e);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Stop all log streams
+    pub fn stop_streaming(&mut self) {
+        self.streaming = false;
+        self.stream_tx = None;
+        self.stream_rx = None;
+    }
+
+    /// Check if streaming is active
+    pub fn is_streaming(&self) -> bool {
+        self.streaming
+    }
+
+    /// Process incoming streamed log entries (call on tick)
+    fn process_stream_entries(&mut self) {
+        // First, drain the channel into a local vec to avoid borrow issues
+        let raw_lines: Vec<(String, String)> = {
+            let rx = match &mut self.stream_rx {
+                Some(r) => r,
+                None => return,
+            };
+
+            let mut lines = Vec::new();
+            let mut count = 0;
+            const MAX_PER_TICK: usize = 100; // Prevent overwhelming on large bursts
+
+            while let Ok(item) = rx.try_recv() {
+                lines.push(item);
+                count += 1;
+                if count >= MAX_PER_TICK {
+                    break;
+                }
+            }
+            lines
+        };
+
+        if raw_lines.is_empty() {
+            return;
+        }
+
+        // Now parse entries (can access self freely)
+        let new_entries: Vec<MultiLogEntry> = raw_lines
+            .into_iter()
+            .map(|(service_id, line)| {
+                let color = self.get_service_color(&service_id);
+                Self::parse_line(&line, &service_id, color)
+            })
+            .collect();
+
+        // Add new entries
+        self.entries.extend(new_entries);
+
+        // Re-sort (could optimize with insertion sort for streaming)
+        self.entries.sort_by_key(|e| e.timestamp_sort);
+
+        // Enforce max entries (ring buffer)
+        if self.entries.len() > MAX_ENTRIES {
+            self.entries.drain(0..self.entries.len() - MAX_ENTRIES);
+        }
+
+        // Update counts
+        for service in &mut self.services {
+            service.entry_count = self.entries.iter().filter(|e| e.service_id == service.id).count();
+        }
+        for level_state in &mut self.levels {
+            level_state.entry_count = self.entries.iter().filter(|e| e.level == level_state.level).count();
+        }
+
+        // Rebuild visible indices
+        self.rebuild_visible_indices();
+
+        // Auto-scroll if following
+        if self.following {
+            self.scroll_to_bottom();
         }
     }
 
@@ -1186,11 +1334,29 @@ impl Component for MultiLogsComponent {
                 Ok(None)
             }
 
+            // Toggle streaming (Shift+F)
+            KeyCode::Char('F') => {
+                if self.streaming {
+                    self.stop_streaming();
+                } else {
+                    self.start_streaming();
+                }
+                Ok(None)
+            }
+
             _ => Ok(None),
         }
     }
 
-    fn update(&mut self, _action: Action) -> Result<Option<Action>> {
+    fn update(&mut self, action: Action) -> Result<Option<Action>> {
+        if let Action::Tick = action {
+            // Process any incoming streamed log entries
+            if self.streaming {
+                self.process_stream_entries();
+                // Animate pulse indicator (cycles through 0-7)
+                self.pulse_frame = (self.pulse_frame + 1) % 8;
+            }
+        }
         Ok(None)
     }
 
@@ -1216,7 +1382,16 @@ impl Component for MultiLogsComponent {
         };
 
         // Header with title matching mockup
-        let follow_indicator = if self.following {
+        let follow_indicator = if self.following && self.streaming {
+            // Pulsing LIVE indicator when streaming
+            let pulse_color = match self.pulse_frame {
+                0 | 4 => Color::Green,
+                1 | 3 | 5 | 7 => Color::LightGreen,
+                2 | 6 => Color::Rgb(100, 255, 100), // Brighter green
+                _ => Color::Green,
+            };
+            Span::styled("● LIVE ", Style::default().fg(pulse_color).bold())
+        } else if self.following {
             Span::styled("● LIVE ", Style::default().fg(Color::Green).bold())
         } else {
             Span::styled("○ PAUSED ", Style::default().fg(Color::DarkGray))
@@ -1342,6 +1517,7 @@ impl Component for MultiLogsComponent {
                 Span::raw(" back").dim(),
             ]
         } else {
+            let stream_text = if self.streaming { " stop" } else { " stream" };
             vec![
                 Span::raw(" [s]").fg(Color::Yellow),
                 Span::raw(" services").dim(),
@@ -1354,6 +1530,9 @@ impl Component for MultiLogsComponent {
                 Span::raw("  "),
                 Span::raw("[f]").fg(Color::Yellow),
                 Span::raw(" follow").dim(),
+                Span::raw("  "),
+                Span::raw("[F]").fg(Color::Yellow),
+                Span::raw(stream_text).dim(),
                 Span::raw("  "),
                 Span::raw("[q]").fg(Color::Yellow),
                 Span::raw(" back").dim(),
