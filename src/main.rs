@@ -27,6 +27,10 @@ struct Cli {
     /// Log file path (default: /tmp/talos-pilot.log)
     #[arg(long, default_value = "/tmp/talos-pilot.log")]
     log_file: String,
+
+    /// Number of log lines to fetch (default: 500)
+    #[arg(short, long, default_value = "500")]
+    tail: i32,
 }
 
 #[tokio::main]
@@ -60,8 +64,8 @@ async fn main() -> Result<()> {
         tracing::info!("Using context: {}", ctx);
     }
 
-    // Run the TUI with the specified context
-    let mut app = App::new(cli.context);
+    // Run the TUI with the specified context and tail limit
+    let mut app = App::new(cli.context, cli.tail);
     app.run().await?;
 
     tracing::info!("Goodbye!");

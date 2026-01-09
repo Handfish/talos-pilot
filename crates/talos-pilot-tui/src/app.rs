@@ -25,6 +25,8 @@ pub struct App {
     cluster: ClusterComponent,
     /// Logs component (created when viewing logs)
     logs: Option<LogsComponent>,
+    /// Number of log lines to fetch
+    tail_lines: i32,
     /// Tick rate for animations (ms)
     tick_rate: Duration,
     /// Channel for async action results
@@ -45,18 +47,19 @@ enum AsyncResult {
 
 impl Default for App {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, 500)
     }
 }
 
 impl App {
-    pub fn new(context: Option<String>) -> Self {
+    pub fn new(context: Option<String>, tail_lines: i32) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         Self {
             should_quit: false,
             view: View::Cluster,
             cluster: ClusterComponent::new(context),
             logs: None,
+            tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
             action_tx,
@@ -205,7 +208,7 @@ impl App {
 
                 // Fetch logs asynchronously
                 if let Some(client) = self.cluster.client() {
-                    match client.logs(&service_id, 100).await {
+                    match client.logs(&service_id, self.tail_lines).await {
                         Ok(content) => {
                             logs_component.set_logs(content);
                         }
