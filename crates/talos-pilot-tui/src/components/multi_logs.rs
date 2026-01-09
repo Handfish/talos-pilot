@@ -1246,6 +1246,15 @@ impl MultiLogsComponent {
             let mut spans = Vec::new();
             let is_cursor = self.is_cursor(visible_idx);
 
+            // Line style - highlight cursor and selected lines
+            let line_style = if is_cursor {
+                Style::default().bg(Color::DarkGray)
+            } else if is_selected {
+                Style::default().bg(Color::Rgb(60, 20, 60)) // Dark magenta
+            } else {
+                Style::default()
+            };
+
             // Selection/match/cursor indicator
             if is_selected {
                 spans.push(Span::styled("█", Style::default().fg(Color::Magenta)));
@@ -1257,11 +1266,16 @@ impl MultiLogsComponent {
                 spans.push(Span::raw(" "));
             }
 
-            // Timestamp
+            // Timestamp - use lighter color on highlighted lines
+            let timestamp_color = if is_cursor || is_selected {
+                Color::Gray
+            } else {
+                Color::DarkGray
+            };
             if !entry.timestamp.is_empty() {
                 spans.push(Span::styled(
                     format!("{:>8}", entry.timestamp),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(timestamp_color),
                 ));
             } else {
                 spans.push(Span::raw("        "));
@@ -1303,7 +1317,7 @@ impl MultiLogsComponent {
                         } else {
                             spans.push(Span::raw(chunk));
                         }
-                        lines.push(Line::from(spans.clone()));
+                        lines.push(Line::from(spans.clone()).style(line_style));
                         spans.clear();
                     } else {
                         // Continuation lines: indent to align with message start
@@ -1314,7 +1328,7 @@ impl MultiLogsComponent {
                         } else {
                             cont_spans.push(Span::raw(chunk));
                         }
-                        lines.push(Line::from(cont_spans));
+                        lines.push(Line::from(cont_spans).style(line_style));
                     }
                     chunk_start = chunk_end;
                 }
@@ -1324,7 +1338,7 @@ impl MultiLogsComponent {
                 } else {
                     spans.push(Span::raw(entry.message.clone()));
                 }
-                lines.push(Line::from(spans));
+                lines.push(Line::from(spans).style(line_style));
             } else {
                 // Truncate mode
                 let truncated: String = entry.message.chars().take(available.saturating_sub(1)).collect();
@@ -1334,7 +1348,7 @@ impl MultiLogsComponent {
                     spans.push(Span::raw(truncated));
                 }
                 spans.push(Span::raw("…").dim());
-                lines.push(Line::from(spans));
+                lines.push(Line::from(spans).style(line_style));
             }
         }
 

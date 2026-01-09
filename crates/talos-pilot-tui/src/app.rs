@@ -230,7 +230,21 @@ impl App {
             }
             Action::Refresh => {
                 tracing::info!("Refresh requested");
-                self.cluster.refresh().await?;
+                match self.view {
+                    View::Cluster => {
+                        self.cluster.refresh().await?;
+                    }
+                    View::Etcd => {
+                        if let Some(etcd) = &mut self.etcd {
+                            if let Err(e) = etcd.refresh().await {
+                                etcd.set_error(e.to_string());
+                            }
+                        }
+                    }
+                    View::MultiLogs => {
+                        // Multi-logs handles its own streaming refresh
+                    }
+                }
             }
             Action::ShowMultiLogs(node_ip, node_role, service_ids) => {
                 // Switch to multi-service logs view

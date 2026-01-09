@@ -16,6 +16,17 @@ use talos_rs::{
     VersionInfo,
 };
 
+/// Simple etcd status for header display
+#[derive(Debug, Clone, Default)]
+struct EtcdSummary {
+    /// Number of healthy members
+    healthy: usize,
+    /// Total number of members
+    total: usize,
+    /// Whether etcd has quorum
+    has_quorum: bool,
+}
+
 /// Cluster component showing overview with node list
 pub struct ClusterComponent {
     /// Talos client for API calls
@@ -34,6 +45,8 @@ pub struct ClusterComponent {
     load_avg: Vec<NodeLoadAvg>,
     /// CPU info from nodes
     cpu_info: Vec<NodeCpuInfo>,
+    /// Etcd summary for header
+    etcd_summary: Option<EtcdSummary>,
     /// Currently selected node index
     selected: usize,
     /// Currently selected service index within the node
@@ -74,6 +87,7 @@ impl ClusterComponent {
             memory: Vec::new(),
             load_avg: Vec::new(),
             cpu_info: Vec::new(),
+            etcd_summary: None,
             selected: 0,
             selected_service: 0,
             list_state,
@@ -137,6 +151,23 @@ impl ClusterComponent {
             match client.cpu_info().await {
                 Ok(cpu_info) => self.cpu_info = cpu_info,
                 Err(e) => self.error = Some(format!("CPUInfo error: {}", e)),
+            }
+
+            // Fetch etcd status for header summary
+            match (client.etcd_members().await, client.etcd_status().await) {
+                (Ok(members), Ok(statuses)) => {
+                    let total = members.len();
+                    let healthy = statuses.len(); // Status only returned for reachable members
+                    let quorum_needed = total / 2 + 1;
+                    self.etcd_summary = Some(EtcdSummary {
+                        healthy,
+                        total,
+                        has_quorum: healthy >= quorum_needed,
+                    });
+                }
+                _ => {
+                    // Don't overwrite existing summary on error, just leave it
+                }
             }
 
             self.last_refresh = Some(std::time::Instant::now());
@@ -325,7 +356,25 @@ impl Component for ClusterComponent {
             ConnectionState::Error(_) => Span::raw(" ✗ ").fg(Color::Red),
         };
 
-        let header = Paragraph::new(Line::from(vec![
+        // Build etcd status indicator for header
+        let etcd_spans = if let Some(etcd) = &self.etcd_summary {
+            let (indicator, color) = if etcd.has_quorum && etcd.healthy == etcd.total {
+                ("●", Color::Green)
+            } else if etcd.has_quorum {
+                ("◐", Color::Yellow)
+            } else {
+                ("✗", Color::Red)
+            };
+            vec![
+                Span::raw("    etcd ").dim(),
+                Span::styled(indicator, Style::default().fg(color)),
+                Span::raw(format!(" {}/{}", etcd.healthy, etcd.total)).dim(),
+            ]
+        } else {
+            vec![]
+        };
+
+        let mut header_spans = vec![
             Span::raw(" talos-pilot ").bold().fg(Color::Cyan),
             status_indicator,
             Span::raw(match &self.state {
@@ -335,7 +384,10 @@ impl Component for ClusterComponent {
                 ConnectionState::Error(e) => e.as_str(),
             })
             .dim(),
-        ]))
+        ];
+        header_spans.extend(etcd_spans);
+
+        let header = Paragraph::new(Line::from(header_spans))
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)

@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
 use talos_rs::{EtcdAlarm, EtcdMemberInfo, EtcdMemberStatus, TalosClient};
@@ -75,8 +75,8 @@ pub struct EtcdComponent {
 
     /// Selected member index
     selected: usize,
-    /// List state for rendering
-    list_state: ListState,
+    /// Table state for rendering
+    table_state: TableState,
 
     /// Loading state
     loading: bool,
@@ -98,8 +98,8 @@ impl Default for EtcdComponent {
 
 impl EtcdComponent {
     pub fn new() -> Self {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
 
         Self {
             members: Vec::new(),
@@ -108,7 +108,7 @@ impl EtcdComponent {
             total_db_size: 0,
             revision: 0,
             selected: 0,
-            list_state,
+            table_state,
             loading: true,
             error: None,
             last_refresh: None,
@@ -181,6 +181,14 @@ impl EtcdComponent {
             })
             .collect();
 
+        tracing::info!("Loaded {} etcd members", self.members.len());
+
+        // Reset selection if needed
+        if !self.members.is_empty() && self.selected >= self.members.len() {
+            self.selected = 0;
+        }
+        self.table_state.select(Some(self.selected));
+
         // Calculate quorum state
         self.calculate_quorum_state();
 
@@ -236,7 +244,7 @@ impl EtcdComponent {
     fn select_prev(&mut self) {
         if !self.members.is_empty() {
             self.selected = self.selected.saturating_sub(1);
-            self.list_state.select(Some(self.selected));
+            self.table_state.select(Some(self.selected));
         }
     }
 
@@ -244,7 +252,7 @@ impl EtcdComponent {
     fn select_next(&mut self) {
         if !self.members.is_empty() {
             self.selected = (self.selected + 1).min(self.members.len() - 1);
-            self.list_state.select(Some(self.selected));
+            self.table_state.select(Some(self.selected));
         }
     }
 
@@ -294,18 +302,14 @@ impl EtcdComponent {
 
     /// Draw the member table
     fn draw_member_table(&mut self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self
+        let rows: Vec<Row> = self
             .members
             .iter()
-            .enumerate()
-            .map(|(idx, member)| {
-                let is_selected = idx == self.selected;
-                let cursor = if is_selected { ">" } else { " " };
-
+            .map(|member| {
                 let (status_indicator, status_text, status_color) = match &member.status {
-                    Some(s) if s.is_leader() => ("★", "Leader", Color::Magenta),
-                    Some(_) => ("●", "Follow", Color::Green),
-                    None => ("✗", "DOWN", Color::Red),
+                    Some(s) if s.is_leader() => ("*", "Leader", Color::Magenta),
+                    Some(_) => ("o", "Follow", Color::Green),
+                    None => ("x", "DOWN", Color::Red),
                 };
 
                 let db_size = member
@@ -323,7 +327,13 @@ impl EtcdComponent {
                 let errors = member
                     .status
                     .as_ref()
-                    .map(|s| s.errors.len().to_string())
+                    .map(|s| {
+                        if s.errors.is_empty() {
+                            "-".to_string()
+                        } else {
+                            s.errors.len().to_string()
+                        }
+                    })
                     .unwrap_or_else(|| "-".to_string());
 
                 // Get endpoint from client_urls
@@ -334,51 +344,46 @@ impl EtcdComponent {
                     .map(|u| u.replace("https://", "").replace("http://", ""))
                     .unwrap_or_else(|| "unknown".to_string());
 
-                let line = Line::from(vec![
-                    Span::styled(cursor, Style::default().fg(Color::Cyan)),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<12}", member.info.hostname),
-                        Style::default().add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(status_indicator, Style::default().fg(status_color)),
-                    Span::raw(" "),
-                    Span::styled(format!("{:<8}", status_text), Style::default().fg(status_color)),
-                    Span::raw(format!("{:<20}", endpoint)),
-                    Span::raw(format!("{:>10}", db_size)),
-                    Span::raw(format!("{:>12}", raft_idx)),
-                    Span::raw(format!("{:>8}", errors)),
-                ]);
+                let status_full = format!("{} {}", status_indicator, status_text);
 
-                ListItem::new(line)
+                Row::new(vec![
+                    Cell::from(member.info.hostname.clone()),
+                    Cell::from(status_full).style(Style::default().fg(status_color)),
+                    Cell::from(endpoint),
+                    Cell::from(db_size),
+                    Cell::from(raft_idx),
+                    Cell::from(errors),
+                ])
             })
             .collect();
 
-        // Header
-        let header = Line::from(vec![
-            Span::raw("  "),
-            Span::styled("MEMBER      ", Style::default().add_modifier(Modifier::DIM)),
-            Span::raw("   "),
-            Span::styled("STATUS  ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(format!("{:<20}", "ENDPOINT"), Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(format!("{:>10}", "DB SIZE"), Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(format!("{:>12}", "RAFT IDX"), Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(format!("{:>8}", "ERRORS"), Style::default().add_modifier(Modifier::DIM)),
-        ]);
+        let header = Row::new(vec![
+            Cell::from("MEMBER"),
+            Cell::from("STATUS"),
+            Cell::from("ENDPOINT"),
+            Cell::from("DB SIZE"),
+            Cell::from("RAFT IDX"),
+            Cell::from("ERRORS"),
+        ])
+        .style(Style::default().add_modifier(Modifier::DIM))
+        .bottom_margin(1);
 
-        let header_para = Paragraph::new(header);
-        let header_area = Rect { height: 1, ..area };
-        frame.render_widget(header_para, header_area);
+        // Use proportional column widths to fill available space
+        let widths = [
+            Constraint::Min(12),         // MEMBER
+            Constraint::Length(10),      // STATUS
+            Constraint::Percentage(30),  // ENDPOINT (flexible)
+            Constraint::Length(10),      // DB SIZE
+            Constraint::Length(12),      // RAFT IDX
+            Constraint::Length(8),       // ERRORS
+        ];
 
-        // List
-        let list_area = Rect {
-            y: area.y + 1,
-            height: area.height.saturating_sub(1),
-            ..area
-        };
-        let list = List::new(items);
-        frame.render_stateful_widget(list, list_area, &mut self.list_state);
+        let table = Table::new(rows, widths)
+            .header(header)
+            .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol("> ");
+
+        frame.render_stateful_widget(table, area, &mut self.table_state);
     }
 
     /// Draw the detail section for selected member
@@ -528,14 +533,35 @@ impl Component for EtcdComponent {
                 Ok(None)
             }
             KeyCode::Char('r') => Ok(Some(Action::Refresh)),
-            // TODO: Add log viewing actions
             KeyCode::Char('l') => {
                 // View etcd logs for all control plane nodes
-                Ok(None)
+                // Collect all member hostnames and show etcd logs for each
+                if self.members.is_empty() {
+                    return Ok(None);
+                }
+                // Use first member's hostname as the "node" but show all etcd services
+                // In practice, with the current API this shows etcd logs from all connected nodes
+                let node = self.members.first()
+                    .map(|m| m.info.hostname.clone())
+                    .unwrap_or_else(|| "controlplane".to_string());
+                Ok(Some(Action::ShowMultiLogs(
+                    node,
+                    "controlplane".to_string(),
+                    vec!["etcd".to_string()],
+                )))
             }
             KeyCode::Enter => {
                 // View etcd logs for selected member
-                Ok(None)
+                if let Some(member) = self.selected_member() {
+                    let node = member.info.hostname.clone();
+                    Ok(Some(Action::ShowMultiLogs(
+                        node,
+                        "controlplane".to_string(),
+                        vec!["etcd".to_string()],
+                    )))
+                } else {
+                    Ok(None)
+                }
             }
             _ => Ok(None),
         }
@@ -546,26 +572,6 @@ impl Component for EtcdComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
-        // Layout:
-        // - Header/title: 1 line (handled by parent)
-        // - Status bar: 2 lines
-        // - Member table: dynamic (header + members)
-        // - Detail section: 6 lines
-        // - Alarms: 2 lines
-        // - Footer: 1 line
-
-        let member_count = self.members.len().max(1);
-        let table_height = (member_count + 2) as u16; // header + members + padding
-
-        let chunks = Layout::vertical([
-            Constraint::Length(2),              // Status bar
-            Constraint::Length(table_height),   // Member table
-            Constraint::Length(6),              // Detail section
-            Constraint::Length(2),              // Alarms
-            Constraint::Length(1),              // Footer
-        ])
-        .split(area);
-
         if self.loading {
             let loading = Paragraph::new("Loading...")
                 .style(Style::default().fg(Color::DarkGray));
@@ -580,11 +586,57 @@ impl Component for EtcdComponent {
             return Ok(());
         }
 
-        self.draw_status_bar(frame, chunks[0]);
-        self.draw_member_table(frame, chunks[1]);
-        self.draw_detail_section(frame, chunks[2]);
-        self.draw_alarms(frame, chunks[3]);
-        self.draw_footer(frame, chunks[4]);
+        // Calculate dynamic heights
+        let member_count = self.members.len().max(1);
+        let table_height = (member_count + 2) as u16; // header + members + padding
+        let detail_height = 6u16;
+        let alarm_height = if self.alarms.is_empty() { 2 } else { (self.alarms.len() + 2) as u16 };
+
+        // Total content height (excluding flexible space)
+        let content_height = 3 + table_height + 1 + detail_height + 1 + alarm_height + 1;
+
+        // Layout: group content at top with small gaps, footer pinned to bottom
+        let chunks = if area.height > content_height + 10 {
+            // Large terminal: add breathing room between sections
+            Layout::vertical([
+                Constraint::Length(3),              // Status bar (with padding)
+                Constraint::Length(table_height),   // Member table
+                Constraint::Length(2),              // Spacer
+                Constraint::Length(detail_height),  // Detail section
+                Constraint::Length(2),              // Spacer
+                Constraint::Length(alarm_height),   // Alarms
+                Constraint::Fill(1),                // Flexible space before footer
+                Constraint::Length(1),              // Footer
+            ])
+            .split(area)
+        } else {
+            // Compact terminal: minimal spacing
+            Layout::vertical([
+                Constraint::Length(2),              // Status bar
+                Constraint::Length(table_height),   // Member table
+                Constraint::Length(detail_height),  // Detail section
+                Constraint::Length(alarm_height),   // Alarms
+                Constraint::Fill(1),                // Flexible space
+                Constraint::Length(1),              // Footer
+            ])
+            .split(area)
+        };
+
+        if area.height > content_height + 10 {
+            // Large terminal layout indices
+            self.draw_status_bar(frame, chunks[0]);
+            self.draw_member_table(frame, chunks[1]);
+            self.draw_detail_section(frame, chunks[3]);
+            self.draw_alarms(frame, chunks[5]);
+            self.draw_footer(frame, chunks[7]);
+        } else {
+            // Compact layout indices
+            self.draw_status_bar(frame, chunks[0]);
+            self.draw_member_table(frame, chunks[1]);
+            self.draw_detail_section(frame, chunks[2]);
+            self.draw_alarms(frame, chunks[3]);
+            self.draw_footer(frame, chunks[5]);
+        }
 
         Ok(())
     }
