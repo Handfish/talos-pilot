@@ -15,6 +15,9 @@ ratatui.workspace = true
 crossterm.workspace = true
 tachyonfx.workspace = true
 
+# TLS (for crypto provider)
+rustls.workspace = true
+
 # Async
 tokio.workspace = true
 tokio-stream.workspace = true

@@ -2,8 +2,10 @@
 //!
 //! Based on the ratatui Component template pattern.
 
+pub mod cluster;
 pub mod home;
 
+pub use cluster::ClusterComponent;
 pub use home::HomeComponent;
 
 use crate::action::Action;

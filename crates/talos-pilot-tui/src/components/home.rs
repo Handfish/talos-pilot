@@ -13,6 +13,7 @@ use ratatui::{
 };
 
 /// Home component showing the main dashboard
+#[allow(dead_code)]
 pub struct HomeComponent {
     /// Whether the component is active
     active: bool,

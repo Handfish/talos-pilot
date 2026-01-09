@@ -1806,6 +1806,7 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "rustls",
  "tachyonfx",
  "talos-pilot-core",
  "talos-rs",
