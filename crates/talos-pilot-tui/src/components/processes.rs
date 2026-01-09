@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
+use std::collections::HashMap;
 use std::time::Instant;
 use talos_rs::{CpuStat, ProcessInfo, ProcessState, TalosClient};
 
@@ -23,14 +24,16 @@ const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortBy {
     #[default]
-    Cpu,
+    CpuPercent,
+    CpuTime,
     Mem,
 }
 
 impl SortBy {
     pub fn label(&self) -> &'static str {
         match self {
-            SortBy::Cpu => "CPU",
+            SortBy::CpuPercent => "CPU%",
+            SortBy::CpuTime => "TIME",
             SortBy::Mem => "MEM",
         }
     }
@@ -88,6 +91,11 @@ pub struct ProcessesComponent {
     sort_by: SortBy,
     /// Tree view enabled
     tree_view: bool,
+    /// Tree root PID (None = full tree from init, Some(pid) = subtree)
+    tree_root: Option<i32>,
+
+    /// State filter (None = show all, Some(state) = show only that state)
+    state_filter: Option<ProcessState>,
 
     /// Current mode
     mode: Mode,
@@ -111,6 +119,15 @@ pub struct ProcessesComponent {
     cpu_usage_percent: f32,
     /// Number of CPUs on node
     cpu_count: usize,
+    /// Load average (1, 5, 15 min)
+    load_avg: (f64, f64, f64),
+
+    /// Previous CPU time per process (for calculating per-process CPU %)
+    prev_cpu_times: HashMap<i32, f64>,
+    /// Calculated CPU percentage per process
+    cpu_percentages: HashMap<i32, f32>,
+    /// Time of last CPU measurement
+    last_cpu_sample: Option<Instant>,
 
     /// Loading state
     loading: bool,
@@ -145,8 +162,10 @@ impl ProcessesComponent {
             display_entries: Vec::new(),
             selected: 0,
             table_state,
-            sort_by: SortBy::Cpu,
+            sort_by: SortBy::CpuPercent,
             tree_view: false,
+            tree_root: None,
+            state_filter: None,
             mode: Mode::Normal,
             filter_input: String::new(),
             filter: None,
@@ -157,6 +176,10 @@ impl ProcessesComponent {
             prev_cpu_stat: None,
             cpu_usage_percent: 0.0,
             cpu_count: 0,
+            load_avg: (0.0, 0.0, 0.0),
+            prev_cpu_times: HashMap::new(),
+            cpu_percentages: HashMap::new(),
+            last_cpu_sample: None,
             loading: true,
             error: None,
             auto_refresh: true,
@@ -185,13 +208,14 @@ impl ProcessesComponent {
 
         self.loading = true;
 
-        // Fetch processes, memory info, system stats, and CPU info in parallel
+        // Fetch processes, memory info, system stats, CPU info, and load avg in parallel
         let timeout = std::time::Duration::from_secs(10);
-        let (procs_result, mem_result, stat_result, cpu_info_result) = tokio::join!(
+        let (procs_result, mem_result, stat_result, cpu_info_result, load_result) = tokio::join!(
             tokio::time::timeout(timeout, client.processes()),
             tokio::time::timeout(timeout, client.memory()),
             tokio::time::timeout(timeout, client.system_stat()),
             tokio::time::timeout(timeout, client.cpu_info()),
+            tokio::time::timeout(timeout, client.load_avg()),
         );
 
         // Handle memory result (for total memory and usage)
@@ -209,6 +233,13 @@ impl ProcessesComponent {
         if let Ok(Ok(cpu_info)) = cpu_info_result {
             if let Some(node_cpu) = cpu_info.into_iter().next() {
                 self.cpu_count = node_cpu.cpu_count;
+            }
+        }
+
+        // Handle load average result
+        if let Ok(Ok(load_info)) = load_result {
+            if let Some(node_load) = load_info.into_iter().next() {
+                self.load_avg = (node_load.load1, node_load.load5, node_load.load15);
             }
         }
 
@@ -240,6 +271,7 @@ impl ProcessesComponent {
         // Find processes for our node
         if let Some(node_data) = node_processes.into_iter().next() {
             self.processes = node_data.processes;
+            self.calculate_cpu_percentages();
             self.calculate_state_counts();
             self.sort_processes();
             self.apply_filter();
@@ -275,10 +307,57 @@ impl ProcessesComponent {
         }
     }
 
+    /// Calculate per-process CPU percentages from delta
+    fn calculate_cpu_percentages(&mut self) {
+        let now = Instant::now();
+
+        // Calculate elapsed time since last sample
+        let elapsed_secs = self.last_cpu_sample
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+
+        // Need at least some time elapsed to calculate percentage
+        if elapsed_secs > 0.1 && self.cpu_count > 0 {
+            // Calculate percentage for each process
+            for proc in &self.processes {
+                if let Some(&prev_time) = self.prev_cpu_times.get(&proc.pid) {
+                    let delta = proc.cpu_time - prev_time;
+                    // CPU % = (delta_cpu_time / elapsed_wall_time) * 100 / num_cpus
+                    // Actually for "percentage of one CPU", we don't divide by num_cpus
+                    // This matches htop behavior where a process can show >100% on multi-core
+                    let pct = ((delta / elapsed_secs) * 100.0) as f32;
+                    self.cpu_percentages.insert(proc.pid, pct.max(0.0));
+                }
+            }
+        }
+
+        // Store current CPU times for next calculation
+        self.prev_cpu_times.clear();
+        for proc in &self.processes {
+            self.prev_cpu_times.insert(proc.pid, proc.cpu_time);
+        }
+        self.last_cpu_sample = Some(now);
+    }
+
+    /// Get CPU percentage for a process (returns None if not yet calculated)
+    fn get_cpu_percent(&self, pid: i32) -> Option<f32> {
+        self.cpu_percentages.get(&pid).copied()
+    }
+
     /// Sort processes based on current sort order
     fn sort_processes(&mut self) {
         match self.sort_by {
-            SortBy::Cpu => {
+            SortBy::CpuPercent => {
+                // Sort by CPU percentage
+                let cpu_pcts = &self.cpu_percentages;
+                self.processes.sort_by(|a, b| {
+                    let a_pct = cpu_pcts.get(&a.pid).unwrap_or(&0.0);
+                    let b_pct = cpu_pcts.get(&b.pid).unwrap_or(&0.0);
+                    b_pct.partial_cmp(a_pct).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            SortBy::CpuTime => {
+                // Sort by cumulative CPU time
                 self.processes.sort_by(|a, b| {
                     b.cpu_time.partial_cmp(&a.cpu_time).unwrap_or(std::cmp::Ordering::Equal)
                 });
@@ -291,21 +370,31 @@ impl ProcessesComponent {
 
     /// Apply current filter to processes
     fn apply_filter(&mut self) {
-        self.filtered_indices = if let Some(ref filter) = self.filter {
-            let filter_lower = filter.to_lowercase();
-            self.processes
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
+        self.filtered_indices = self.processes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                // Apply text filter
+                let text_match = if let Some(ref filter) = self.filter {
+                    let filter_lower = filter.to_lowercase();
                     p.command.to_lowercase().contains(&filter_lower)
                         || p.args.to_lowercase().contains(&filter_lower)
                         || p.executable.to_lowercase().contains(&filter_lower)
-                })
-                .map(|(i, _)| i)
-                .collect()
-        } else {
-            (0..self.processes.len()).collect()
-        };
+                } else {
+                    true
+                };
+
+                // Apply state filter
+                let state_match = if let Some(ref state_filter) = self.state_filter {
+                    std::mem::discriminant(&p.state) == std::mem::discriminant(state_filter)
+                } else {
+                    true
+                };
+
+                text_match && state_match
+            })
+            .map(|(i, _)| i)
+            .collect();
         // Rebuild display list after filtering
         self.rebuild_display_list();
     }
@@ -339,8 +428,34 @@ impl ProcessesComponent {
         let mut children_map: HashMap<i32, Vec<usize>> = HashMap::new();
         let mut root_indices: Vec<usize> = Vec::new();
 
+        // Determine which processes are descendants of tree_root (if set)
+        let descendants: Option<std::collections::HashSet<i32>> = self.tree_root.map(|root_pid| {
+            let mut desc = std::collections::HashSet::new();
+            desc.insert(root_pid);
+            // Keep adding children until no more found
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for proc in &self.processes {
+                    if desc.contains(&proc.ppid) && !desc.contains(&proc.pid) {
+                        desc.insert(proc.pid);
+                        changed = true;
+                    }
+                }
+            }
+            desc
+        });
+
         for &idx in &self.filtered_indices {
             let proc = &self.processes[idx];
+
+            // If subtree mode, skip processes not in the subtree
+            if let Some(ref desc) = descendants {
+                if !desc.contains(&proc.pid) {
+                    continue;
+                }
+            }
+
             let ppid = proc.ppid;
 
             // Check if parent exists in our filtered list
@@ -348,12 +463,25 @@ impl ProcessesComponent {
                 .map(|&parent_idx| self.filtered_indices.contains(&parent_idx))
                 .unwrap_or(false);
 
-            if ppid == 0 || ppid == proc.pid || !parent_in_list {
-                // Root process (no parent, or parent not in list)
-                root_indices.push(idx);
+            // In subtree mode, root is the tree_root process
+            let is_root = if let Some(root_pid) = self.tree_root {
+                proc.pid == root_pid
             } else {
-                // Has a visible parent
-                children_map.entry(ppid).or_default().push(idx);
+                ppid == 0 || ppid == proc.pid || !parent_in_list
+            };
+
+            if is_root {
+                root_indices.push(idx);
+            } else if parent_in_list {
+                // Has a visible parent (and not filtered out by subtree)
+                if descendants.as_ref().map_or(true, |d| d.contains(&ppid)) {
+                    children_map.entry(ppid).or_default().push(idx);
+                } else {
+                    // Parent not in subtree, treat as root
+                    root_indices.push(idx);
+                }
+            } else {
+                root_indices.push(idx);
             }
         }
 
@@ -476,7 +604,20 @@ impl ProcessesComponent {
     /// Draw the header
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let sort_indicator = format!("[{}▼]", self.sort_by.label());
-        let tree_indicator = if self.tree_view { "[TREE]" } else { "" };
+        let tree_indicator = if self.tree_view {
+            if let Some(root_pid) = self.tree_root {
+                // Find root process name
+                let root_name = self.processes.iter()
+                    .find(|p| p.pid == root_pid)
+                    .map(|p| p.command.as_str())
+                    .unwrap_or("?");
+                format!("[TREE:{}/{}]", root_pid, root_name)
+            } else {
+                "[TREE]".to_string()
+            }
+        } else {
+            String::new()
+        };
         let proc_count = format!("{} procs", self.display_entries.len());
 
         // System resources info
@@ -520,7 +661,19 @@ impl ProcessesComponent {
 
         if self.tree_view {
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(tree_indicator, Style::default().fg(Color::Green)));
+            let tree_color = if self.tree_root.is_some() { Color::Cyan } else { Color::Green };
+            spans.push(Span::styled(tree_indicator, Style::default().fg(tree_color)));
+        }
+
+        // State filter indicator
+        if let Some(ref state_filter) = self.state_filter {
+            spans.push(Span::raw(" "));
+            let (label, color) = match state_filter {
+                ProcessState::Zombie => ("ZOMBIE", Color::Red),
+                ProcessState::DiskSleep => ("DISK-WAIT", Color::Yellow),
+                _ => ("FILTER", Color::White),
+            };
+            spans.push(Span::styled(format!("[{}]", label), Style::default().fg(color)));
         }
 
         spans.push(Span::raw(" "));
@@ -560,13 +713,33 @@ impl ProcessesComponent {
         let (mem_bar, mem_color) = Self::usage_bar(self.memory_usage_percent);
         let mem_pct = format!("{:>3.0}%", self.memory_usage_percent);
 
+        // Load average with color coding (red if > cpu_count, yellow if > cpu_count*0.7)
+        let load_color = |load: f64| {
+            let threshold = self.cpu_count as f64;
+            if load > threshold {
+                Color::Red
+            } else if load > threshold * 0.7 {
+                Color::Yellow
+            } else {
+                Color::Green
+            }
+        };
+
         let mut spans = vec![
             Span::raw("CPU "),
             Span::styled(cpu_bar, Style::default().fg(cpu_color)),
             Span::raw(format!(" {} ", cpu_pct)),
-            Span::raw("   MEM "),
+            Span::raw("  MEM "),
             Span::styled(mem_bar, Style::default().fg(mem_color)),
             Span::raw(format!(" {} ", mem_pct)),
+            Span::raw("  "),
+            // Load average
+            Span::styled("Load: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(format!("{:.2}", self.load_avg.0), Style::default().fg(load_color(self.load_avg.0))),
+            Span::raw(" "),
+            Span::styled(format!("{:.2}", self.load_avg.1), Style::default().fg(load_color(self.load_avg.1))),
+            Span::raw(" "),
+            Span::styled(format!("{:.2}", self.load_avg.2), Style::default().fg(load_color(self.load_avg.2))),
             Span::raw("  "),
         ];
 
@@ -657,7 +830,6 @@ impl ProcessesComponent {
     fn draw_process_table(&mut self, frame: &mut Frame, area: Rect) {
         // Collect row data first to avoid borrow conflicts
         let max_cmd_len = area.width.saturating_sub(45) as usize;
-        let max_cpu = self.processes.iter().map(|p| p.cpu_time).fold(0.0, f64::max);
         let max_mem = self.processes.iter().map(|p| p.resident_memory).max().unwrap_or(0);
 
         let row_data: Vec<_> = self
@@ -666,18 +838,18 @@ impl ProcessesComponent {
             .filter_map(|entry| {
                 let proc = self.processes.get(entry.process_idx)?;
 
-                // Calculate CPU intensity color inline
-                let cpu_color = if max_cpu == 0.0 {
-                    Color::default()
+                // Get CPU percentage (or 0 if not calculated yet)
+                let cpu_pct = self.cpu_percentages.get(&proc.pid).copied().unwrap_or(0.0);
+
+                // CPU color based on percentage thresholds
+                let cpu_color = if cpu_pct > 50.0 {
+                    Color::Red
+                } else if cpu_pct > 10.0 {
+                    Color::Yellow
+                } else if cpu_pct > 0.1 {
+                    Color::Green
                 } else {
-                    let ratio = proc.cpu_time / max_cpu;
-                    if ratio > 0.7 {
-                        Color::Red
-                    } else if ratio > 0.3 {
-                        Color::Yellow
-                    } else {
-                        Color::default()
-                    }
+                    Color::default()
                 };
 
                 // Calculate MEM intensity color
@@ -695,7 +867,8 @@ impl ProcessesComponent {
                 };
 
                 let state_color = Self::state_color(&proc.state);
-                let cpu_str = proc.cpu_time_human();
+                // Show CPU as percentage + time (show 0.0% on first sample since we have no delta yet)
+                let cpu_str = format!("{:>5.1}%  {}", cpu_pct, proc.cpu_time_human());
                 let mem_str = proc.resident_memory_human();
                 let command = proc.display_command();
 
@@ -726,27 +899,43 @@ impl ProcessesComponent {
                     full_command
                 };
 
-                Some((proc.pid, cpu_str, mem_str, proc.state.short(), cmd_display, cpu_color, mem_color, state_color))
+                // Highlight interesting states (running, zombie, disk-wait) instead of dimming sleeping
+                let is_interesting = matches!(proc.state, ProcessState::Running | ProcessState::Zombie | ProcessState::DiskSleep);
+                Some((proc.pid, cpu_str, mem_str, proc.state.short(), cmd_display, cpu_color, mem_color, state_color, is_interesting))
             })
             .collect();
 
         let rows: Vec<Row> = row_data
             .into_iter()
-            .map(|(pid, cpu_str, mem_str, state, cmd_display, cpu_color, mem_color, state_color)| {
+            .map(|(pid, cpu_str, mem_str, state, cmd_display, cpu_color, mem_color, state_color, is_interesting)| {
+                // Highlight interesting processes (running, zombie, disk-wait) with bold
+                let base_style = if is_interesting {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
                 Row::new(vec![
-                    Cell::from(format!("{:>6}", pid)),
-                    Cell::from(format!("{:>8}", cpu_str)).style(Style::default().fg(cpu_color)),
-                    Cell::from(format!("{:>8}", mem_str)).style(Style::default().fg(mem_color)),
-                    Cell::from(state).style(Style::default().fg(state_color)),
-                    Cell::from(cmd_display),
+                    Cell::from(format!("{:>6}", pid)).style(base_style),
+                    Cell::from(cpu_str).style(base_style.fg(cpu_color)),
+                    Cell::from(format!("{:>8}", mem_str)).style(base_style.fg(mem_color)),
+                    Cell::from(state).style(base_style.fg(state_color)),
+                    Cell::from(cmd_display).style(base_style),
                 ])
             })
             .collect();
 
+        // Build header with sort indicators
+        let cpu_header = match self.sort_by {
+            SortBy::CpuPercent => "CPU%▼  TIME",
+            SortBy::CpuTime => "CPU%   TIME▼",
+            _ => "CPU%   TIME",
+        };
+        let mem_header = if self.sort_by == SortBy::Mem { "MEM▼" } else { "MEM" };
+
         let header = Row::new(vec![
             Cell::from("PID"),
-            Cell::from("CPU"),
-            Cell::from("MEM"),
+            Cell::from(cpu_header),
+            Cell::from(mem_header),
             Cell::from("S"),
             Cell::from("COMMAND"),
         ])
@@ -755,10 +944,10 @@ impl ProcessesComponent {
 
         let widths = [
             Constraint::Length(7),      // PID
-            Constraint::Length(9),      // CPU
+            Constraint::Length(14),     // CPU% + TIME
             Constraint::Length(9),      // MEM
             Constraint::Length(2),      // State
-            Constraint::Percentage(60), // Command
+            Constraint::Percentage(55), // Command
         ];
 
         let table = Table::new(rows, widths)
@@ -784,6 +973,12 @@ impl ProcessesComponent {
         // Full command line with wrapping
         let full_cmd = proc.display_command();
 
+        // Find parent process name
+        let parent_name = self.processes.iter()
+            .find(|p| p.pid == proc.ppid)
+            .map(|p| p.command.as_str())
+            .unwrap_or("-");
+
         // Split area: command takes most space, stats at bottom
         let inner_area = {
             let block = Block::default().title(title.clone()).borders(Borders::TOP);
@@ -792,7 +987,7 @@ impl ProcessesComponent {
 
         let detail_chunks = Layout::vertical([
             Constraint::Min(3),    // Command (wrapped)
-            Constraint::Length(1), // Stats line
+            Constraint::Length(2), // Stats lines (now 2 lines)
         ])
         .split(inner_area);
 
@@ -806,17 +1001,24 @@ impl ProcessesComponent {
             .wrap(Wrap { trim: false });
         frame.render_widget(cmd_para, detail_chunks[0]);
 
-        // Stats line
-        let stats = Line::from(vec![
+        // Stats lines
+        let stats_line1 = Line::from(vec![
             Span::styled("State: ", Style::default().add_modifier(Modifier::DIM)),
             Span::styled(
                 proc.state.description(),
                 Style::default().fg(Self::state_color(&proc.state)),
             ),
             Span::raw("  "),
+            Span::styled("PPID: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::raw(format!("{} ", proc.ppid)),
+            Span::styled("(", Style::default().fg(Color::DarkGray)),
+            Span::styled(parent_name, Style::default().fg(Color::Cyan)),
+            Span::styled(")", Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
             Span::styled("Threads: ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw(proc.threads.to_string()),
-            Span::raw("  "),
+        ]);
+        let stats_line2 = Line::from(vec![
             Span::styled("Virt: ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw(proc.virtual_memory_human()),
             Span::raw("  "),
@@ -825,7 +1027,7 @@ impl ProcessesComponent {
             Span::raw("  "),
             Span::styled("[y] yank", Style::default().fg(Color::DarkGray)),
         ]);
-        let stats_para = Paragraph::new(stats);
+        let stats_para = Paragraph::new(vec![stats_line1, stats_line2]);
         frame.render_widget(stats_para, detail_chunks[1]);
     }
 
@@ -838,28 +1040,44 @@ impl ProcessesComponent {
         };
 
         let tree_status = if self.tree_view {
-            Span::styled("ON ", Style::default().fg(Color::Green))
+            if self.tree_root.is_some() {
+                Span::styled("SUB", Style::default().fg(Color::Cyan))
+            } else {
+                Span::styled("ALL", Style::default().fg(Color::Green))
+            }
         } else {
             Span::styled("OFF", Style::default().fg(Color::DarkGray))
         };
 
+        // State filter status
+        let filter_status = match &self.state_filter {
+            Some(ProcessState::Zombie) => Span::styled(" [Z]", Style::default().fg(Color::Red)),
+            Some(ProcessState::DiskSleep) => Span::styled(" [D]", Style::default().fg(Color::Yellow)),
+            _ => Span::raw(""),
+        };
+
         let line = Line::from(vec![
             Span::styled("[1]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" cpu  "),
+            Span::raw(" cpu "),
             Span::styled("[2]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" mem  "),
+            Span::raw(" mem "),
             Span::styled("[t]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" subtree "),
+            Span::styled("[T]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" tree:"),
             tree_status,
-            Span::raw("  "),
+            Span::raw(" "),
+            Span::styled("[z]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" zombie "),
+            Span::styled("[d]", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" disk"),
+            filter_status,
+            Span::raw(" "),
             Span::styled("[/]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" filter  "),
-            Span::styled("[r]", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" refresh  "),
+            Span::raw(" filter "),
             Span::styled("[a]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" auto:"),
             auto_status,
-            Span::raw("  "),
             Span::styled("[q]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" back"),
         ]);
@@ -985,7 +1203,12 @@ impl ProcessesComponent {
                 Ok(None)
             }
             KeyCode::Char('1') => {
-                self.sort_by = SortBy::Cpu;
+                // Toggle between CPU% and CPU time
+                self.sort_by = match self.sort_by {
+                    SortBy::CpuPercent => SortBy::CpuTime,
+                    SortBy::CpuTime => SortBy::CpuPercent,
+                    _ => SortBy::CpuPercent,
+                };
                 self.sort_processes();
                 self.apply_filter();
                 self.selected = 0;
@@ -1011,8 +1234,52 @@ impl ProcessesComponent {
                 Ok(None)
             }
             KeyCode::Char('t') => {
+                // Toggle subtree from selected process
+                if let Some(proc) = self.selected_process() {
+                    if self.tree_view && self.tree_root == Some(proc.pid) {
+                        // Already in subtree mode for this process - clear it
+                        self.tree_view = false;
+                        self.tree_root = None;
+                    } else {
+                        // Enter subtree mode for selected process
+                        self.tree_root = Some(proc.pid);
+                        self.tree_view = true;
+                    }
+                    self.rebuild_display_list();
+                    self.selected = 0;
+                    self.table_state.select(Some(0));
+                }
+                Ok(None)
+            }
+            KeyCode::Char('T') => {
+                // Full tree from init (pid 1)
+                self.tree_root = None;
                 self.tree_view = !self.tree_view;
                 self.rebuild_display_list();
+                self.selected = 0;
+                self.table_state.select(Some(0));
+                Ok(None)
+            }
+            KeyCode::Char('z') => {
+                // Toggle zombie filter
+                if self.state_filter == Some(ProcessState::Zombie) {
+                    self.state_filter = None;
+                } else {
+                    self.state_filter = Some(ProcessState::Zombie);
+                }
+                self.apply_filter();
+                self.selected = 0;
+                self.table_state.select(Some(0));
+                Ok(None)
+            }
+            KeyCode::Char('d') => {
+                // Toggle disk-wait filter
+                if self.state_filter == Some(ProcessState::DiskSleep) {
+                    self.state_filter = None;
+                } else {
+                    self.state_filter = Some(ProcessState::DiskSleep);
+                }
+                self.apply_filter();
                 self.selected = 0;
                 self.table_state.select(Some(0));
                 Ok(None)
@@ -1021,19 +1288,10 @@ impl ProcessesComponent {
                 // Yank (copy) the selected process command to clipboard
                 if let Some(proc) = self.selected_process() {
                     let full_cmd = proc.display_command().to_string();
-                    match arboard::Clipboard::new() {
-                        Ok(mut clipboard) => {
-                            let preview_len = full_cmd.len().min(50);
-                            let preview = &full_cmd[..preview_len];
-                            if let Err(e) = clipboard.set_text(&full_cmd) {
-                                tracing::warn!("Failed to copy to clipboard: {}", e);
-                            } else {
-                                tracing::info!("Copied to clipboard: {}...", preview);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to access clipboard: {}", e);
-                        }
+                    let preview_len = full_cmd.len().min(50);
+                    let preview = full_cmd[..preview_len].to_string();
+                    if crate::clipboard::copy_to_clipboard(full_cmd).is_ok() {
+                        tracing::info!("Copied to clipboard: {}...", preview);
                     }
                 }
                 Ok(None)

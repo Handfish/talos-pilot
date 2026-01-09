@@ -964,16 +964,8 @@ impl MultiLogsComponent {
         let count = lines.len();
         let content = lines.join("\n");
 
-        // Copy to clipboard using arboard
-        let success = match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                clipboard.set_text(&content).is_ok()
-            }
-            Err(e) => {
-                tracing::warn!("Failed to access clipboard: {}", e);
-                false
-            }
-        };
+        // Copy to clipboard using helper that handles Linux quirks
+        let success = crate::clipboard::copy_to_clipboard(content).is_ok();
 
         (success, count)
     }
