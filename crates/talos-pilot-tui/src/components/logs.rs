@@ -4,6 +4,7 @@ use crate::action::Action;
 use crate::components::Component;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
+use std::collections::HashSet;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -18,8 +19,8 @@ struct LogEntry {
     timestamp: String,
     level: LogLevel,
     message: String,
-    /// Original line for searching
-    raw: String,
+    /// Pre-computed lowercase of full line for efficient searching
+    search_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,9 +96,11 @@ pub struct LogsComponent {
     search_mode: SearchMode,
     /// Current search query
     search_query: String,
-    /// Indices of entries that match the search
-    matches: Vec<usize>,
-    /// Current match index (into matches vec)
+    /// Set of entry indices that match (O(1) lookup for rendering)
+    match_set: HashSet<usize>,
+    /// Ordered list of matches for n/N navigation
+    match_order: Vec<usize>,
+    /// Current match index (into match_order vec)
     current_match: usize,
 }
 
@@ -111,7 +114,8 @@ impl LogsComponent {
             error: None,
             search_mode: SearchMode::Off,
             search_query: String::new(),
-            matches: Vec::new(),
+            match_set: HashSet::new(),
+            match_order: Vec::new(),
             current_match: 0,
         }
     }
@@ -131,7 +135,8 @@ impl LogsComponent {
     /// Parse a log line into structured components
     fn parse_line(line: &str) -> LogEntry {
         let line = line.trim();
-        let raw = line.to_string();
+        // Pre-compute lowercase for O(1) search (no allocation during search)
+        let search_text = line.to_lowercase();
 
         // Try to extract timestamp (looks for time-like pattern at start)
         let (timestamp, rest) = Self::extract_timestamp(line);
@@ -146,7 +151,7 @@ impl LogsComponent {
             timestamp,
             level,
             message,
-            raw,
+            search_text,
         }
     }
 
@@ -271,7 +276,8 @@ impl LogsComponent {
 
     /// Update search matches based on current query
     fn update_matches(&mut self) {
-        self.matches.clear();
+        self.match_set.clear();
+        self.match_order.clear();
         self.current_match = 0;
 
         if self.search_query.is_empty() {
@@ -280,58 +286,61 @@ impl LogsComponent {
 
         let query_lower = self.search_query.to_lowercase();
         for (i, entry) in self.entries.iter().enumerate() {
-            if entry.raw.to_lowercase().contains(&query_lower) {
-                self.matches.push(i);
+            // Use pre-computed lowercase - no allocation per entry!
+            if entry.search_text.contains(&query_lower) {
+                self.match_set.insert(i);
+                self.match_order.push(i);
             }
         }
 
         // Jump to first match
-        if !self.matches.is_empty() {
-            self.scroll = self.matches[0] as u16;
+        if !self.match_order.is_empty() {
+            self.scroll = self.match_order[0] as u16;
         }
     }
 
     /// Go to next match
     fn next_match(&mut self) {
-        if self.matches.is_empty() {
+        if self.match_order.is_empty() {
             return;
         }
-        self.current_match = (self.current_match + 1) % self.matches.len();
-        self.scroll = self.matches[self.current_match] as u16;
+        self.current_match = (self.current_match + 1) % self.match_order.len();
+        self.scroll = self.match_order[self.current_match] as u16;
     }
 
     /// Go to previous match
     fn prev_match(&mut self) {
-        if self.matches.is_empty() {
+        if self.match_order.is_empty() {
             return;
         }
         self.current_match = if self.current_match == 0 {
-            self.matches.len() - 1
+            self.match_order.len() - 1
         } else {
             self.current_match - 1
         };
-        self.scroll = self.matches[self.current_match] as u16;
+        self.scroll = self.match_order[self.current_match] as u16;
     }
 
     /// Clear search
     fn clear_search(&mut self) {
         self.search_mode = SearchMode::Off;
         self.search_query.clear();
-        self.matches.clear();
+        self.match_set.clear();
+        self.match_order.clear();
         self.current_match = 0;
     }
 
     /// Check if an entry index is the current match
     fn is_current_match(&self, entry_idx: usize) -> bool {
-        if self.matches.is_empty() {
+        if self.match_order.is_empty() {
             return false;
         }
-        self.matches.get(self.current_match) == Some(&entry_idx)
+        self.match_order.get(self.current_match) == Some(&entry_idx)
     }
 
-    /// Check if an entry matches the search
+    /// Check if an entry matches the search - O(1) with HashSet
     fn entry_matches(&self, entry_idx: usize) -> bool {
-        self.matches.contains(&entry_idx)
+        self.match_set.contains(&entry_idx)
     }
 
     /// Render message with search highlighting (returns owned spans)
@@ -430,7 +439,8 @@ impl Component for LogsComponent {
             KeyCode::Char('/') => {
                 self.search_mode = SearchMode::Input;
                 self.search_query.clear();
-                self.matches.clear();
+                self.match_set.clear();
+                self.match_order.clear();
                 Ok(None)
             }
             KeyCode::Char('n') => {
@@ -505,10 +515,10 @@ impl Component for LogsComponent {
         ];
 
         // Show match count in header when searching
-        if !self.matches.is_empty() {
+        if !self.match_order.is_empty() {
             header_spans.push(Span::raw("  "));
             header_spans.push(Span::styled(
-                format!("[{}/{}]", self.current_match + 1, self.matches.len()),
+                format!("[{}/{}]", self.current_match + 1, self.match_order.len()),
                 Style::default().fg(Color::Yellow).bold(),
             ));
         } else if self.search_mode != SearchMode::Off && !self.search_query.is_empty() {
