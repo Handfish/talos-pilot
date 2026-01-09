@@ -25,6 +25,8 @@ pub enum Action {
     ShowClusterList,
     ShowNodeList(String), // cluster name
     ShowNodeDetails(String, String), // cluster, node
+    /// Show multi-service logs: (node_ip, node_role, service_ids)
+    ShowMultiLogs(String, String, Vec<String>),
 
     // UI state
     Tick,

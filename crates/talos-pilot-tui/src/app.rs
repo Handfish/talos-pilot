@@ -1,7 +1,7 @@
 //! Application state and main loop
 
 use crate::action::Action;
-use crate::components::{ClusterComponent, Component, LogsComponent};
+use crate::components::{ClusterComponent, Component, MultiLogsComponent};
 use crate::tui::{self, Tui};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone, PartialEq)]
 enum View {
     Cluster,
-    Logs,
+    MultiLogs,
 }
 
 /// Main application state
@@ -23,9 +23,9 @@ pub struct App {
     view: View,
     /// Cluster component
     cluster: ClusterComponent,
-    /// Logs component (created when viewing logs)
-    logs: Option<LogsComponent>,
-    /// Number of log lines to fetch
+    /// Multi-service logs component (created when viewing logs)
+    multi_logs: Option<MultiLogsComponent>,
+    /// Number of log lines to fetch per service
     tail_lines: i32,
     /// Tick rate for animations (ms)
     tick_rate: Duration,
@@ -58,7 +58,7 @@ impl App {
             should_quit: false,
             view: View::Cluster,
             cluster: ClusterComponent::new(context),
-            logs: None,
+            multi_logs: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
@@ -96,9 +96,9 @@ impl App {
                     View::Cluster => {
                         let _ = self.cluster.draw(frame, area);
                     }
-                    View::Logs => {
-                        if let Some(logs) = &mut self.logs {
-                            let _ = logs.draw(frame, area);
+                    View::MultiLogs => {
+                        if let Some(multi_logs) = &mut self.multi_logs {
+                            let _ = multi_logs.draw(frame, area);
                         }
                     }
                 }
@@ -110,9 +110,9 @@ impl App {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let action = match self.view {
                             View::Cluster => self.cluster.handle_key_event(key)?,
-                            View::Logs => {
-                                if let Some(logs) = &mut self.logs {
-                                    logs.handle_key_event(key)?
+                            View::MultiLogs => {
+                                if let Some(multi_logs) = &mut self.multi_logs {
+                                    multi_logs.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -141,15 +141,13 @@ impl App {
                     AsyncResult::Refreshed => {
                         tracing::info!("Data refreshed");
                     }
-                    AsyncResult::LogsLoaded(content) => {
-                        if let Some(logs) = &mut self.logs {
-                            logs.set_logs(content);
-                        }
+                    AsyncResult::LogsLoaded(_content) => {
+                        // Legacy - multi_logs uses set_logs directly
                     }
                     AsyncResult::Error(e) => {
                         tracing::error!("Async error: {}", e);
-                        if let Some(logs) = &mut self.logs {
-                            logs.set_error(e);
+                        if let Some(multi_logs) = &mut self.multi_logs {
+                            multi_logs.set_error(e);
                         }
                     }
                 }
@@ -173,7 +171,7 @@ impl App {
             Action::Back => {
                 // Return to cluster view
                 self.view = View::Cluster;
-                self.logs = None;
+                self.multi_logs = None;
             }
             Action::Tick => {
                 // Update animations, etc.
@@ -183,9 +181,9 @@ impl App {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
                     }
-                    View::Logs => {
-                        if let Some(logs) = &mut self.logs
-                            && let Some(next_action) = logs.update(Action::Tick)?
+                    View::MultiLogs => {
+                        if let Some(multi_logs) = &mut self.multi_logs
+                            && let Some(next_action) = multi_logs.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -199,27 +197,35 @@ impl App {
                 tracing::info!("Refresh requested");
                 self.cluster.refresh().await?;
             }
-            Action::ShowNodeDetails(_node, service_id) => {
-                // Switch to logs view
-                tracing::info!("Viewing logs for service: {}", service_id);
+            Action::ShowMultiLogs(node_ip, node_role, service_ids) => {
+                // Switch to multi-service logs view
+                tracing::info!("Viewing multi-service logs for node: {}", node_ip);
 
-                // Create logs component
-                let mut logs_component = LogsComponent::new(service_id.clone());
+                // Create multi-logs component
+                let mut multi_logs = MultiLogsComponent::new(
+                    node_ip,
+                    node_role,
+                    service_ids.clone(),
+                );
 
-                // Fetch logs asynchronously
+                // Fetch logs from all services in parallel
                 if let Some(client) = self.cluster.client() {
-                    match client.logs(&service_id, self.tail_lines).await {
-                        Ok(content) => {
-                            logs_component.set_logs(content);
+                    let service_refs: Vec<&str> = service_ids.iter().map(|s| s.as_str()).collect();
+                    match client.logs_multi(&service_refs, self.tail_lines).await {
+                        Ok(logs) => {
+                            multi_logs.set_logs(logs);
                         }
                         Err(e) => {
-                            logs_component.set_error(e.to_string());
+                            multi_logs.set_error(e.to_string());
                         }
                     }
                 }
 
-                self.logs = Some(logs_component);
-                self.view = View::Logs;
+                self.multi_logs = Some(multi_logs);
+                self.view = View::MultiLogs;
+            }
+            Action::ShowNodeDetails(_, _) => {
+                // Legacy - no longer used, we use ShowMultiLogs now
             }
             _ => {
                 // Forward to current component
@@ -229,9 +235,9 @@ impl App {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
                     }
-                    View::Logs => {
-                        if let Some(logs) = &mut self.logs
-                            && let Some(next_action) = logs.update(action)?
+                    View::MultiLogs => {
+                        if let Some(multi_logs) = &mut self.multi_logs
+                            && let Some(next_action) = multi_logs.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }

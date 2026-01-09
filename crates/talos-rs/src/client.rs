@@ -237,6 +237,44 @@ impl TalosClient {
 
         Ok(logs)
     }
+
+    /// Get logs for multiple services in parallel
+    /// Returns Vec of (service_id, log_content) tuples
+    pub async fn logs_multi(
+        &self,
+        service_ids: &[&str],
+        tail_lines: i32,
+    ) -> Result<Vec<(String, String)>, TalosError> {
+        use futures::future::join_all;
+
+        let futures: Vec<_> = service_ids
+            .iter()
+            .map(|&service_id| {
+                let service_id = service_id.to_string();
+                async move {
+                    let result = self.logs(&service_id, tail_lines).await;
+                    (service_id, result)
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        let mut logs = Vec::new();
+        for (service_id, result) in results {
+            match result {
+                Ok(content) => {
+                    logs.push((service_id, content));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch logs for {}: {}", service_id, e);
+                    // Continue with other services, just skip this one
+                }
+            }
+        }
+
+        Ok(logs)
+    }
 }
 
 /// Version information for a node

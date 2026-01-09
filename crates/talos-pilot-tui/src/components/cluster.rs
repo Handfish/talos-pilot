@@ -217,6 +217,32 @@ impl ClusterComponent {
             .map(|s| s.len())
             .unwrap_or(0)
     }
+
+    /// Get all service IDs for current node
+    fn current_service_ids(&self) -> Vec<String> {
+        if self.versions.is_empty() {
+            return Vec::new();
+        }
+        let node_name = &self.versions[self.selected].node;
+        self.get_node_services(node_name)
+            .map(|services| services.iter().map(|s| s.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Get current node IP/name
+    fn current_node_name(&self) -> Option<String> {
+        self.versions.get(self.selected).map(|v| v.node.clone())
+    }
+
+    /// Determine node role based on services (etcd = controlplane)
+    fn current_node_role(&self) -> String {
+        let service_ids = self.current_service_ids();
+        if service_ids.iter().any(|s| s == "etcd") {
+            "controlplane".to_string()
+        } else {
+            "worker".to_string()
+        }
+    }
 }
 
 impl Component for ClusterComponent {
@@ -255,9 +281,15 @@ impl Component for ClusterComponent {
                 Ok(None)
             }
             KeyCode::Enter | KeyCode::Char('l') => {
-                // View logs for selected service
-                if let Some(service_id) = self.selected_service_id() {
-                    Ok(Some(Action::ShowNodeDetails(String::new(), service_id)))
+                // View multi-service logs for current node
+                if let Some(node_name) = self.current_node_name() {
+                    let service_ids = self.current_service_ids();
+                    if !service_ids.is_empty() {
+                        let node_role = self.current_node_role();
+                        Ok(Some(Action::ShowMultiLogs(node_name, node_role, service_ids)))
+                    } else {
+                        Ok(None)
+                    }
                 } else {
                     Ok(None)
                 }

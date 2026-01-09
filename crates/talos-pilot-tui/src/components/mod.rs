@@ -5,10 +5,12 @@
 pub mod cluster;
 pub mod home;
 pub mod logs;
+pub mod multi_logs;
 
 pub use cluster::ClusterComponent;
 pub use home::HomeComponent;
 pub use logs::LogsComponent;
+pub use multi_logs::MultiLogsComponent;
 
 use crate::action::Action;
 use color_eyre::Result;
