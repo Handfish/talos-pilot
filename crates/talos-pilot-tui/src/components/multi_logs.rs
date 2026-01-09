@@ -3,7 +3,7 @@
 use crate::action::Action;
 use crate::components::Component;
 use color_eyre::Result;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -158,6 +158,8 @@ pub struct MultiLogsComponent {
     focus: Focus,
     /// Scroll position in logs
     scroll: u16,
+    /// Last known viewport height (for half-page scroll)
+    viewport_height: u16,
     /// Following mode (auto-scroll to bottom)
     following: bool,
 
@@ -205,8 +207,9 @@ impl MultiLogsComponent {
             entries: Vec::new(),
             visible_indices: Vec::new(),
             view_mode: ViewMode::Full,
-            focus: Focus::Logs,
+            focus: Focus::Sidebar, // Start with sidebar focused
             scroll: 0,
+            viewport_height: 20, // Will be updated on first draw
             following: true,
             loading: true,
             error: None,
@@ -404,6 +407,12 @@ impl MultiLogsComponent {
             .map(|(i, _)| i)
             .collect();
 
+        // Clamp scroll to valid range
+        let max_scroll = self.visible_indices.len().saturating_sub(1) as u16;
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+
         // Update search if active
         if self.search_mode == SearchMode::Active {
             self.update_matches();
@@ -449,6 +458,18 @@ impl MultiLogsComponent {
     fn scroll_down(&mut self, amount: u16) {
         let max = self.visible_indices.len().saturating_sub(1) as u16;
         self.scroll = (self.scroll + amount).min(max);
+    }
+
+    /// Scroll half page up (Ctrl+U)
+    fn scroll_half_page_up(&mut self) {
+        let half = (self.viewport_height / 2).max(1);
+        self.scroll_up(half);
+    }
+
+    /// Scroll half page down (Ctrl+D)
+    fn scroll_half_page_down(&mut self) {
+        let half = (self.viewport_height / 2).max(1);
+        self.scroll_down(half);
     }
 
     /// Scroll to bottom and enable following
@@ -562,20 +583,50 @@ impl MultiLogsComponent {
         }
     }
 
-    /// Draw the sidebar
-    fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self.services
+    /// Draw the floating services panel
+    fn draw_services_panel(&mut self, frame: &mut Frame, area: Rect) {
+        // Filter services by search query if searching
+        let query_lower = self.search_query.to_lowercase();
+        let filtered_services: Vec<(usize, &ServiceState)> = if self.search_mode != SearchMode::Off && !self.search_query.is_empty() {
+            self.services
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.id.to_lowercase().contains(&query_lower))
+                .collect()
+        } else {
+            self.services.iter().enumerate().collect()
+        };
+
+        if filtered_services.is_empty() {
+            return; // Don't show panel if no services match
+        }
+
+        // Calculate panel size based on filtered service names
+        let max_name_len = filtered_services.iter().map(|(_, s)| s.id.len()).max().unwrap_or(8);
+        let panel_width = (max_name_len + 4).max(16).min(area.width as usize - 4) as u16;
+        let panel_height = (filtered_services.len() + 2).min(area.height as usize - 2) as u16;
+
+        // Position in top-left with small margin
+        let panel_area = Rect::new(
+            area.x + 1,
+            area.y,
+            panel_width,
+            panel_height,
+        );
+
+        // Clear the background
+        frame.render_widget(ratatui::widgets::Clear, panel_area);
+
+        let items: Vec<ListItem> = filtered_services
             .iter()
-            .map(|s| {
+            .map(|(_, s)| {
                 let indicator = if s.active { "●" } else { "○" };
                 let style = Style::default().fg(s.color);
-                let count_str = format!(" ({})", s.entry_count);
 
                 ListItem::new(Line::from(vec![
                     Span::styled(indicator, style),
                     Span::raw(" "),
                     Span::styled(&s.id, style),
-                    Span::raw(count_str).dim(),
                 ]))
             })
             .collect();
@@ -589,13 +640,27 @@ impl MultiLogsComponent {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(" Services ")
+                    .title("─ Services ")
+                    .title_style(border_style)
                     .borders(Borders::ALL)
                     .border_style(border_style),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-        frame.render_stateful_widget(list, area, &mut self.sidebar_state);
+        // Adjust selected index if filtering
+        let mut adjusted_state = ListState::default();
+        if let Some(selected) = self.sidebar_state.selected() {
+            // Find the position of the originally selected service in filtered list
+            let adjusted_idx = filtered_services
+                .iter()
+                .position(|(orig_idx, _)| *orig_idx == selected)
+                .unwrap_or(0);
+            adjusted_state.select(Some(adjusted_idx));
+        } else {
+            adjusted_state.select(Some(0));
+        }
+
+        frame.render_stateful_widget(list, panel_area, &mut adjusted_state);
     }
 
     /// Draw the logs area
@@ -627,9 +692,11 @@ impl MultiLogsComponent {
         }
 
         let visible_height = area.height as usize;
-        let content_width = area.width.saturating_sub(2) as usize;
+        let content_width = area.width.saturating_sub(1) as usize; // -1 for scrollbar
 
-        let start = self.scroll as usize;
+        // Safety clamp scroll to valid range
+        let max_start = self.visible_indices.len().saturating_sub(1);
+        let start = (self.scroll as usize).min(max_start);
         let end = (start + visible_height).min(self.visible_indices.len());
 
         let mut lines: Vec<Line> = Vec::new();
@@ -806,6 +873,16 @@ impl Component for MultiLogsComponent {
                 self.scroll_down(20);
                 Ok(None)
             }
+
+            // Vim-style half-page scroll
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_half_page_up();
+                Ok(None)
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_half_page_down();
+                Ok(None)
+            }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.scroll = 0;
                 self.following = false;
@@ -871,13 +948,13 @@ impl Component for MultiLogsComponent {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
-        // Layout depends on view mode and search state
+        // Layout: Header, Content (logs with floating services), optional search, footer
         let has_search_bar = self.search_mode != SearchMode::Off;
 
         let main_layout = if has_search_bar {
             Layout::vertical([
                 Constraint::Length(2), // Header
-                Constraint::Min(0),    // Content
+                Constraint::Min(0),    // Content (logs + floating services)
                 Constraint::Length(1), // Search bar
                 Constraint::Length(2), // Footer
             ])
@@ -891,26 +968,27 @@ impl Component for MultiLogsComponent {
             .split(area)
         };
 
-        // Header
+        // Header with title matching mockup
         let follow_indicator = if self.following {
-            Span::styled(" ● LIVE ", Style::default().fg(Color::Green).bold())
+            Span::styled("● LIVE ", Style::default().fg(Color::Green).bold())
         } else {
-            Span::styled(" ○ PAUSED ", Style::default().fg(Color::DarkGray))
+            Span::styled("○ PAUSED ", Style::default().fg(Color::DarkGray))
         };
 
         let mut header_spans = vec![
-            Span::raw(" Logs: ").bold().fg(Color::Cyan),
+            Span::raw(" Multi-Service Logs: ").bold().fg(Color::Cyan),
             Span::raw(&self.node_ip).fg(Color::White),
             Span::raw(format!(" ({})", self.node_role)).dim(),
+            Span::raw("  "),
             follow_indicator,
-            Span::raw(format!("[{} active]", self.active_count())).dim(),
+            Span::raw(format!(" [{} active]", self.active_count())).dim(),
         ];
 
         // Show match count when searching
         if !self.match_order.is_empty() {
             header_spans.push(Span::raw("  "));
             header_spans.push(Span::styled(
-                format!("[{}/{}]", self.current_match + 1, self.match_order.len()),
+                format!("[{} matches]", self.match_order.len()),
                 Style::default().fg(Color::Yellow).bold(),
             ));
         } else if self.search_mode != SearchMode::Off && !self.search_query.is_empty() {
@@ -925,36 +1003,47 @@ impl Component for MultiLogsComponent {
         );
         frame.render_widget(header, main_layout[0]);
 
-        // Content area
+        // Content area - logs, with floating services panel on top in Full mode
         let content_area = main_layout[1];
 
-        match self.view_mode {
-            ViewMode::Full => {
-                // Split into sidebar and logs
-                let content_layout = Layout::horizontal([
-                    Constraint::Length(20), // Sidebar
-                    Constraint::Min(0),     // Logs
-                ])
-                .split(content_area);
+        // Update viewport height for half-page scrolling
+        self.viewport_height = content_area.height;
 
-                self.draw_sidebar(frame, content_layout[0]);
-                self.draw_logs(frame, content_layout[1]);
-            }
-            ViewMode::Compact => {
-                self.draw_logs(frame, content_area);
-            }
+        // Draw logs (no border)
+        self.draw_logs(frame, content_area);
+
+        // Draw floating services panel on top (only in Full mode)
+        if self.view_mode == ViewMode::Full {
+            self.draw_services_panel(frame, content_area);
         }
 
         // Search bar
         if has_search_bar {
             let search_area = main_layout[2];
             let cursor = if self.search_mode == SearchMode::Input { "█" } else { "" };
+
+            // Match count on the right
+            let match_info = if !self.match_order.is_empty() {
+                format!("[{}/{}]", self.current_match + 1, self.match_order.len())
+            } else {
+                String::new()
+            };
+
             let search_line = Line::from(vec![
                 Span::styled(" /", Style::default().fg(Color::Yellow)),
                 Span::raw(&self.search_query),
                 Span::styled(cursor, Style::default().fg(Color::Yellow)),
             ]);
             frame.render_widget(Paragraph::new(search_line), search_area);
+
+            // Render match count on the right side
+            if !match_info.is_empty() {
+                let match_para = Paragraph::new(Line::from(vec![
+                    Span::styled(&match_info, Style::default().fg(Color::Yellow)),
+                    Span::raw(" "),
+                ])).alignment(ratatui::layout::Alignment::Right);
+                frame.render_widget(match_para, search_area);
+            }
         }
 
         // Footer
@@ -986,11 +1075,11 @@ impl Component for MultiLogsComponent {
                 Span::raw(" [Space]").fg(Color::Yellow),
                 Span::raw(" toggle").dim(),
                 Span::raw("  "),
-                Span::raw("[a/n]").fg(Color::Yellow),
-                Span::raw(" all/none").dim(),
+                Span::raw("[a]").fg(Color::Yellow),
+                Span::raw(" all").dim(),
                 Span::raw("  "),
-                Span::raw("[Tab]").fg(Color::Yellow),
-                Span::raw(" compact").dim(),
+                Span::raw("[n]").fg(Color::Yellow),
+                Span::raw(" none").dim(),
                 Span::raw("  "),
                 Span::raw("[/]").fg(Color::Yellow),
                 Span::raw(" search").dim(),
@@ -1004,7 +1093,7 @@ impl Component for MultiLogsComponent {
         } else {
             vec![
                 Span::raw(" [Tab]").fg(Color::Yellow),
-                Span::raw(" full view").dim(),
+                Span::raw(" show services").dim(),
                 Span::raw("  "),
                 Span::raw("[/]").fg(Color::Yellow),
                 Span::raw(" search").dim(),
