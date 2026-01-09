@@ -1,7 +1,7 @@
 //! Application state and main loop
 
 use crate::action::Action;
-use crate::components::{ClusterComponent, Component, MultiLogsComponent};
+use crate::components::{ClusterComponent, Component, EtcdComponent, MultiLogsComponent};
 use crate::tui::{self, Tui};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 enum View {
     Cluster,
     MultiLogs,
+    Etcd,
 }
 
 /// Main application state
@@ -25,6 +26,8 @@ pub struct App {
     cluster: ClusterComponent,
     /// Multi-service logs component (created when viewing logs)
     multi_logs: Option<MultiLogsComponent>,
+    /// Etcd status component (created when viewing etcd)
+    etcd: Option<EtcdComponent>,
     /// Number of log lines to fetch per service
     tail_lines: i32,
     /// Tick rate for animations (ms)
@@ -59,6 +62,7 @@ impl App {
             view: View::Cluster,
             cluster: ClusterComponent::new(context),
             multi_logs: None,
+            etcd: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
@@ -101,6 +105,11 @@ impl App {
                             let _ = multi_logs.draw(frame, area);
                         }
                     }
+                    View::Etcd => {
+                        if let Some(etcd) = &mut self.etcd {
+                            let _ = etcd.draw(frame, area);
+                        }
+                    }
                 }
             })?;
 
@@ -113,6 +122,13 @@ impl App {
                             View::MultiLogs => {
                                 if let Some(multi_logs) = &mut self.multi_logs {
                                     multi_logs.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                            View::Etcd => {
+                                if let Some(etcd) = &mut self.etcd {
+                                    etcd.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -169,13 +185,21 @@ impl App {
                 self.should_quit = true;
             }
             Action::Back => {
-                // Stop streaming if active
-                if let Some(multi_logs) = &mut self.multi_logs {
-                    multi_logs.stop_streaming();
+                match self.view {
+                    View::MultiLogs => {
+                        // Stop streaming if active
+                        if let Some(multi_logs) = &mut self.multi_logs {
+                            multi_logs.stop_streaming();
+                        }
+                        self.multi_logs = None;
+                    }
+                    View::Etcd => {
+                        self.etcd = None;
+                    }
+                    View::Cluster => {}
                 }
                 // Return to cluster view
                 self.view = View::Cluster;
-                self.multi_logs = None;
             }
             Action::Tick => {
                 // Update animations, etc.
@@ -188,6 +212,13 @@ impl App {
                     View::MultiLogs => {
                         if let Some(multi_logs) = &mut self.multi_logs
                             && let Some(next_action) = multi_logs.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Etcd => {
+                        if let Some(etcd) = &mut self.etcd
+                            && let Some(next_action) = etcd.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -236,6 +267,24 @@ impl App {
             Action::ShowNodeDetails(_, _) => {
                 // Legacy - no longer used, we use ShowMultiLogs now
             }
+            Action::ShowEtcd => {
+                // Switch to etcd status view
+                tracing::info!("Viewing etcd cluster status");
+
+                // Create etcd component
+                let mut etcd = EtcdComponent::new();
+
+                // Set the client and refresh data
+                if let Some(client) = self.cluster.client() {
+                    etcd.set_client(client.clone());
+                    if let Err(e) = etcd.refresh().await {
+                        etcd.set_error(e.to_string());
+                    }
+                }
+
+                self.etcd = Some(etcd);
+                self.view = View::Etcd;
+            }
             _ => {
                 // Forward to current component
                 match self.view {
@@ -247,6 +296,13 @@ impl App {
                     View::MultiLogs => {
                         if let Some(multi_logs) = &mut self.multi_logs
                             && let Some(next_action) = multi_logs.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Etcd => {
+                        if let Some(etcd) = &mut self.etcd
+                            && let Some(next_action) = etcd.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }

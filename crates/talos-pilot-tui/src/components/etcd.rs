@@ -121,6 +121,12 @@ impl EtcdComponent {
         self.client = Some(client);
     }
 
+    /// Set an error message
+    pub fn set_error(&mut self, error: String) {
+        self.error = Some(error);
+        self.loading = false;
+    }
+
     /// Refresh etcd data from the cluster
     pub async fn refresh(&mut self) -> Result<()> {
         let Some(client) = &self.client else {

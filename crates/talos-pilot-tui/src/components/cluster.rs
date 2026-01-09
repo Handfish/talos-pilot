@@ -294,6 +294,10 @@ impl Component for ClusterComponent {
                     Ok(None)
                 }
             }
+            KeyCode::Char('e') => {
+                // View etcd cluster status
+                Ok(Some(Action::ShowEtcd))
+            }
             _ => Ok(None),
         }
     }
@@ -368,6 +372,9 @@ impl Component for ClusterComponent {
             Span::raw("  "),
             Span::raw("[Enter]").fg(Color::Yellow),
             Span::raw(" logs").dim(),
+            Span::raw("  "),
+            Span::raw("[e]").fg(Color::Yellow),
+            Span::raw(" etcd").dim(),
         ]))
         .block(
             Block::default()
