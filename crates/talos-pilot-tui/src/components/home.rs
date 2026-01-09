@@ -41,11 +41,8 @@ impl Component for HomeComponent {
     }
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
-        match action {
-            Action::Tick => {
-                // Handle tick for animations
-            }
-            _ => {}
+        if let Action::Tick = action {
+            // Handle tick for animations
         }
         Ok(None)
     }

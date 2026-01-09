@@ -165,11 +165,8 @@ impl Component for ClusterComponent {
     }
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
-        match action {
-            Action::Tick => {
-                // Could trigger auto-refresh here
-            }
-            _ => {}
+        if let Action::Tick = action {
+            // Could trigger auto-refresh here
         }
         Ok(None)
     }

@@ -2,7 +2,10 @@
 
 use clap::Parser;
 use color_eyre::Result;
+use std::fs::File;
 use talos_pilot_tui::App;
+use tracing::Level;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 /// talos-pilot: Terminal UI for Talos Linux clusters
 #[derive(Parser, Debug)]
@@ -20,6 +23,10 @@ struct Cli {
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
+
+    /// Log file path (default: /tmp/talos-pilot.log)
+    #[arg(long, default_value = "/tmp/talos-pilot.log")]
+    log_file: String,
 }
 
 #[tokio::main]
@@ -30,14 +37,21 @@ async fn main() -> Result<()> {
     // Initialize error handling
     color_eyre::install()?;
 
-    // Initialize logging
-    let log_level = if cli.debug { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(log_level.parse().unwrap()),
+    // Initialize logging to file (not stdout, which would corrupt TUI)
+    let log_level = if cli.debug { Level::DEBUG } else { Level::INFO };
+    let log_file = File::create(&cli.log_file)?;
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(log_file)
+                .with_ansi(true)
+                .with_target(false),
         )
-        .with_target(false)
+        .with(
+            EnvFilter::from_default_env()
+                .add_directive(log_level.into()),
+        )
         .init();
 
     tracing::info!("Starting talos-pilot");

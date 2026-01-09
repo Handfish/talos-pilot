@@ -23,6 +23,10 @@
 //! }
 //! ```
 
+// TalosError contains tonic types which are large, but this is fine for an API client
+// where errors are on the cold path
+#![allow(clippy::result_large_err)]
+
 pub mod auth;
 pub mod client;
 pub mod config;
