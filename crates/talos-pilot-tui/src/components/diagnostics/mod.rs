@@ -54,6 +54,10 @@ pub struct DiagnosticsComponent {
     service_checks: Vec<DiagnosticCheck>,
     /// CNI-specific checks
     cni_checks: Vec<DiagnosticCheck>,
+    /// Addon-specific checks
+    addon_checks: Vec<DiagnosticCheck>,
+    /// Detected addons
+    detected_addons: addons::DetectedAddons,
 
     /// Currently selected category
     selected_category: usize,
@@ -120,6 +124,8 @@ impl DiagnosticsComponent {
             kubernetes_checks: Vec::new(),
             service_checks: Vec::new(),
             cni_checks: Vec::new(),
+            addon_checks: Vec::new(),
+            detected_addons: addons::DetectedAddons::default(),
             selected_category: 0,
             selected_check: 0,
             table_state,
@@ -158,6 +164,7 @@ impl DiagnosticsComponent {
             1 => &self.kubernetes_checks,
             2 => &self.cni_checks,
             3 => &self.service_checks,
+            4 => &self.addon_checks,
             _ => &[],
         }
     }
@@ -169,7 +176,7 @@ impl DiagnosticsComponent {
 
     /// Get total number of categories
     fn category_count(&self) -> usize {
-        4 // System, Kubernetes, CNI, Services
+        5 // System, Kubernetes, CNI, Services, Addons
     }
 
     /// Select next category
@@ -447,7 +454,13 @@ impl DiagnosticsComponent {
                     tracing::warn!("Failed to check pod health via K8s API: {}", e);
                 }
             }
+
+            // Detect installed addons
+            self.detected_addons = addons::detect_addons(kc).await;
         }
+
+        // Clone detected_addons for use in async block
+        let detected_addons = self.detected_addons.clone();
 
         let result = tokio::time::timeout(timeout, async {
             // Run core checks
@@ -458,16 +471,24 @@ impl DiagnosticsComponent {
             // Run CNI-specific checks
             let cni_checks = cni::run_cni_checks(client, &self.context).await;
 
-            (system_checks, kubernetes_checks, service_checks, cni_checks)
+            // Run addon-specific checks
+            let addon_checks = addons::run_addon_checks(
+                k8s_client.as_ref(),
+                &detected_addons,
+                &self.context,
+            ).await;
+
+            (system_checks, kubernetes_checks, service_checks, cni_checks, addon_checks)
         })
         .await;
 
         match result {
-            Ok((system, kubernetes, services, cni)) => {
+            Ok((system, kubernetes, services, cni, addons_result)) => {
                 self.system_checks = system;
                 self.kubernetes_checks = kubernetes;
                 self.service_checks = services;
                 self.cni_checks = cni;
+                self.addon_checks = addons_result;
                 self.last_refresh = Some(Instant::now());
             }
             Err(_) => {
@@ -491,6 +512,7 @@ impl DiagnosticsComponent {
                 _ => "CNI",
             },
             3 => "Services",
+            4 => "Addons",
             _ => "Unknown",
         }
     }
@@ -906,11 +928,19 @@ impl Component for DiagnosticsComponent {
                 .style(Style::default().fg(Color::Red));
             frame.render_widget(error_msg, chunks[1]);
         } else {
+            // Dynamically size Addons section based on whether addons are detected
+            let addons_height = if self.detected_addons.any_detected() {
+                Constraint::Length(5)
+            } else {
+                Constraint::Length(0)
+            };
+
             let content_chunks = Layout::vertical([
-                Constraint::Length(5),
-                Constraint::Length(5),
-                Constraint::Length(6),
-                Constraint::Fill(1),
+                Constraint::Length(5),  // System Health
+                Constraint::Length(5),  // Kubernetes Components
+                Constraint::Length(5),  // CNI
+                Constraint::Fill(1),    // Services
+                addons_height,          // Addons (if any)
             ])
             .split(chunks[1]);
 
@@ -942,6 +972,17 @@ impl Component for DiagnosticsComponent {
                 &self.service_checks,
                 self.selected_category == 3,
             );
+
+            // Only render Addons section if addons are detected
+            if self.detected_addons.any_detected() {
+                self.render_category(
+                    frame,
+                    content_chunks[4],
+                    4,
+                    &self.addon_checks,
+                    self.selected_category == 4,
+                );
+            }
         }
 
         // Footer
