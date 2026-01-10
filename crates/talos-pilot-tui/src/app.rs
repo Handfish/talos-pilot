@@ -1,7 +1,7 @@
 //! Application state and main loop
 
 use crate::action::Action;
-use crate::components::{ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, MultiLogsComponent, NetworkStatsComponent, ProcessesComponent, SecurityComponent};
+use crate::components::{ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent, MultiLogsComponent, NetworkStatsComponent, ProcessesComponent, SecurityComponent};
 use crate::tui::{self, Tui};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -18,6 +18,7 @@ enum View {
     Network,
     Diagnostics,
     Security,
+    Lifecycle,
 }
 
 /// Main application state
@@ -40,6 +41,8 @@ pub struct App {
     diagnostics: Option<DiagnosticsComponent>,
     /// Security component (created when viewing certificates)
     security: Option<SecurityComponent>,
+    /// Lifecycle component (created when viewing versions)
+    lifecycle: Option<LifecycleComponent>,
     /// Number of log lines to fetch per service
     tail_lines: i32,
     /// Tick rate for animations (ms)
@@ -79,6 +82,7 @@ impl App {
             network: None,
             diagnostics: None,
             security: None,
+            lifecycle: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
@@ -146,6 +150,11 @@ impl App {
                             let _ = security.draw(frame, area);
                         }
                     }
+                    View::Lifecycle => {
+                        if let Some(lifecycle) = &mut self.lifecycle {
+                            let _ = lifecycle.draw(frame, area);
+                        }
+                    }
                 }
             })?;
 
@@ -193,6 +202,13 @@ impl App {
                             View::Security => {
                                 if let Some(security) = &mut self.security {
                                     security.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                            View::Lifecycle => {
+                                if let Some(lifecycle) = &mut self.lifecycle {
+                                    lifecycle.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -272,6 +288,9 @@ impl App {
                     View::Security => {
                         self.security = None;
                     }
+                    View::Lifecycle => {
+                        self.lifecycle = None;
+                    }
                     View::Cluster => {}
                 }
                 // Return to cluster view
@@ -323,6 +342,13 @@ impl App {
                     View::Security => {
                         if let Some(security) = &mut self.security
                             && let Some(next_action) = security.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Lifecycle => {
+                        if let Some(lifecycle) = &mut self.lifecycle
+                            && let Some(next_action) = lifecycle.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -385,6 +411,13 @@ impl App {
                         if let Some(security) = &mut self.security {
                             if let Err(e) = security.refresh().await {
                                 security.set_error(e.to_string());
+                            }
+                        }
+                    }
+                    View::Lifecycle => {
+                        if let Some(lifecycle) = &mut self.lifecycle {
+                            if let Err(e) = lifecycle.refresh().await {
+                                lifecycle.set_error(e.to_string());
                             }
                         }
                     }
@@ -540,6 +573,26 @@ impl App {
                 self.security = Some(security);
                 self.view = View::Security;
             }
+            Action::ShowLifecycle => {
+                // Switch to lifecycle/version view
+                tracing::info!("Viewing lifecycle/versions");
+
+                // Create lifecycle component
+                let mut lifecycle = LifecycleComponent::new(String::new());
+
+                // Set the client and refresh data
+                if let Some(client) = self.cluster.client() {
+                    lifecycle.set_client(client.clone());
+                }
+
+                if let Err(e) = lifecycle.refresh().await {
+                    tracing::error!("Lifecycle refresh error: {:?}", e);
+                    lifecycle.set_error(e.to_string());
+                }
+
+                self.lifecycle = Some(lifecycle);
+                self.view = View::Lifecycle;
+            }
             _ => {
                 // Forward to current component
                 match self.view {
@@ -586,6 +639,13 @@ impl App {
                     View::Security => {
                         if let Some(security) = &mut self.security
                             && let Some(next_action) = security.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Lifecycle => {
+                        if let Some(lifecycle) = &mut self.lifecycle
+                            && let Some(next_action) = lifecycle.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }

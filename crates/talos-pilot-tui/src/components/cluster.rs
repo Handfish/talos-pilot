@@ -474,6 +474,11 @@ impl Component for ClusterComponent {
                 tracing::info!("Cluster: pressing c, showing security view");
                 Ok(Some(Action::ShowSecurity))
             }
+            KeyCode::Char('L') => {
+                // View lifecycle/versions
+                tracing::info!("Cluster: pressing L, showing lifecycle view");
+                Ok(Some(Action::ShowLifecycle))
+            }
             _ => Ok(None),
         }
     }
@@ -584,6 +589,9 @@ impl Component for ClusterComponent {
             Span::raw("  "),
             Span::raw("[c]").fg(Color::Yellow),
             Span::raw(" certs").dim(),
+            Span::raw("  "),
+            Span::raw("[L]").fg(Color::Yellow),
+            Span::raw(" lifecycle").dim(),
         ]))
         .block(
             Block::default()

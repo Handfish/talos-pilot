@@ -65,6 +65,36 @@ pub enum ViewMode {
     #[default]
     Interfaces,   // Main view showing interfaces
     Connections,  // Drill-down view showing connections
+    KubeSpan,     // KubeSpan peer status
+}
+
+impl ViewMode {
+    /// Get the next view mode (for Tab cycling)
+    pub fn next(&self) -> Self {
+        match self {
+            ViewMode::Interfaces => ViewMode::Connections,
+            ViewMode::Connections => ViewMode::KubeSpan,
+            ViewMode::KubeSpan => ViewMode::Interfaces,
+        }
+    }
+
+    /// Get the previous view mode (for Shift+Tab cycling)
+    pub fn prev(&self) -> Self {
+        match self {
+            ViewMode::Interfaces => ViewMode::KubeSpan,
+            ViewMode::Connections => ViewMode::Interfaces,
+            ViewMode::KubeSpan => ViewMode::Connections,
+        }
+    }
+
+    /// Get display label for the tab
+    pub fn label(&self) -> &'static str {
+        match self {
+            ViewMode::Interfaces => "Interfaces",
+            ViewMode::Connections => "Connections",
+            ViewMode::KubeSpan => "KubeSpan",
+        }
+    }
 }
 
 /// Sort order for connection list
@@ -818,6 +848,23 @@ impl NetworkStatsComponent {
 
         let auto_indicator = if self.auto_refresh { "" } else { " [AUTO:OFF]" };
 
+        // Build tab bar for right side
+        let tab_ifaces = if self.view_mode == ViewMode::Interfaces {
+            Span::styled("[Interfaces]", Style::default().fg(Color::Cyan))
+        } else {
+            Span::styled(" Interfaces ", Style::default().fg(Color::DarkGray))
+        };
+        let tab_conns = if self.view_mode == ViewMode::Connections {
+            Span::styled("[Connections]", Style::default().fg(Color::Cyan))
+        } else {
+            Span::styled(" Connections ", Style::default().fg(Color::DarkGray))
+        };
+        let tab_kubespan = if self.view_mode == ViewMode::KubeSpan {
+            Span::styled("[KubeSpan]", Style::default().fg(Color::Cyan))
+        } else {
+            Span::styled(" KubeSpan ", Style::default().fg(Color::DarkGray))
+        };
+
         let spans = vec![
             Span::styled("Network: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(&self.hostname),
@@ -827,6 +874,10 @@ impl NetworkStatsComponent {
             Span::raw("  "),
             Span::styled(&device_count, Style::default().fg(Color::DarkGray)),
             Span::styled(auto_indicator, Style::default().fg(Color::Yellow)),
+            Span::raw("  │ "),
+            tab_ifaces,
+            tab_conns,
+            tab_kubespan,
         ];
 
         let header = Paragraph::new(Line::from(spans));
@@ -1173,6 +1224,8 @@ impl NetworkStatsComponent {
         let auto_label = if self.auto_refresh { "auto:ON" } else { "auto:OFF" };
 
         let spans = vec![
+            Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
+            Span::raw(" views  "),
             Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
             Span::raw(" connections  "),
             Span::styled("[1]", Style::default().fg(Color::Cyan)),
@@ -1204,6 +1257,23 @@ impl NetworkStatsComponent {
             self.selected_interface.clone().unwrap_or_else(|| "all".to_string())
         };
 
+        // Build tab bar for right side
+        let tab_ifaces = if self.view_mode == ViewMode::Interfaces {
+            Span::styled("[Interfaces]", Style::default().fg(Color::Cyan))
+        } else {
+            Span::styled(" Interfaces ", Style::default().fg(Color::DarkGray))
+        };
+        let tab_conns = if self.view_mode == ViewMode::Connections {
+            Span::styled("[Connections]", Style::default().fg(Color::Cyan))
+        } else {
+            Span::styled(" Connections ", Style::default().fg(Color::DarkGray))
+        };
+        let tab_kubespan = if self.view_mode == ViewMode::KubeSpan {
+            Span::styled("[KubeSpan]", Style::default().fg(Color::Cyan))
+        } else {
+            Span::styled(" KubeSpan ", Style::default().fg(Color::DarkGray))
+        };
+
         let mut spans = vec![
             Span::styled("Connections: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(&iface_display, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -1212,6 +1282,10 @@ impl NetworkStatsComponent {
             Span::raw("  "),
             Span::styled(format!("{} connections", conn_count), Style::default().fg(Color::DarkGray)),
             Span::styled(filter_label, Style::default().fg(Color::Yellow)),
+            Span::raw("  │ "),
+            tab_ifaces,
+            tab_conns,
+            tab_kubespan,
         ];
 
         // Show visual mode indicator
@@ -1395,6 +1469,8 @@ impl NetworkStatsComponent {
         } else {
             // Normal mode footer
             vec![
+                Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
+                Span::raw(" views  "),
                 Span::styled("[1]", Style::default().fg(Color::Cyan)),
                 Span::raw(" state  "),
                 Span::styled("[2]", Style::default().fg(Color::Cyan)),
@@ -1570,6 +1646,118 @@ impl NetworkStatsComponent {
         self.draw_conn_detail(frame, chunks[3]);
         self.draw_conn_footer(frame, chunks[4]);
     }
+
+    /// Draw the KubeSpan peer status view
+    fn draw_kubespan_view(&mut self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // Tab bar
+            Constraint::Min(5),    // Content
+            Constraint::Length(1), // Footer
+        ])
+        .split(area);
+
+        // Tab bar
+        let tabs = Line::from(vec![
+            Span::raw(" "),
+            if self.view_mode == ViewMode::Interfaces {
+                Span::styled(" Interfaces ", Style::default().fg(Color::Black).bg(Color::Cyan))
+            } else {
+                Span::styled(" Interfaces ", Style::default().fg(Color::DarkGray))
+            },
+            Span::raw(" "),
+            if self.view_mode == ViewMode::Connections {
+                Span::styled(" Connections ", Style::default().fg(Color::Black).bg(Color::Cyan))
+            } else {
+                Span::styled(" Connections ", Style::default().fg(Color::DarkGray))
+            },
+            Span::raw(" "),
+            if self.view_mode == ViewMode::KubeSpan {
+                Span::styled(" KubeSpan ", Style::default().fg(Color::Black).bg(Color::Cyan))
+            } else {
+                Span::styled(" KubeSpan ", Style::default().fg(Color::DarkGray))
+            },
+        ]);
+        frame.render_widget(Paragraph::new(tabs), chunks[0]);
+
+        // Content - placeholder until COSI API is available
+        let content_chunks = Layout::vertical([
+            Constraint::Length(3), // Header
+            Constraint::Min(5),    // Info section
+        ])
+        .split(chunks[1]);
+
+        // Header
+        let header = Paragraph::new(format!(" KubeSpan │ {} ({})", self.hostname, self.address))
+            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        frame.render_widget(header, content_chunks[0]);
+
+        // Info section - explain status and how to check manually
+        let info_lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  KubeSpan Status", Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled("Note: ", Style::default().fg(Color::DarkGray)),
+                Span::raw("KubeSpan peer data requires COSI Resource API"),
+            ]),
+            Line::from(vec![
+                Span::raw("        (scheduled for talos-rs extension)"),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  To check KubeSpan status manually:", Style::default().fg(Color::Cyan)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("    talosctl get kubespanpeerstatus", Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("    talosctl get kubespanendpoint", Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("    talosctl get kubespanlinkstatus", Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Expected Features:", Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("    • ", Style::default().fg(Color::DarkGray)),
+                Span::raw("Peer connectivity status (up/down)"),
+            ]),
+            Line::from(vec![
+                Span::styled("    • ", Style::default().fg(Color::DarkGray)),
+                Span::raw("Endpoint discovery (direct/relay)"),
+            ]),
+            Line::from(vec![
+                Span::styled("    • ", Style::default().fg(Color::DarkGray)),
+                Span::raw("Link quality metrics (latency, jitter)"),
+            ]),
+            Line::from(vec![
+                Span::styled("    • ", Style::default().fg(Color::DarkGray)),
+                Span::raw("WireGuard handshake state"),
+            ]),
+        ];
+
+        let info = Paragraph::new(info_lines)
+            .block(Block::default().borders(Borders::NONE));
+        frame.render_widget(info, content_chunks[1]);
+
+        // Footer
+        let footer = Line::from(vec![
+            Span::styled(" Tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" cycle views "),
+            Span::styled("q", Style::default().fg(Color::Cyan)),
+            Span::raw(" back "),
+            Span::styled("r", Style::default().fg(Color::Cyan)),
+            Span::raw(" refresh"),
+        ]);
+        frame.render_widget(Paragraph::new(footer), chunks[2]);
+    }
 }
 
 impl NetworkStatsComponent {
@@ -1614,9 +1802,34 @@ impl NetworkStatsComponent {
                 self.auto_refresh = !self.auto_refresh;
                 Ok(None)
             }
+            KeyCode::Tab => {
+                self.view_mode = self.view_mode.next();
+                Ok(None)
+            }
+            KeyCode::BackTab => {
+                self.view_mode = self.view_mode.prev();
+                Ok(None)
+            }
             // Packet capture disabled - causes feedback loop without BPF filter
             // (capturing on management interface captures its own gRPC traffic)
             // TODO: Re-enable when BPF filter support is added (e.g., "not port 50000")
+            _ => Ok(None),
+        }
+    }
+
+    /// Handle key events in KubeSpan view
+    fn handle_kubespan_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Ok(Some(Action::Back)),
+            KeyCode::Char('r') => Ok(Some(Action::Refresh)),
+            KeyCode::Tab => {
+                self.view_mode = self.view_mode.next();
+                Ok(None)
+            }
+            KeyCode::BackTab => {
+                self.view_mode = self.view_mode.prev();
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }
@@ -1755,6 +1968,16 @@ impl NetworkStatsComponent {
             KeyCode::Char('t') => {
                 self.show_routing_table();
                 Ok(Some(Action::Refresh)) // Trigger fetch immediately
+            }
+
+            // Tab cycling between views
+            KeyCode::Tab => {
+                self.view_mode = self.view_mode.next();
+                Ok(None)
+            }
+            KeyCode::BackTab => {
+                self.view_mode = self.view_mode.prev();
+                Ok(None)
             }
 
             // Packet capture disabled - causes feedback loop without BPF filter
@@ -1947,6 +2170,7 @@ impl Component for NetworkStatsComponent {
         match self.view_mode {
             ViewMode::Interfaces => self.handle_interfaces_key(key),
             ViewMode::Connections => self.handle_connections_key(key),
+            ViewMode::KubeSpan => self.handle_kubespan_key(key),
         }
     }
 
@@ -2007,6 +2231,7 @@ impl Component for NetworkStatsComponent {
         match self.view_mode {
             ViewMode::Interfaces => self.draw_interfaces_view(frame, main_area),
             ViewMode::Connections => self.draw_connections_view(frame, main_area),
+            ViewMode::KubeSpan => self.draw_kubespan_view(frame, main_area),
         }
 
         // Draw output pane if shown

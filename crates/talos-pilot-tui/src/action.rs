@@ -39,6 +39,8 @@ pub enum Action {
     ApplyDiagnosticFix,
     /// Show security/certificates view
     ShowSecurity,
+    /// Show lifecycle/version view
+    ShowLifecycle,
 
     // UI state
     Tick,

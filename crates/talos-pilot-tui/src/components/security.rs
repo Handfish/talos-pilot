@@ -168,8 +168,14 @@ impl SecurityComponent {
                     // Parse client certificate
                     if let Ok(pem_data) = context.client_cert_pem() {
                         if let Ok(cert_info) = pki::parse_certificate("talosconfig", &pem_data) {
-                            // Extract RBAC role from subject (e.g., "os:admin")
-                            pki.rbac_role = Some(cert_info.subject.clone());
+                            // Extract RBAC role from subject
+                            // Subject format is like "O=os:admin" - extract just the role part
+                            let role = cert_info.subject
+                                .strip_prefix("O=")
+                                .or_else(|| cert_info.subject.strip_prefix("CN="))
+                                .unwrap_or(&cert_info.subject)
+                                .to_string();
+                            pki.rbac_role = Some(role);
                             pki.rbac_enabled = true;
                             pki.client_certs.push(cert_info);
                         }
@@ -239,15 +245,16 @@ impl SecurityComponent {
     async fn load_encryption_status(&mut self) {
         // For now, show placeholder - actual implementation would query VolumeStatus
         // via Talos resource API which isn't exposed yet in talos-rs
+        // TODO: Add talos-rs method for querying VolumeStatus resource
         self.encryption_status = EncryptionStatus {
             volumes: vec![
                 VolumeEncryption {
                     name: "STATE".to_string(),
-                    provider: EncryptionProvider::Unknown("check node".to_string()),
+                    provider: EncryptionProvider::Unknown("run: talosctl get volumestatus".to_string()),
                 },
                 VolumeEncryption {
                     name: "EPHEMERAL".to_string(),
-                    provider: EncryptionProvider::Unknown("check node".to_string()),
+                    provider: EncryptionProvider::Unknown("run: talosctl get volumestatus".to_string()),
                 },
             ],
         };
@@ -362,7 +369,7 @@ impl SecurityComponent {
                         EncryptionProvider::NodeID => "Key derived from node UUID. Provides minimal protection.",
                         EncryptionProvider::Tpm => "Key sealed to TPM. Provides strong hardware-backed encryption.",
                         EncryptionProvider::Kms => "Key managed by external KMS. Provides strong enterprise encryption.",
-                        EncryptionProvider::Unknown(_) => "Encryption status could not be determined.",
+                        EncryptionProvider::Unknown(_) => "Encryption status requires querying the node.\nRun: talosctl get volumestatus -n <node-ip>\n\nThis will be automated in a future release.",
                     }
                 )),
             });
