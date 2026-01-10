@@ -39,3 +39,6 @@ tracing.workspace = true
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

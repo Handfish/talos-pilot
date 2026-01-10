@@ -6,7 +6,7 @@ use crate::auth::create_channel;
 use crate::config::{Context, TalosConfig};
 use crate::error::TalosError;
 use crate::proto::machine::machine_service_client::MachineServiceClient;
-use crate::proto::machine::{EtcdMemberListRequest, LogsRequest};
+use crate::proto::machine::{EtcdMemberListRequest, LogsRequest, NetstatRequest, netstat_request};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tonic::Request;
@@ -542,6 +542,55 @@ impl TalosClient {
                 hostname,
                 total,
                 devices,
+            });
+        }
+
+        Ok(result)
+    }
+
+    /// Get network connections (netstat) from all configured nodes
+    ///
+    /// Returns TCP connections by default. Use filter to get only listening or connected.
+    pub async fn netstat(&self, filter: NetstatFilter) -> Result<Vec<NodeConnections>, TalosError> {
+        let mut client = self.machine_client();
+
+        // Must explicitly enable TCP protocols and host network
+        let request = self.with_nodes(Request::new(NetstatRequest {
+            filter: filter.to_proto(),
+            feature: Some(netstat_request::Feature { pid: false }),
+            l4proto: Some(netstat_request::L4proto {
+                tcp: true,
+                tcp6: true,
+                udp: false,
+                udp6: false,
+                udplite: false,
+                udplite6: false,
+                raw: false,
+                raw6: false,
+            }),
+            netns: Some(netstat_request::NetNs {
+                hostnetwork: true,
+                netns: vec![],
+                allnetns: false,
+            }),
+        }));
+
+        let response = client.netstat(request).await?;
+        let inner = response.into_inner();
+
+        let mut result = Vec::new();
+        for msg in inner.messages {
+            let hostname = msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default();
+
+            let connections: Vec<ConnectionInfo> = msg
+                .connectrecord
+                .into_iter()
+                .map(ConnectionInfo::from_proto)
+                .collect();
+
+            result.push(NodeConnections {
+                hostname,
+                connections,
             });
         }
 
@@ -1129,5 +1178,218 @@ impl NetDevRate {
     /// Get total dropped
     pub fn total_dropped(&self) -> u64 {
         self.rx_dropped + self.tx_dropped
+    }
+}
+
+// ==================== Connection Types ====================
+
+/// Filter for netstat queries
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetstatFilter {
+    /// All connections
+    #[default]
+    All,
+    /// Only connected (ESTABLISHED, etc.)
+    Connected,
+    /// Only listening
+    Listening,
+}
+
+impl NetstatFilter {
+    fn to_proto(self) -> i32 {
+        match self {
+            NetstatFilter::All => 0,
+            NetstatFilter::Connected => 1,
+            NetstatFilter::Listening => 2,
+        }
+    }
+}
+
+/// Network connections for a node
+#[derive(Debug, Clone)]
+pub struct NodeConnections {
+    /// Node hostname
+    pub hostname: String,
+    /// Connections on this node
+    pub connections: Vec<ConnectionInfo>,
+}
+
+impl NodeConnections {
+    /// Count connections by state
+    pub fn count_by_state(&self) -> ConnectionCounts {
+        let mut counts = ConnectionCounts::default();
+        for conn in &self.connections {
+            match conn.state {
+                ConnectionState::Established => counts.established += 1,
+                ConnectionState::Listen => counts.listen += 1,
+                ConnectionState::TimeWait => counts.time_wait += 1,
+                ConnectionState::CloseWait => counts.close_wait += 1,
+                ConnectionState::SynSent => counts.syn_sent += 1,
+                _ => counts.other += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// Connection counts by state
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionCounts {
+    pub established: usize,
+    pub listen: usize,
+    pub time_wait: usize,
+    pub close_wait: usize,
+    pub syn_sent: usize,
+    pub other: usize,
+}
+
+impl ConnectionCounts {
+    /// Count connections by state from a slice of ConnectionInfo
+    pub fn count_by_state(connections: &[ConnectionInfo]) -> Self {
+        let mut counts = ConnectionCounts::default();
+        for conn in connections {
+            match conn.state {
+                ConnectionState::Established => counts.established += 1,
+                ConnectionState::Listen => counts.listen += 1,
+                ConnectionState::TimeWait => counts.time_wait += 1,
+                ConnectionState::CloseWait => counts.close_wait += 1,
+                ConnectionState::SynSent => counts.syn_sent += 1,
+                _ => counts.other += 1,
+            }
+        }
+        counts
+    }
+
+    /// Total number of connections
+    pub fn total(&self) -> usize {
+        self.established + self.listen + self.time_wait + self.close_wait + self.syn_sent + self.other
+    }
+
+    /// Check if there are any warning conditions
+    pub fn has_warnings(&self) -> bool {
+        self.time_wait > 100 || self.close_wait > 0 || self.syn_sent > 0
+    }
+}
+
+/// Information about a single network connection
+#[derive(Debug, Clone)]
+pub struct ConnectionInfo {
+    /// Protocol (tcp, tcp6, udp, etc.)
+    pub protocol: String,
+    /// Local IP address
+    pub local_ip: String,
+    /// Local port
+    pub local_port: u32,
+    /// Remote IP address (empty for LISTEN)
+    pub remote_ip: String,
+    /// Remote port (0 for LISTEN)
+    pub remote_port: u32,
+    /// Connection state
+    pub state: ConnectionState,
+    /// Receive queue size
+    pub rx_queue: u64,
+    /// Transmit queue size
+    pub tx_queue: u64,
+}
+
+impl ConnectionInfo {
+    fn from_proto(record: crate::proto::machine::ConnectRecord) -> Self {
+        Self {
+            protocol: record.l4proto,
+            local_ip: record.localip,
+            local_port: record.localport,
+            remote_ip: record.remoteip,
+            remote_port: record.remoteport,
+            state: ConnectionState::from_proto(record.state),
+            rx_queue: record.rxqueue,
+            tx_queue: record.txqueue,
+        }
+    }
+
+    /// Check if this is a listening socket
+    pub fn is_listening(&self) -> bool {
+        self.state == ConnectionState::Listen
+    }
+
+    /// Check if this is an established connection
+    pub fn is_established(&self) -> bool {
+        self.state == ConnectionState::Established
+    }
+
+    /// Format local address as "ip:port" or ":port" for listening
+    pub fn local_addr(&self) -> String {
+        if self.local_ip.is_empty() || self.local_ip == "0.0.0.0" || self.local_ip == "::" {
+            format!(":{}", self.local_port)
+        } else {
+            format!("{}:{}", self.local_ip, self.local_port)
+        }
+    }
+
+    /// Format remote address as "ip:port" or "-" for listening
+    pub fn remote_addr(&self) -> String {
+        if self.remote_ip.is_empty() || self.remote_port == 0 {
+            "-".to_string()
+        } else {
+            format!("{}:{}", self.remote_ip, self.remote_port)
+        }
+    }
+}
+
+/// Connection state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Established,
+    SynSent,
+    SynRecv,
+    FinWait1,
+    FinWait2,
+    TimeWait,
+    Close,
+    CloseWait,
+    LastAck,
+    Listen,
+    Closing,
+    Unknown,
+}
+
+impl ConnectionState {
+    fn from_proto(value: i32) -> Self {
+        match value {
+            1 => ConnectionState::Established,
+            2 => ConnectionState::SynSent,
+            3 => ConnectionState::SynRecv,
+            4 => ConnectionState::FinWait1,
+            5 => ConnectionState::FinWait2,
+            6 => ConnectionState::TimeWait,
+            7 => ConnectionState::Close,
+            8 => ConnectionState::CloseWait,
+            9 => ConnectionState::LastAck,
+            10 => ConnectionState::Listen,
+            11 => ConnectionState::Closing,
+            _ => ConnectionState::Unknown,
+        }
+    }
+
+    /// Get short name for display
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            ConnectionState::Established => "ESTABLISHED",
+            ConnectionState::SynSent => "SYN_SENT",
+            ConnectionState::SynRecv => "SYN_RECV",
+            ConnectionState::FinWait1 => "FIN_WAIT1",
+            ConnectionState::FinWait2 => "FIN_WAIT2",
+            ConnectionState::TimeWait => "TIME_WAIT",
+            ConnectionState::Close => "CLOSE",
+            ConnectionState::CloseWait => "CLOSE_WAIT",
+            ConnectionState::LastAck => "LAST_ACK",
+            ConnectionState::Listen => "LISTEN",
+            ConnectionState::Closing => "CLOSING",
+            ConnectionState::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// Check if this is a problematic state
+    pub fn is_problematic(&self) -> bool {
+        matches!(self, ConnectionState::CloseWait | ConnectionState::SynSent)
     }
 }

@@ -15,7 +15,10 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::time::Instant;
-use talos_rs::{NetDevRate, NetDevStats, TalosClient};
+use talos_rs::{
+    ConnectionCounts, ConnectionInfo, ConnectionState, NetDevRate, NetDevStats, NetstatFilter,
+    TalosClient,
+};
 
 /// Auto-refresh interval in seconds (faster than processes for responsive rates)
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 2;
@@ -35,6 +38,22 @@ impl SortBy {
             SortBy::Errors => "ERRORS",
         }
     }
+}
+
+/// View mode for the network component
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Interfaces,   // Main view showing interfaces
+    Connections,  // Drill-down view showing connections
+}
+
+/// Sort order for connection list
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnSortBy {
+    #[default]
+    State,  // Sort by connection state
+    Port,   // Sort by local port
 }
 
 /// Network stats component for viewing node network interfaces
@@ -69,6 +88,13 @@ pub struct NetworkStatsComponent {
     /// Total dropped across all devices
     total_dropped: u64,
 
+    /// Connection data from netstat
+    connections: Vec<ConnectionInfo>,
+    /// Connection counts by state
+    conn_counts: ConnectionCounts,
+    /// Service health status (port -> is_healthy)
+    service_health: HashMap<u16, bool>,
+
     /// Loading state
     loading: bool,
     /// Error message
@@ -78,6 +104,17 @@ pub struct NetworkStatsComponent {
     auto_refresh: bool,
     /// Last refresh time
     last_refresh: Option<Instant>,
+
+    /// Current view mode (Interfaces or Connections drill-down)
+    view_mode: ViewMode,
+    /// Selected connection index (for Connections view)
+    conn_selected: usize,
+    /// Connection table state
+    conn_table_state: TableState,
+    /// Connection sort order
+    conn_sort_by: ConnSortBy,
+    /// Filter to listening only
+    listening_only: bool,
 
     /// Client for API calls
     client: Option<TalosClient>,
@@ -93,6 +130,8 @@ impl NetworkStatsComponent {
     pub fn new(hostname: String, address: String) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
+        let mut conn_table_state = TableState::default();
+        conn_table_state.select(Some(0));
 
         Self {
             hostname,
@@ -108,10 +147,18 @@ impl NetworkStatsComponent {
             total_tx_rate: 0,
             total_errors: 0,
             total_dropped: 0,
+            connections: Vec::new(),
+            conn_counts: ConnectionCounts::default(),
+            service_health: HashMap::new(),
             loading: true,
             error: None,
             auto_refresh: true,
             last_refresh: None,
+            view_mode: ViewMode::Interfaces,
+            conn_selected: 0,
+            conn_table_state,
+            conn_sort_by: ConnSortBy::State,
+            listening_only: false,
             client: None,
         }
     }
@@ -137,9 +184,18 @@ impl NetworkStatsComponent {
         self.loading = true;
 
         let timeout = std::time::Duration::from_secs(10);
-        let result = tokio::time::timeout(timeout, client.network_device_stats()).await;
 
-        match result {
+        // Fetch both interface stats and netstat data concurrently
+        let dev_future = client.network_device_stats();
+        let conn_future = client.netstat(NetstatFilter::All);
+
+        let (dev_result, conn_result) = tokio::join!(
+            tokio::time::timeout(timeout, dev_future),
+            tokio::time::timeout(timeout, conn_future)
+        );
+
+        // Process interface stats
+        match dev_result {
             Ok(Ok(stats)) => {
                 if let Some(node_data) = stats.into_iter().next() {
                     self.update_devices(node_data.devices);
@@ -158,6 +214,31 @@ impl NetworkStatsComponent {
             }
         }
 
+        // Process netstat data (don't fail if this errors, connection data is supplementary)
+        match conn_result {
+            Ok(Ok(conn_data)) => {
+                if let Some(node_conns) = conn_data.into_iter().next() {
+                    self.update_connections(node_conns.connections);
+                } else {
+                    self.connections.clear();
+                    self.conn_counts = ConnectionCounts::default();
+                }
+            }
+            Ok(Err(_)) => {
+                // Silently ignore netstat errors - interface data still useful
+                self.connections.clear();
+                self.conn_counts = ConnectionCounts::default();
+            }
+            Err(_) => {
+                // Timeout on netstat - continue with interface data
+                self.connections.clear();
+                self.conn_counts = ConnectionCounts::default();
+            }
+        }
+
+        // Update service health based on connection data
+        self.update_service_health();
+
         // Reset selection if needed
         if !self.devices.is_empty() && self.selected >= self.devices.len() {
             self.selected = 0;
@@ -169,6 +250,28 @@ impl NetworkStatsComponent {
         self.last_refresh = Some(Instant::now());
 
         Ok(())
+    }
+
+    /// Update connections and calculate counts
+    fn update_connections(&mut self, connections: Vec<ConnectionInfo>) {
+        self.conn_counts = ConnectionCounts::count_by_state(&connections);
+        self.connections = connections;
+    }
+
+    /// Update service health indicators based on connection data
+    fn update_service_health(&mut self) {
+        self.service_health.clear();
+
+        // Key ports to monitor for Kubernetes
+        let key_ports: &[u16] = &[6443, 2379, 10250, 10259, 10257];
+
+        for port in key_ports {
+            // Check if port is listening
+            let is_listening = self.connections.iter().any(|c| {
+                c.local_port == *port as u32 && c.state == ConnectionState::Listen
+            });
+            self.service_health.insert(*port, is_listening);
+        }
     }
 
     /// Update devices and calculate rates
@@ -273,6 +376,84 @@ impl NetworkStatsComponent {
         self.rates.get(name)
     }
 
+    /// Get filtered and sorted connections for display
+    fn filtered_connections(&self) -> Vec<&ConnectionInfo> {
+        let mut conns: Vec<_> = self.connections.iter()
+            .filter(|c| !self.listening_only || c.state == ConnectionState::Listen)
+            .collect();
+
+        match self.conn_sort_by {
+            ConnSortBy::State => {
+                // Sort by state priority: LISTEN, ESTABLISHED, TIME_WAIT, CLOSE_WAIT, others
+                conns.sort_by(|a, b| {
+                    let priority = |s: &ConnectionState| match s {
+                        ConnectionState::Listen => 0,
+                        ConnectionState::Established => 1,
+                        ConnectionState::TimeWait => 2,
+                        ConnectionState::CloseWait => 3,
+                        ConnectionState::SynSent => 4,
+                        _ => 5,
+                    };
+                    priority(&a.state).cmp(&priority(&b.state))
+                        .then_with(|| a.local_port.cmp(&b.local_port))
+                });
+            }
+            ConnSortBy::Port => {
+                conns.sort_by(|a, b| a.local_port.cmp(&b.local_port));
+            }
+        }
+
+        conns
+    }
+
+    /// Navigate to previous connection
+    fn conn_select_prev(&mut self) {
+        let count = self.filtered_connections().len();
+        if count > 0 && self.conn_selected > 0 {
+            self.conn_selected -= 1;
+            self.conn_table_state.select(Some(self.conn_selected));
+        }
+    }
+
+    /// Navigate to next connection
+    fn conn_select_next(&mut self) {
+        let count = self.filtered_connections().len();
+        if count > 0 {
+            self.conn_selected = (self.conn_selected + 1).min(count - 1);
+            self.conn_table_state.select(Some(self.conn_selected));
+        }
+    }
+
+    /// Jump to first connection
+    fn conn_select_first(&mut self) {
+        let count = self.filtered_connections().len();
+        if count > 0 {
+            self.conn_selected = 0;
+            self.conn_table_state.select(Some(self.conn_selected));
+        }
+    }
+
+    /// Jump to last connection
+    fn conn_select_last(&mut self) {
+        let count = self.filtered_connections().len();
+        if count > 0 {
+            self.conn_selected = count - 1;
+            self.conn_table_state.select(Some(self.conn_selected));
+        }
+    }
+
+    /// Enter connection drill-down view
+    fn enter_connections_view(&mut self) {
+        self.view_mode = ViewMode::Connections;
+        self.conn_selected = 0;
+        self.conn_table_state.select(Some(0));
+    }
+
+    /// Return to interfaces view
+    fn exit_connections_view(&mut self) {
+        self.view_mode = ViewMode::Interfaces;
+    }
+
     /// Draw the header
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let device_count = format!("{} ifaces", self.devices.len());
@@ -333,15 +514,110 @@ impl NetworkStatsComponent {
         frame.render_widget(summary, area);
     }
 
+    /// Draw the connection summary bar
+    fn draw_connection_summary(&self, frame: &mut Frame, area: Rect) {
+        let cc = &self.conn_counts;
+        let has_warnings = cc.has_warnings();
+        let warning = if has_warnings { "! " } else { "" };
+
+        let mut spans = vec![
+            Span::styled(warning, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("Conns: ", Style::default().add_modifier(Modifier::BOLD)),
+        ];
+
+        // ESTABLISHED count
+        spans.push(Span::styled(
+            format!("{} ", cc.established),
+            Style::default().fg(Color::Green),
+        ));
+        spans.push(Span::styled("EST", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::raw("  "));
+
+        // LISTEN count
+        spans.push(Span::styled(
+            format!("{} ", cc.listen),
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::styled("LISTEN", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::raw("  "));
+
+        // TIME_WAIT count (yellow if > 100)
+        let tw_style = if cc.time_wait > 100 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(format!("{} ", cc.time_wait), tw_style));
+        spans.push(Span::styled("TIME_WAIT", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::raw("  "));
+
+        // CLOSE_WAIT count (red if > 0)
+        let cw_style = if cc.close_wait > 0 {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(format!("{} ", cc.close_wait), cw_style));
+        spans.push(Span::styled("CLOSE_WAIT", Style::default().fg(Color::DarkGray)));
+
+        let summary = Paragraph::new(Line::from(spans));
+        frame.render_widget(summary, area);
+    }
+
+    /// Draw service health indicators
+    fn draw_service_health(&self, frame: &mut Frame, area: Rect) {
+        // Define services with their expected ports
+        let services = [
+            ("API", 6443_u16),
+            ("Etcd", 2379),
+            ("Kubelet", 10250),
+            ("Scheduler", 10259),
+            ("Controller", 10257),
+        ];
+
+        let mut spans = Vec::new();
+
+        for (name, port) in services {
+            let is_healthy = self.service_health.get(&port).copied().unwrap_or(false);
+            let indicator = if is_healthy { "●" } else { "○" };
+            let color = if is_healthy { Color::Green } else { Color::Red };
+
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+
+            spans.push(Span::styled(
+                format!("{}:{} ", name, port),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(indicator, Style::default().fg(color)));
+        }
+
+        let health = Paragraph::new(Line::from(spans));
+        frame.render_widget(health, area);
+    }
+
     /// Draw warning banner if there are errors
     fn draw_warning(&self, frame: &mut Frame, area: Rect) {
         let mut messages = Vec::new();
 
+        // Interface warnings
         if self.total_errors > 0 {
-            messages.push(format!("{} interface errors detected", self.total_errors));
+            messages.push(format!("{} interface errors", self.total_errors));
         }
         if self.total_dropped > 0 {
-            messages.push(format!("{} dropped packets", self.total_dropped));
+            messages.push(format!("{} dropped", self.total_dropped));
+        }
+
+        // Connection warnings
+        if self.conn_counts.time_wait > 100 {
+            messages.push(format!("High TIME_WAIT ({})", self.conn_counts.time_wait));
+        }
+        if self.conn_counts.close_wait > 0 {
+            messages.push(format!("CLOSE_WAIT ({})", self.conn_counts.close_wait));
+        }
+        if self.conn_counts.syn_sent > 0 {
+            messages.push(format!("SYN_SENT stuck ({})", self.conn_counts.syn_sent));
         }
 
         if !messages.is_empty() {
@@ -369,8 +645,8 @@ impl NetworkStatsComponent {
             Cell::from("TX DROP"),
         ];
         let header = Row::new(header_cells)
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .height(1);
+            .style(Style::default().add_modifier(Modifier::DIM))
+            .bottom_margin(1);
 
         let rows: Vec<Row> = self.devices.iter().enumerate().map(|(idx, dev)| {
             let rate = self.get_rate(&dev.name);
@@ -436,7 +712,12 @@ impl NetworkStatsComponent {
 
         let table = Table::new(rows, widths)
             .header(header)
-            .row_highlight_style(Style::default().bg(Color::DarkGray));
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
 
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
@@ -490,17 +771,32 @@ impl NetworkStatsComponent {
             ]),
         ];
 
+        // Add connection summary line if we have connection data
+        let mut lines = lines;
+        if !self.connections.is_empty() {
+            let cc = &self.conn_counts;
+            lines.push(Line::from(vec![
+                Span::styled("Connections: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{} ", cc.established), Style::default().fg(Color::Green)),
+                Span::styled("EST  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{} ", cc.listen), Style::default().fg(Color::Cyan)),
+                Span::styled("LISTEN  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{} ", cc.time_wait),
+                    if cc.time_wait > 100 { Style::default().fg(Color::Yellow) } else { Style::default() }),
+                Span::styled("TIME_WAIT  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{} ", cc.close_wait),
+                    if cc.close_wait > 0 { Style::default().fg(Color::Red) } else { Style::default() }),
+                Span::styled("CLOSE_WAIT", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
         // Add warning line if there are errors
-        let lines = if has_errors {
-            let mut lines = lines;
+        if has_errors {
             lines.push(Line::from(vec![
                 Span::styled("! ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                 Span::styled("Interface has errors - check cable/driver/hardware", Style::default().fg(Color::Yellow)),
             ]));
-            lines
-        } else {
-            lines
-        };
+        }
 
         let block = Block::default()
             .borders(Borders::TOP)
@@ -514,20 +810,19 @@ impl NetworkStatsComponent {
         frame.render_widget(detail, area);
     }
 
-    /// Draw the footer with keybindings
+    /// Draw the footer with keybindings (interfaces view)
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let auto_label = if self.auto_refresh { "auto:ON" } else { "auto:OFF" };
 
         let spans = vec![
+            Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
+            Span::raw(" connections  "),
             Span::styled("[1]", Style::default().fg(Color::Cyan)),
             Span::raw(" traffic  "),
             Span::styled("[2]", Style::default().fg(Color::Cyan)),
             Span::raw(" errors  "),
-            Span::styled("[r]", Style::default().fg(Color::Cyan)),
-            Span::raw(" refresh  "),
             Span::styled("[a]", Style::default().fg(Color::Cyan)),
             Span::raw(format!(" {}  ", auto_label)),
-            Span::raw("          "),
             Span::styled("[q]", Style::default().fg(Color::Cyan)),
             Span::raw(" back"),
         ];
@@ -536,12 +831,184 @@ impl NetworkStatsComponent {
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(footer, area);
     }
+
+    // ========== Connection Drill-Down View ==========
+
+    /// Draw the connection view header
+    fn draw_conn_header(&self, frame: &mut Frame, area: Rect) {
+        let conn_count = self.filtered_connections().len();
+        let filter_label = if self.listening_only { " [LISTEN ONLY]" } else { "" };
+
+        let spans = vec![
+            Span::styled("Connections: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(&self.hostname),
+            Span::styled(" (", Style::default().fg(Color::DarkGray)),
+            Span::raw(&self.address),
+            Span::styled(")", Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(format!("{} connections", conn_count), Style::default().fg(Color::DarkGray)),
+            Span::styled(filter_label, Style::default().fg(Color::Yellow)),
+        ];
+
+        let header = Paragraph::new(Line::from(spans));
+        frame.render_widget(header, area);
+    }
+
+    /// Draw the connection summary bar
+    fn draw_conn_summary_bar(&self, frame: &mut Frame, area: Rect) {
+        let cc = &self.conn_counts;
+
+        let spans = vec![
+            Span::styled(format!("{} ", cc.established), Style::default().fg(Color::Green)),
+            Span::styled("ESTABLISHED", Style::default().fg(Color::DarkGray)),
+            Span::raw("   "),
+            Span::styled(format!("{} ", cc.listen), Style::default().fg(Color::Cyan)),
+            Span::styled("LISTEN", Style::default().fg(Color::DarkGray)),
+            Span::raw("   "),
+            Span::styled(format!("{} ", cc.time_wait),
+                if cc.time_wait > 100 { Style::default().fg(Color::Yellow) } else { Style::default() }),
+            Span::styled("TIME_WAIT", Style::default().fg(Color::DarkGray)),
+            Span::raw("   "),
+            Span::styled(format!("{} ", cc.close_wait),
+                if cc.close_wait > 0 { Style::default().fg(Color::Red) } else { Style::default() }),
+            Span::styled("CLOSE_WAIT", Style::default().fg(Color::DarkGray)),
+        ];
+
+        let summary = Paragraph::new(Line::from(spans));
+        frame.render_widget(summary, area);
+    }
+
+    /// Draw the connection table
+    fn draw_conn_table(&mut self, frame: &mut Frame, area: Rect) {
+        // Build column headers with sort indicators
+        let state_header = if self.conn_sort_by == ConnSortBy::State { "STATE▼" } else { "STATE" };
+        let port_header = if self.conn_sort_by == ConnSortBy::Port { "LOCAL▼" } else { "LOCAL" };
+
+        let header_cells = [
+            Cell::from("PROTO"),
+            Cell::from(port_header),
+            Cell::from("REMOTE"),
+            Cell::from(state_header),
+            Cell::from("RX/TX Q"),
+        ];
+        let header = Row::new(header_cells)
+            .style(Style::default().add_modifier(Modifier::DIM))
+            .bottom_margin(1);
+
+        let conns = self.filtered_connections();
+        let rows: Vec<Row> = conns.iter().map(|conn| {
+            // Format local address
+            let local = if conn.local_port > 0 {
+                format!(":{}", conn.local_port)
+            } else {
+                "-".to_string()
+            };
+
+            // Format remote address
+            let remote = if conn.remote_port > 0 {
+                format!("{}:{}", conn.remote_ip, conn.remote_port)
+            } else {
+                "-".to_string()
+            };
+
+            // Format state with color
+            let (state_str, state_color) = match conn.state {
+                ConnectionState::Established => ("ESTABLISHED", Color::Green),
+                ConnectionState::Listen => ("LISTEN", Color::Cyan),
+                ConnectionState::TimeWait => ("TIME_WAIT", if self.conn_counts.time_wait > 100 { Color::Yellow } else { Color::White }),
+                ConnectionState::CloseWait => ("CLOSE_WAIT", Color::Red),
+                ConnectionState::SynSent => ("SYN_SENT", Color::Yellow),
+                ConnectionState::SynRecv => ("SYN_RECV", Color::Yellow),
+                ConnectionState::FinWait1 => ("FIN_WAIT1", Color::DarkGray),
+                ConnectionState::FinWait2 => ("FIN_WAIT2", Color::DarkGray),
+                ConnectionState::Closing => ("CLOSING", Color::DarkGray),
+                ConnectionState::LastAck => ("LAST_ACK", Color::DarkGray),
+                ConnectionState::Close => ("CLOSE", Color::DarkGray),
+                ConnectionState::Unknown => ("UNKNOWN", Color::DarkGray),
+            };
+
+            // Format queues
+            let queues = format!("{}/{}", conn.rx_queue, conn.tx_queue);
+
+            Row::new([
+                Cell::from(conn.protocol.clone()),
+                Cell::from(local),
+                Cell::from(remote),
+                Cell::from(state_str).style(Style::default().fg(state_color)),
+                Cell::from(queues),
+            ])
+        }).collect();
+
+        let widths = [
+            Constraint::Length(6),    // PROTO
+            Constraint::Length(8),    // LOCAL
+            Constraint::Length(24),   // REMOTE
+            Constraint::Length(12),   // STATE
+            Constraint::Length(10),   // RX/TX Q
+        ];
+
+        let table = Table::new(rows, widths)
+            .header(header)
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+
+        frame.render_stateful_widget(table, area, &mut self.conn_table_state);
+    }
+
+    /// Draw footer for connection view
+    fn draw_conn_footer(&self, frame: &mut Frame, area: Rect) {
+        let listen_label = if self.listening_only { "all" } else { "listen only" };
+
+        let spans = vec![
+            Span::styled("[1]", Style::default().fg(Color::Cyan)),
+            Span::raw(" state  "),
+            Span::styled("[2]", Style::default().fg(Color::Cyan)),
+            Span::raw(" port  "),
+            Span::styled("[l]", Style::default().fg(Color::Cyan)),
+            Span::raw(format!(" {}  ", listen_label)),
+            Span::styled("[r]", Style::default().fg(Color::Cyan)),
+            Span::raw(" refresh  "),
+            Span::styled("[q]", Style::default().fg(Color::Cyan)),
+            Span::raw(" back"),
+        ];
+
+        let footer = Paragraph::new(Line::from(spans))
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(footer, area);
+    }
+
+    /// Draw the connection drill-down view
+    fn draw_connections_view(&mut self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::vertical([
+            Constraint::Length(1),  // Header
+            Constraint::Length(1),  // Summary bar
+            Constraint::Min(5),     // Connection table
+            Constraint::Length(1),  // Footer
+        ])
+        .split(area);
+
+        self.draw_conn_header(frame, chunks[0]);
+        self.draw_conn_summary_bar(frame, chunks[1]);
+        self.draw_conn_table(frame, chunks[2]);
+        self.draw_conn_footer(frame, chunks[3]);
+    }
 }
 
-impl Component for NetworkStatsComponent {
-    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+impl NetworkStatsComponent {
+    /// Handle key events in Interfaces view
+    fn handle_interfaces_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Ok(Some(Action::Back)),
+            KeyCode::Enter => {
+                if !self.connections.is_empty() {
+                    self.enter_connections_view();
+                }
+                Ok(None)
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.select_next();
                 Ok(None)
@@ -577,6 +1044,123 @@ impl Component for NetworkStatsComponent {
         }
     }
 
+    /// Handle key events in Connections view
+    fn handle_connections_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.exit_connections_view();
+                Ok(None)
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.conn_select_next();
+                Ok(None)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.conn_select_prev();
+                Ok(None)
+            }
+            KeyCode::Char('g') => {
+                self.conn_select_first();
+                Ok(None)
+            }
+            KeyCode::Char('G') => {
+                self.conn_select_last();
+                Ok(None)
+            }
+            KeyCode::Char('1') => {
+                self.conn_sort_by = ConnSortBy::State;
+                self.conn_selected = 0;
+                self.conn_table_state.select(Some(0));
+                Ok(None)
+            }
+            KeyCode::Char('2') => {
+                self.conn_sort_by = ConnSortBy::Port;
+                self.conn_selected = 0;
+                self.conn_table_state.select(Some(0));
+                Ok(None)
+            }
+            KeyCode::Char('l') => {
+                self.listening_only = !self.listening_only;
+                self.conn_selected = 0;
+                self.conn_table_state.select(Some(0));
+                Ok(None)
+            }
+            KeyCode::Char('r') => Ok(Some(Action::Refresh)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Draw the interfaces view (main view)
+    fn draw_interfaces_view(&mut self, frame: &mut Frame, area: Rect) {
+        // Build constraints dynamically based on what we need to show
+        let has_warning = self.total_errors > 0 || self.total_dropped > 0 || self.conn_counts.has_warnings();
+        let has_connections = !self.connections.is_empty();
+
+        let mut constraints = vec![
+            Constraint::Length(1),  // Header
+            Constraint::Length(1),  // Traffic summary bar
+        ];
+
+        if has_connections {
+            constraints.push(Constraint::Length(1));  // Connection summary bar
+            constraints.push(Constraint::Length(1));  // Service health indicators
+        }
+
+        if has_warning {
+            constraints.push(Constraint::Length(1));  // Warning
+        }
+
+        constraints.push(Constraint::Min(5));     // Device table (takes remaining space)
+        constraints.push(Constraint::Length(4));  // Detail section
+        constraints.push(Constraint::Length(1));  // Footer
+
+        let chunks = Layout::vertical(constraints).split(area);
+
+        let mut idx = 0;
+
+        // Header
+        self.draw_header(frame, chunks[idx]);
+        idx += 1;
+
+        // Traffic summary
+        self.draw_summary_bar(frame, chunks[idx]);
+        idx += 1;
+
+        // Connection data (if available)
+        if has_connections {
+            self.draw_connection_summary(frame, chunks[idx]);
+            idx += 1;
+            self.draw_service_health(frame, chunks[idx]);
+            idx += 1;
+        }
+
+        // Warning (if any)
+        if has_warning {
+            self.draw_warning(frame, chunks[idx]);
+            idx += 1;
+        }
+
+        // Device table
+        self.draw_device_table(frame, chunks[idx]);
+        idx += 1;
+
+        // Detail section
+        self.draw_detail_section(frame, chunks[idx]);
+        idx += 1;
+
+        // Footer
+        self.draw_footer(frame, chunks[idx]);
+    }
+}
+
+impl Component for NetworkStatsComponent {
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        match self.view_mode {
+            ViewMode::Interfaces => self.handle_interfaces_key(key),
+            ViewMode::Connections => self.handle_connections_key(key),
+        }
+    }
+
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         if let Action::Tick = action {
             // Check for auto-refresh
@@ -607,30 +1191,10 @@ impl Component for NetworkStatsComponent {
             return Ok(());
         }
 
-        // Calculate layout
-        let has_warning = self.total_errors > 0 || self.total_dropped > 0;
-        let warning_height = if has_warning { 1 } else { 0 };
-
-        let chunks = Layout::vertical([
-            Constraint::Length(1),                    // Header
-            Constraint::Length(1),                    // Summary bar
-            Constraint::Length(warning_height),       // Warning (if any)
-            Constraint::Min(5),                       // Device table
-            Constraint::Length(4),                    // Detail section
-            Constraint::Length(1),                    // Footer
-        ])
-        .split(area);
-
-        self.draw_header(frame, chunks[0]);
-        self.draw_summary_bar(frame, chunks[1]);
-
-        if has_warning {
-            self.draw_warning(frame, chunks[2]);
+        match self.view_mode {
+            ViewMode::Interfaces => self.draw_interfaces_view(frame, area),
+            ViewMode::Connections => self.draw_connections_view(frame, area),
         }
-
-        self.draw_device_table(frame, chunks[3]);
-        self.draw_detail_section(frame, chunks[4]);
-        self.draw_footer(frame, chunks[5]);
 
         Ok(())
     }

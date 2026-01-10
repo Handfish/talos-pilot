@@ -71,6 +71,8 @@ pub use client::{
     NodeProcesses, ProcessInfo, ProcessState,
     // Network types
     NetDevRate, NetDevStats, NodeNetworkStats,
+    // Connection types
+    ConnectionCounts, ConnectionInfo, ConnectionState, NetstatFilter, NodeConnections,
 };
 pub use config::{Context, TalosConfig};
 pub use error::TalosError;
