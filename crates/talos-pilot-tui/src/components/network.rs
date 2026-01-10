@@ -39,6 +39,9 @@ fn port_to_service(port: u32) -> Option<&'static str> {
 /// Auto-refresh interval in seconds (faster than processes for responsive rates)
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 2;
 
+/// Max capture size before auto-stop (500 KB - quick sample, not full capture)
+const MAX_CAPTURE_SIZE: usize = 500 * 1024;
+
 /// Sort order for device list
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortBy {
@@ -79,6 +82,28 @@ pub enum PendingAction {
     RestartService(String, String),
 }
 
+/// File viewer overlay type
+#[derive(Debug, Clone)]
+pub enum FileViewerType {
+    /// DNS configuration (/etc/resolv.conf)
+    DnsConfig,
+    /// Routing table (/proc/net/route)
+    RoutingTable,
+}
+
+/// File viewer overlay state
+#[derive(Debug, Clone)]
+pub struct FileViewerOverlay {
+    /// Type of file being viewed
+    pub viewer_type: FileViewerType,
+    /// Title for the overlay
+    pub title: String,
+    /// Content lines
+    pub lines: Vec<String>,
+    /// Scroll offset
+    pub scroll: usize,
+}
+
 /// Command output entry for the output pane
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
@@ -90,6 +115,26 @@ pub struct CommandOutput {
     pub timestamp: Instant,
     /// Whether the command succeeded
     pub success: bool,
+}
+
+/// Packet capture state
+#[derive(Debug, Clone, Default)]
+pub enum CaptureState {
+    #[default]
+    Idle,
+    /// Capturing packets (interface, start time)
+    Capturing(String, Instant),
+}
+
+/// Packet capture data holder
+#[derive(Debug, Default)]
+pub struct CaptureData {
+    /// State of the capture
+    pub state: CaptureState,
+    /// Captured pcap data
+    pub data: Vec<u8>,
+    /// Receiver for capture stream (Option to allow taking ownership)
+    pub receiver: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 /// Network stats component for viewing node network interfaces
@@ -177,6 +222,12 @@ pub struct NetworkStatsComponent {
     /// Command output history (most recent first)
     command_output: Option<CommandOutput>,
 
+    /// File viewer overlay (DNS config, routing table)
+    file_viewer: Option<FileViewerOverlay>,
+
+    /// Packet capture state and data
+    capture: CaptureData,
+
     /// Client for API calls
     client: Option<TalosClient>,
 }
@@ -231,6 +282,8 @@ impl NetworkStatsComponent {
             pending_restart_service: None,
             show_output_pane: false,
             command_output: None,
+            file_viewer: None,
+            capture: CaptureData::default(),
             client: None,
         }
     }
@@ -1350,10 +1403,10 @@ impl NetworkStatsComponent {
                 Span::raw(format!(" {}  ", listen_label)),
                 Span::styled("[a]", Style::default().fg(Color::Cyan)),
                 Span::raw(format!(" {}  ", all_label)),
-                Span::styled("[V]", Style::default().fg(Color::Cyan)),
-                Span::raw(" visual  "),
-                Span::styled("[y]", Style::default().fg(Color::Cyan)),
-                Span::raw(" yank  "),
+                Span::styled("[d]", Style::default().fg(Color::Cyan)),
+                Span::raw(" dns  "),
+                Span::styled("[t]", Style::default().fg(Color::Cyan)),
+                Span::raw(" routes  "),
                 Span::styled("[q]", Style::default().fg(Color::Cyan)),
                 Span::raw(" back"),
             ]
@@ -1561,6 +1614,9 @@ impl NetworkStatsComponent {
                 self.auto_refresh = !self.auto_refresh;
                 Ok(None)
             }
+            // Packet capture disabled - causes feedback loop without BPF filter
+            // (capturing on management interface captures its own gRPC traffic)
+            // TODO: Re-enable when BPF filter support is added (e.g., "not port 50000")
             _ => Ok(None),
         }
     }
@@ -1689,6 +1745,21 @@ impl NetworkStatsComponent {
                 Ok(None)
             }
 
+            // Show DNS config (/etc/resolv.conf)
+            KeyCode::Char('d') => {
+                self.show_dns_config();
+                Ok(Some(Action::Refresh)) // Trigger fetch immediately
+            }
+
+            // Show routing table (/proc/net/route)
+            KeyCode::Char('t') => {
+                self.show_routing_table();
+                Ok(Some(Action::Refresh)) // Trigger fetch immediately
+            }
+
+            // Packet capture disabled - causes feedback loop without BPF filter
+            // TODO: Re-enable when BPF filter support is added
+
             _ => Ok(None),
         }
     }
@@ -1784,11 +1855,16 @@ impl NetworkStatsComponent {
         // Build constraints dynamically based on what we need to show
         let has_warning = self.total_errors > 0 || self.total_dropped > 0 || self.conn_counts.has_warnings();
         let has_connections = !self.connections.is_empty();
+        let is_capturing = self.is_capturing();
 
         let mut constraints = vec![
             Constraint::Length(1),  // Header
             Constraint::Length(1),  // Traffic summary bar
         ];
+
+        if is_capturing {
+            constraints.push(Constraint::Length(1));  // Capture status bar
+        }
 
         if has_connections {
             constraints.push(Constraint::Length(1));  // Connection summary bar
@@ -1814,6 +1890,12 @@ impl NetworkStatsComponent {
         // Traffic summary
         self.draw_summary_bar(frame, chunks[idx]);
         idx += 1;
+
+        // Capture status bar (when capturing)
+        if is_capturing {
+            self.draw_capture_status(frame, chunks[idx]);
+            idx += 1;
+        }
 
         // Connection data (if available)
         if has_connections {
@@ -1844,6 +1926,11 @@ impl NetworkStatsComponent {
 
 impl Component for NetworkStatsComponent {
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        // If file viewer is shown, handle its keys
+        if self.file_viewer.is_some() {
+            return self.handle_file_viewer_key(key);
+        }
+
         // If output pane is shown, Esc closes it
         if self.show_output_pane {
             if matches!(key.code, KeyCode::Esc) {
@@ -1870,6 +1957,11 @@ impl Component for NetworkStatsComponent {
                 if time.elapsed() > std::time::Duration::from_secs(3) {
                     self.status_message = None;
                 }
+            }
+
+            // Poll packet capture for new data
+            if self.is_capturing() {
+                self.poll_capture();
             }
 
             // Check for auto-refresh
@@ -1930,6 +2022,11 @@ impl Component for NetworkStatsComponent {
         // Draw status message overlay if present
         if let Some((ref msg, _)) = self.status_message {
             self.draw_status_message(frame, area, msg);
+        }
+
+        // Draw file viewer overlay if open
+        if self.file_viewer.is_some() {
+            self.draw_file_viewer(frame, area);
         }
 
         Ok(())
@@ -2015,6 +2112,13 @@ impl NetworkStatsComponent {
     /// Check if there's a pending restart
     pub fn has_pending_restart(&self) -> bool {
         self.pending_restart_service.is_some()
+    }
+
+    /// Check if file viewer needs content fetched
+    pub fn file_viewer_needs_fetch(&self) -> bool {
+        self.file_viewer.as_ref()
+            .map(|v| v.lines.len() == 1 && v.lines[0] == "Loading...")
+            .unwrap_or(false)
     }
 
     /// Draw the confirmation dialog
@@ -2157,5 +2261,512 @@ impl NetworkStatsComponent {
 
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);
+    }
+}
+
+// File viewer methods
+impl NetworkStatsComponent {
+    /// Handle key events when file viewer is open
+    fn handle_file_viewer_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        match key.code {
+            // Close the viewer
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.file_viewer = None;
+                Ok(None)
+            }
+            // Scroll up
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(ref mut viewer) = self.file_viewer {
+                    viewer.scroll = viewer.scroll.saturating_sub(1);
+                }
+                Ok(None)
+            }
+            // Scroll down
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(ref mut viewer) = self.file_viewer {
+                    let max_scroll = viewer.lines.len().saturating_sub(10);
+                    viewer.scroll = (viewer.scroll + 1).min(max_scroll);
+                }
+                Ok(None)
+            }
+            // Page up / Ctrl+U (half page)
+            KeyCode::PageUp => {
+                if let Some(ref mut viewer) = self.file_viewer {
+                    viewer.scroll = viewer.scroll.saturating_sub(10);
+                }
+                Ok(None)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(ref mut viewer) = self.file_viewer {
+                    viewer.scroll = viewer.scroll.saturating_sub(10);
+                }
+                Ok(None)
+            }
+            // Page down / Ctrl+D (half page)
+            KeyCode::PageDown => {
+                if let Some(ref mut viewer) = self.file_viewer {
+                    let max_scroll = viewer.lines.len().saturating_sub(10);
+                    viewer.scroll = (viewer.scroll + 10).min(max_scroll);
+                }
+                Ok(None)
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(ref mut viewer) = self.file_viewer {
+                    let max_scroll = viewer.lines.len().saturating_sub(10);
+                    viewer.scroll = (viewer.scroll + 10).min(max_scroll);
+                }
+                Ok(None)
+            }
+            // Go to top
+            KeyCode::Char('g') => {
+                if let Some(ref mut viewer) = self.file_viewer {
+                    viewer.scroll = 0;
+                }
+                Ok(None)
+            }
+            // Go to bottom
+            KeyCode::Char('G') => {
+                if let Some(ref mut viewer) = self.file_viewer {
+                    viewer.scroll = viewer.lines.len().saturating_sub(10);
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Show DNS configuration overlay
+    fn show_dns_config(&mut self) {
+        // Request file fetch via action - actual fetch happens in refresh
+        self.file_viewer = Some(FileViewerOverlay {
+            viewer_type: FileViewerType::DnsConfig,
+            title: "DNS Configuration (/etc/resolv.conf)".to_string(),
+            lines: vec!["Loading...".to_string()],
+            scroll: 0,
+        });
+    }
+
+    /// Show routing table overlay
+    fn show_routing_table(&mut self) {
+        self.file_viewer = Some(FileViewerOverlay {
+            viewer_type: FileViewerType::RoutingTable,
+            title: "Routing Table (/proc/net/route)".to_string(),
+            lines: vec!["Loading...".to_string()],
+            scroll: 0,
+        });
+    }
+
+    /// Fetch file content for the file viewer
+    pub async fn fetch_file_content(&mut self) {
+        // Get viewer type and path first
+        let (viewer_type, path) = {
+            let Some(ref viewer) = self.file_viewer else {
+                return;
+            };
+            let path = match viewer.viewer_type {
+                FileViewerType::DnsConfig => "/etc/resolv.conf",
+                FileViewerType::RoutingTable => "/proc/net/route",
+            };
+            (viewer.viewer_type.clone(), path)
+        };
+
+        let Some(client) = &self.client else {
+            if let Some(ref mut viewer) = self.file_viewer {
+                viewer.lines = vec!["Error: No client configured".to_string()];
+            }
+            return;
+        };
+
+        let result = client.read_file(path).await;
+
+        // Now parse and update
+        let lines = match result {
+            Ok(content) => match viewer_type {
+                FileViewerType::DnsConfig => Self::parse_dns_config_static(&content),
+                FileViewerType::RoutingTable => Self::parse_routing_table_static(&content),
+            },
+            Err(e) => vec![format!("Error reading {}: {}", path, e)],
+        };
+
+        if let Some(ref mut viewer) = self.file_viewer {
+            viewer.lines = lines;
+        }
+    }
+
+    /// Parse DNS configuration for display (static version for borrow checker)
+    fn parse_dns_config_static(content: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push("─ DNS Configuration ─".to_string());
+        lines.push(String::new());
+
+        let mut nameservers = Vec::new();
+        let mut search_domains = Vec::new();
+        let mut options = Vec::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+
+            if let Some(ns) = line.strip_prefix("nameserver ") {
+                nameservers.push(ns.trim().to_string());
+            } else if let Some(search) = line.strip_prefix("search ") {
+                search_domains.extend(search.split_whitespace().map(String::from));
+            } else if let Some(opt) = line.strip_prefix("options ") {
+                options.extend(opt.split_whitespace().map(String::from));
+            }
+        }
+
+        if !nameservers.is_empty() {
+            lines.push("Nameservers:".to_string());
+            for ns in &nameservers {
+                lines.push(format!("  • {}", ns));
+            }
+            lines.push(String::new());
+        }
+
+        if !search_domains.is_empty() {
+            lines.push("Search Domains:".to_string());
+            for domain in &search_domains {
+                lines.push(format!("  • {}", domain));
+            }
+            lines.push(String::new());
+        }
+
+        if !options.is_empty() {
+            lines.push("Options:".to_string());
+            for opt in &options {
+                lines.push(format!("  • {}", opt));
+            }
+            lines.push(String::new());
+        }
+
+        lines.push("─ Raw Content ─".to_string());
+        for line in content.lines() {
+            lines.push(format!("  {}", line));
+        }
+
+        lines
+    }
+
+    /// Parse routing table for display (static version for borrow checker)
+    fn parse_routing_table_static(content: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push("─ Routing Table ─".to_string());
+        lines.push(String::new());
+
+        // Header
+        lines.push(format!(
+            "{:<18} {:<18} {:<18} {:>6} {:>6} {:>6} {:<10}",
+            "Destination", "Gateway", "Genmask", "Flags", "Metric", "Ref", "Iface"
+        ));
+        lines.push("─".repeat(90));
+
+        let mut route_lines: Vec<&str> = content.lines().skip(1).collect(); // Skip header
+        route_lines.sort(); // Sort for consistent display
+
+        for line in route_lines {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 8 {
+                let iface = parts[0];
+                let destination = Self::hex_to_ip(parts[1]);
+                let gateway = Self::hex_to_ip(parts[2]);
+                let flags = parts[3];
+                let _refcnt = parts[4];
+                let _use = parts[5];
+                let metric = parts[6];
+                let mask = Self::hex_to_ip(parts[7]);
+
+                // Decode flags
+                let flag_val = u32::from_str_radix(flags, 16).unwrap_or(0);
+                let flag_str = Self::decode_route_flags(flag_val);
+
+                lines.push(format!(
+                    "{:<18} {:<18} {:<18} {:>6} {:>6} {:>6} {:<10}",
+                    destination, gateway, mask, flag_str, metric, "0", iface
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("Flags: U=Up, G=Gateway, H=Host".to_string());
+
+        lines
+    }
+
+    /// Convert hex IP to dotted decimal
+    fn hex_to_ip(hex: &str) -> String {
+        if let Ok(val) = u32::from_str_radix(hex, 16) {
+            // Little-endian format in /proc/net/route
+            format!(
+                "{}.{}.{}.{}",
+                val & 0xFF,
+                (val >> 8) & 0xFF,
+                (val >> 16) & 0xFF,
+                (val >> 24) & 0xFF
+            )
+        } else {
+            hex.to_string()
+        }
+    }
+
+    /// Decode route flags
+    fn decode_route_flags(flags: u32) -> String {
+        let mut s = String::new();
+        if flags & 0x0001 != 0 { s.push('U'); } // RTF_UP
+        if flags & 0x0002 != 0 { s.push('G'); } // RTF_GATEWAY
+        if flags & 0x0004 != 0 { s.push('H'); } // RTF_HOST
+        if s.is_empty() { s.push('-'); }
+        s
+    }
+
+    /// Draw the file viewer overlay
+    fn draw_file_viewer(&self, frame: &mut Frame, area: Rect) {
+        let Some(ref viewer) = self.file_viewer else {
+            return;
+        };
+
+        // Create a centered overlay
+        let overlay_width = (area.width * 4 / 5).min(100);
+        let overlay_height = (area.height * 3 / 4).min(30);
+        let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+        let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+        let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
+
+        // Clear the area
+        frame.render_widget(Clear, overlay_area);
+
+        // Draw the block
+        let block = Block::default()
+            .title(Span::styled(
+                format!(" {} ", viewer.title),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(Color::Black));
+
+        let inner = block.inner(overlay_area);
+        frame.render_widget(block, overlay_area);
+
+        // Build visible lines
+        let visible_height = inner.height.saturating_sub(2) as usize; // Leave room for footer
+        let visible_lines: Vec<Line> = viewer
+            .lines
+            .iter()
+            .skip(viewer.scroll)
+            .take(visible_height)
+            .map(|l| {
+                let style = if l.starts_with("─") {
+                    Style::default().fg(Color::DarkGray)
+                } else if l.starts_with("Error") {
+                    Style::default().fg(Color::Red)
+                } else if l.starts_with("  •") {
+                    Style::default().fg(Color::Green)
+                } else if l.contains(':') && !l.contains('.') {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(l.as_str(), style))
+            })
+            .collect();
+
+        let content = Paragraph::new(visible_lines);
+        frame.render_widget(content, Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(2)));
+
+        // Draw footer
+        let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        let scroll_info = if viewer.lines.len() > visible_height {
+            format!(
+                "Lines {}-{} of {} | ",
+                viewer.scroll + 1,
+                (viewer.scroll + visible_height).min(viewer.lines.len()),
+                viewer.lines.len()
+            )
+        } else {
+            String::new()
+        };
+
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled(&scroll_info, Style::default().fg(Color::DarkGray)),
+            Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
+            Span::raw(" scroll "),
+            Span::styled("[g/G]", Style::default().fg(Color::Cyan)),
+            Span::raw(" top/bottom "),
+            Span::styled("[q/Esc]", Style::default().fg(Color::Cyan)),
+            Span::raw(" close"),
+        ]));
+        frame.render_widget(footer, footer_area);
+    }
+}
+
+// Packet capture methods
+impl NetworkStatsComponent {
+    /// Toggle packet capture on/off
+    fn toggle_capture(&mut self) {
+        match &self.capture.state {
+            CaptureState::Idle => {
+                // Get selected interface name
+                if let Some(dev) = self.selected_device() {
+                    self.capture.state = CaptureState::Capturing(
+                        dev.name.clone(),
+                        Instant::now(),
+                    );
+                    self.capture.data.clear();
+                    // Actual capture start happens in start_capture_async
+                }
+            }
+            CaptureState::Capturing(..) => {
+                // Stop capture
+                let bytes = self.capture.data.len();
+                self.capture.state = CaptureState::Idle;
+                self.capture.receiver = None;
+
+                let bytes_str = NetDevStats::format_bytes(bytes as u64);
+                self.status_message = Some((
+                    format!("Capture stopped: {} - press 's' to save, open in Wireshark", bytes_str),
+                    Instant::now(),
+                ));
+            }
+        }
+    }
+
+    /// Start the async capture (called from app.rs)
+    pub async fn start_capture_async(&mut self) {
+        if let CaptureState::Capturing(ref interface, _) = self.capture.state {
+            if self.capture.receiver.is_some() {
+                return; // Already started
+            }
+
+            let Some(client) = &self.client else {
+                self.status_message = Some((
+                    "Error: No client configured".to_string(),
+                    Instant::now(),
+                ));
+                self.capture.state = CaptureState::Idle;
+                return;
+            };
+
+            // Use snap_len=256 to capture headers only (not full payloads)
+            // This dramatically reduces capture size while keeping useful info
+            match client.packet_capture(interface, false, 256).await {
+                Ok(receiver) => {
+                    self.capture.receiver = Some(receiver);
+                    self.status_message = Some((
+                        format!("Capturing on {} (save with 's')", interface),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    self.status_message = Some((
+                        format!("Capture failed: {}", e),
+                        Instant::now(),
+                    ));
+                    self.capture.state = CaptureState::Idle;
+                }
+            }
+        }
+    }
+
+    /// Check if capture needs to be started
+    pub fn needs_capture_start(&self) -> bool {
+        matches!(self.capture.state, CaptureState::Capturing(..)) && self.capture.receiver.is_none()
+    }
+
+    /// Poll capture receiver for new data (non-blocking)
+    pub fn poll_capture(&mut self) {
+        if let Some(ref mut receiver) = self.capture.receiver {
+            // Non-blocking receive all available data
+            while let Ok(data) = receiver.try_recv() {
+                self.capture.data.extend_from_slice(&data);
+
+                // Auto-stop if capture exceeds size limit
+                if self.capture.data.len() >= MAX_CAPTURE_SIZE {
+                    let bytes_str = NetDevStats::format_bytes(self.capture.data.len() as u64);
+                    self.capture.state = CaptureState::Idle;
+                    self.capture.receiver = None;
+                    self.status_message = Some((
+                        format!("Capture auto-stopped at {} - press 's' to save", bytes_str),
+                        Instant::now(),
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Check if capture is active
+    pub fn is_capturing(&self) -> bool {
+        matches!(self.capture.state, CaptureState::Capturing(..))
+    }
+
+    /// Save capture data to file
+    fn save_capture(&mut self) {
+        if self.capture.data.is_empty() {
+            self.status_message = Some((
+                "No capture data to save".to_string(),
+                Instant::now(),
+            ));
+            return;
+        }
+
+        // Generate filename with timestamp
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let interface = match &self.capture.state {
+            CaptureState::Capturing(iface, ..) => iface.clone(),
+            CaptureState::Idle => "capture".to_string(),
+        };
+        let filename = format!("{}_{}.pcap", interface, timestamp);
+        let path = std::path::Path::new("/tmp").join(&filename);
+
+        match std::fs::write(&path, &self.capture.data) {
+            Ok(_) => {
+                self.status_message = Some((
+                    format!("Saved to {}", path.display()),
+                    Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.status_message = Some((
+                    format!("Save failed: {}", e),
+                    Instant::now(),
+                ));
+            }
+        }
+    }
+
+    /// Draw capture status bar at the top of connections view
+    fn draw_capture_status(&self, frame: &mut Frame, area: Rect) {
+        if let CaptureState::Capturing(ref iface, start) = self.capture.state {
+            let duration = start.elapsed().as_secs();
+            let mins = duration / 60;
+            let secs = duration % 60;
+            let bytes = self.capture.data.len() as u64;
+            let bytes_str = NetDevStats::format_bytes(bytes);
+
+            let status = Line::from(vec![
+                Span::styled(" ● ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled("REC ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(iface, Style::default().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::styled(format!("{:02}:{:02}", mins, secs), Style::default().fg(Color::Yellow)),
+                Span::raw("  "),
+                Span::styled(&bytes_str, Style::default().fg(Color::Blue)),
+                Span::raw("  "),
+                Span::styled("[c]", Style::default().fg(Color::DarkGray)),
+                Span::styled(" stop  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[s]", Style::default().fg(Color::DarkGray)),
+                Span::styled(" save to /tmp", Style::default().fg(Color::DarkGray)),
+            ]);
+
+            let bar = Paragraph::new(status)
+                .style(Style::default().bg(Color::Black));
+            frame.render_widget(bar, area);
+        }
     }
 }

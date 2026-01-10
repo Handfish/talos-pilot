@@ -829,6 +829,58 @@ impl TalosClient {
 
         Ok(results)
     }
+
+    /// Stream packet capture from an interface
+    ///
+    /// Returns a receiver that yields raw pcap data chunks.
+    /// The first chunk contains the pcap file header.
+    ///
+    /// # Arguments
+    /// * `interface` - Network interface name (e.g., "eth0")
+    /// * `promiscuous` - Enable promiscuous mode
+    /// * `snap_len` - Maximum bytes to capture per packet (0 = use default 65535)
+    pub async fn packet_capture(
+        &self,
+        interface: &str,
+        promiscuous: bool,
+        snap_len: u32,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, TalosError> {
+        use crate::proto::machine::PacketCaptureRequest;
+
+        let mut client = self.machine_client();
+
+        let request = self.with_nodes(Request::new(PacketCaptureRequest {
+            interface: interface.to_string(),
+            promiscuous,
+            snap_len: if snap_len == 0 { 65535 } else { snap_len },
+            bpf_filter: Vec::new(), // Empty = capture all traffic
+        }));
+
+        let response = client.packet_capture(request).await?;
+        let mut stream = response.into_inner();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Spawn a task to read from the stream and send to channel
+        tokio::spawn(async move {
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(data) => {
+                        if tx.send(data.bytes).is_err() {
+                            // Receiver dropped, stop streaming
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Packet capture stream error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
 }
 
 // ==================== Configuration Types ====================

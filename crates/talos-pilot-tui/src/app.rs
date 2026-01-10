@@ -332,6 +332,14 @@ impl App {
                             if network.has_pending_restart() {
                                 let _ = network.perform_pending_restart().await;
                             }
+                            // Check for file viewer content fetch
+                            if network.file_viewer_needs_fetch() {
+                                network.fetch_file_content().await;
+                            }
+                            // Check for packet capture start
+                            if network.needs_capture_start() {
+                                network.start_capture_async().await;
+                            }
                             if let Err(e) = network.refresh().await {
                                 network.set_error(e.to_string());
                             }
