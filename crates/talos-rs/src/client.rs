@@ -65,6 +65,25 @@ impl TalosClient {
         TimeServiceClient::new(self.channel.clone())
     }
 
+    /// Extract node name from response metadata, with fallback to configured nodes
+    ///
+    /// The hostname field is only populated when going through the apid proxy.
+    /// When connecting directly to a node, we fall back to the configured node address.
+    fn node_from_metadata(&self, metadata: Option<&crate::proto::common::Metadata>, index: usize) -> String {
+        metadata
+            .map(|m| m.hostname.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| {
+                self.nodes.get(index)
+                    .map(|n| n.split(':').next().unwrap_or(n).to_string())
+                    .unwrap_or_else(|| {
+                        self.nodes.first()
+                            .map(|n| n.split(':').next().unwrap_or(n).to_string())
+                            .unwrap_or_else(|| "node".to_string())
+                    })
+            })
+    }
+
     /// Add node targeting metadata to a request
     /// If no explicit nodes are configured, don't add the header
     /// (Talos will respond from the endpoint node itself)
@@ -99,15 +118,18 @@ impl TalosClient {
         let versions: Vec<VersionInfo> = inner
             .messages
             .into_iter()
-            .map(|msg| VersionInfo {
-                node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
-                version: msg.version.as_ref().map(|v| v.tag.clone()).unwrap_or_default(),
-                sha: msg.version.as_ref().map(|v| v.sha.clone()).unwrap_or_default(),
-                built: msg.version.as_ref().map(|v| v.built.clone()).unwrap_or_default(),
-                go_version: msg.version.as_ref().map(|v| v.go_version.clone()).unwrap_or_default(),
-                os: msg.version.as_ref().map(|v| v.os.clone()).unwrap_or_default(),
-                arch: msg.version.as_ref().map(|v| v.arch.clone()).unwrap_or_default(),
-                platform: msg.platform.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
+            .enumerate()
+            .map(|(i, msg)| {
+                VersionInfo {
+                    node: self.node_from_metadata(msg.metadata.as_ref(), i),
+                    version: msg.version.as_ref().map(|v| v.tag.clone()).unwrap_or_default(),
+                    sha: msg.version.as_ref().map(|v| v.sha.clone()).unwrap_or_default(),
+                    built: msg.version.as_ref().map(|v| v.built.clone()).unwrap_or_default(),
+                    go_version: msg.version.as_ref().map(|v| v.go_version.clone()).unwrap_or_default(),
+                    os: msg.version.as_ref().map(|v| v.os.clone()).unwrap_or_default(),
+                    arch: msg.version.as_ref().map(|v| v.arch.clone()).unwrap_or_default(),
+                    platform: msg.platform.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
+                }
             })
             .collect();
 
@@ -130,7 +152,8 @@ impl TalosClient {
         let times: Vec<NodeTimeInfo> = inner
             .messages
             .into_iter()
-            .map(|msg| {
+            .enumerate()
+            .map(|(i, msg)| {
                 let local_time = msg.localtime.map(|t| {
                     std::time::UNIX_EPOCH + std::time::Duration::new(
                         t.seconds as u64,
@@ -157,7 +180,7 @@ impl TalosClient {
                 let synced = offset_seconds.abs() < SYNC_TOLERANCE_SECS;
 
                 NodeTimeInfo {
-                    node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                    node: self.node_from_metadata(msg.metadata.as_ref(), i),
                     server: msg.server,
                     local_time,
                     remote_time,
@@ -182,7 +205,7 @@ impl TalosClient {
             .messages
             .into_iter()
             .map(|msg| NodeServices {
-                node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                 services: msg
                     .services
                     .into_iter()
@@ -220,7 +243,7 @@ impl TalosClient {
             .messages
             .into_iter()
             .map(|msg| ServiceRestartResult {
-                node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                 response: msg.resp,
             })
             .collect();
@@ -240,7 +263,7 @@ impl TalosClient {
             .messages
             .into_iter()
             .map(|msg| NodeMemory {
-                node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                 // Note: /proc/meminfo values are in KB, convert to bytes
                 meminfo: msg.meminfo.map(|m| MemInfo {
                     mem_total: m.memtotal * 1024,
@@ -267,7 +290,7 @@ impl TalosClient {
             .messages
             .into_iter()
             .map(|msg| NodeLoadAvg {
-                node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                 load1: msg.load1,
                 load5: msg.load5,
                 load15: msg.load15,
@@ -294,7 +317,7 @@ impl TalosClient {
                 let mhz = msg.cpu_info.first().map(|c| c.cpu_mhz).unwrap_or_default();
 
                 NodeCpuInfo {
-                    node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                    node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                     cpu_count,
                     model_name,
                     mhz,
@@ -329,7 +352,7 @@ impl TalosClient {
                 }).unwrap_or_default();
 
                 NodeSystemStat {
-                    node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                    node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                     cpu_total,
                     process_running: msg.process_running,
                     process_blocked: msg.process_blocked,
@@ -528,7 +551,7 @@ impl TalosClient {
             .into_iter()
             .filter_map(|msg| {
                 msg.member_status.map(|status| EtcdMemberStatus {
-                    node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                    node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                     member_id: status.member_id,
                     protocol_version: status.protocol_version,
                     db_size: status.db_size,
@@ -556,7 +579,7 @@ impl TalosClient {
 
         let mut alarms = Vec::new();
         for msg in inner.messages {
-            let node = msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default();
+            let node = self.node_from_metadata(msg.metadata.as_ref(), 0);
             for member_alarm in msg.member_alarms {
                 // Only include non-NONE alarms
                 if member_alarm.alarm != 0 {
@@ -582,7 +605,7 @@ impl TalosClient {
 
         let mut result = Vec::new();
         for msg in inner.messages {
-            let hostname = msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default();
+            let hostname = self.node_from_metadata(msg.metadata.as_ref(), 0);
 
             let processes: Vec<ProcessInfo> = msg
                 .processes
@@ -617,7 +640,7 @@ impl TalosClient {
 
         let mut result = Vec::new();
         for msg in inner.messages {
-            let hostname = msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default();
+            let hostname = self.node_from_metadata(msg.metadata.as_ref(), 0);
 
             let total = msg.total.map(|t| NetDevStats::from_proto(&t));
 
@@ -670,7 +693,7 @@ impl TalosClient {
 
         let mut result = Vec::new();
         for msg in inner.messages {
-            let hostname = msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default();
+            let hostname = self.node_from_metadata(msg.metadata.as_ref(), 0);
 
             let connections: Vec<ConnectionInfo> = msg
                 .connectrecord
@@ -883,7 +906,7 @@ impl TalosClient {
             .messages
             .into_iter()
             .map(|msg| ApplyConfigResult {
-                node: msg.metadata.as_ref().map(|m| m.hostname.clone()).unwrap_or_default(),
+                node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                 mode_result: msg.mode_details,
                 warnings: msg.warnings,
             })

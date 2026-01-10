@@ -558,46 +558,50 @@ impl Component for ClusterComponent {
         // Node details
         self.draw_node_details(frame, content_layout[1]);
 
-        // Footer
-        let footer = Paragraph::new(Line::from(vec![
-            Span::raw(" [q]").fg(Color::Yellow),
-            Span::raw(" quit").dim(),
-            Span::raw("  "),
-            Span::raw("[r]").fg(Color::Yellow),
-            Span::raw(" refresh").dim(),
-            Span::raw("  "),
-            Span::raw("[↑↓]").fg(Color::Yellow),
-            Span::raw(" nodes").dim(),
-            Span::raw("  "),
-            Span::raw("[Tab]").fg(Color::Yellow),
-            Span::raw(" services").dim(),
-            Span::raw("  "),
-            Span::raw("[Enter]").fg(Color::Yellow),
-            Span::raw(" logs").dim(),
-            Span::raw("  "),
-            Span::raw("[e]").fg(Color::Yellow),
-            Span::raw(" etcd").dim(),
-            Span::raw("  "),
-            Span::raw("[p]").fg(Color::Yellow),
-            Span::raw(" procs").dim(),
-            Span::raw("  "),
-            Span::raw("[n]").fg(Color::Yellow),
-            Span::raw(" net").dim(),
-            Span::raw("  "),
-            Span::raw("[d]").fg(Color::Yellow),
-            Span::raw(" diag").dim(),
-            Span::raw("  "),
-            Span::raw("[c]").fg(Color::Yellow),
-            Span::raw(" certs").dim(),
-            Span::raw("  "),
-            Span::raw("[L]").fg(Color::Yellow),
-            Span::raw(" lifecycle").dim(),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
+        // Footer - two lines for all shortcuts
+        let footer_lines = vec![
+            Line::from(vec![
+                Span::raw(" [q]").fg(Color::Yellow),
+                Span::raw(" quit").dim(),
+                Span::raw("  "),
+                Span::raw("[r]").fg(Color::Yellow),
+                Span::raw(" refresh").dim(),
+                Span::raw("  "),
+                Span::raw("[↑↓]").fg(Color::Yellow),
+                Span::raw(" nodes").dim(),
+                Span::raw("  "),
+                Span::raw("[Tab]").fg(Color::Yellow),
+                Span::raw(" services").dim(),
+                Span::raw("  "),
+                Span::raw("[Enter]").fg(Color::Yellow),
+                Span::raw(" logs").dim(),
+                Span::raw("  "),
+                Span::raw("[e]").fg(Color::Yellow),
+                Span::raw(" etcd").dim(),
+            ]),
+            Line::from(vec![
+                Span::raw(" [p]").fg(Color::Yellow),
+                Span::raw(" procs").dim(),
+                Span::raw("  "),
+                Span::raw("[n]").fg(Color::Yellow),
+                Span::raw(" network").dim(),
+                Span::raw("  "),
+                Span::raw("[d]").fg(Color::Yellow),
+                Span::raw(" diagnostics").dim(),
+                Span::raw("  "),
+                Span::raw("[c]").fg(Color::Yellow),
+                Span::raw(" security").dim(),
+                Span::raw("  "),
+                Span::raw("[L]").fg(Color::Yellow),
+                Span::raw(" lifecycle").dim(),
+            ]),
+        ];
+        let footer = Paragraph::new(footer_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
         frame.render_widget(footer, layout[2]);
 
         Ok(())

@@ -31,6 +31,7 @@ pub mod auth;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod talosctl;
 
 /// Generated protobuf types and gRPC clients
 pub mod proto {
@@ -80,3 +81,4 @@ pub use client::{
 };
 pub use config::{Context, TalosConfig};
 pub use error::TalosError;
+pub use talosctl::{get_machine_config, get_volume_status, MachineConfigInfo, VolumeStatus};

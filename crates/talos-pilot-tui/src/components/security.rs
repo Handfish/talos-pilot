@@ -241,23 +241,97 @@ impl SecurityComponent {
         self.pki_status = pki;
     }
 
-    /// Load encryption status from node
+    /// Load encryption status from node via talosctl
+    ///
+    /// Executes `talosctl get volumestatus` to get encryption info.
     async fn load_encryption_status(&mut self) {
-        // For now, show placeholder - actual implementation would query VolumeStatus
-        // via Talos resource API which isn't exposed yet in talos-rs
-        // TODO: Add talos-rs method for querying VolumeStatus resource
-        self.encryption_status = EncryptionStatus {
-            volumes: vec![
-                VolumeEncryption {
-                    name: "STATE".to_string(),
-                    provider: EncryptionProvider::Unknown("run: talosctl get volumestatus".to_string()),
-                },
-                VolumeEncryption {
-                    name: "EPHEMERAL".to_string(),
-                    provider: EncryptionProvider::Unknown("run: talosctl get volumestatus".to_string()),
-                },
-            ],
+        // Get the first node from talosconfig to query
+        let node = match talos_rs::TalosConfig::load_default() {
+            Ok(config) => {
+                config.current_context()
+                    .and_then(|ctx| {
+                        // Prefer nodes if set, otherwise use first endpoint
+                        if !ctx.nodes.is_empty() {
+                            ctx.nodes.first().map(|n| n.split(':').next().unwrap_or(n).to_string())
+                        } else {
+                            ctx.endpoints.first().map(|e| e.split(':').next().unwrap_or(e).to_string())
+                        }
+                    })
+            }
+            Err(_) => None,
         };
+
+        let Some(node) = node else {
+            self.encryption_status = EncryptionStatus {
+                volumes: vec![
+                    VolumeEncryption {
+                        name: "STATE".to_string(),
+                        provider: EncryptionProvider::Unknown("no node configured".to_string()),
+                    },
+                    VolumeEncryption {
+                        name: "EPHEMERAL".to_string(),
+                        provider: EncryptionProvider::Unknown("no node configured".to_string()),
+                    },
+                ],
+            };
+            return;
+        };
+
+        // Execute talosctl get volumestatus
+        match talos_rs::get_volume_status(&node) {
+            Ok(statuses) => {
+                let mut volumes = Vec::new();
+
+                for status in statuses {
+                    // Only include main volumes
+                    if !status.id.contains("STATE") && !status.id.contains("EPHEMERAL") {
+                        continue;
+                    }
+
+                    let provider = match status.encryption_provider.as_deref() {
+                        Some("luks2") | Some("LUKS2") => EncryptionProvider::Static,
+                        Some(p) if p.to_lowercase().contains("tpm") => EncryptionProvider::Tpm,
+                        Some(p) if p.to_lowercase().contains("kms") => EncryptionProvider::Kms,
+                        Some(_) => EncryptionProvider::Static,
+                        None => EncryptionProvider::None,
+                    };
+
+                    volumes.push(VolumeEncryption {
+                        name: status.id,
+                        provider,
+                    });
+                }
+
+                // If no main volumes found, add defaults
+                if volumes.is_empty() {
+                    volumes.push(VolumeEncryption {
+                        name: "STATE".to_string(),
+                        provider: EncryptionProvider::Unknown("not found".to_string()),
+                    });
+                    volumes.push(VolumeEncryption {
+                        name: "EPHEMERAL".to_string(),
+                        provider: EncryptionProvider::Unknown("not found".to_string()),
+                    });
+                }
+
+                self.encryption_status = EncryptionStatus { volumes };
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get volume status: {}", e);
+                self.encryption_status = EncryptionStatus {
+                    volumes: vec![
+                        VolumeEncryption {
+                            name: "STATE".to_string(),
+                            provider: EncryptionProvider::Unknown(format!("{}", e)),
+                        },
+                        VolumeEncryption {
+                            name: "EPHEMERAL".to_string(),
+                            provider: EncryptionProvider::Unknown(format!("{}", e)),
+                        },
+                    ],
+                };
+            }
+        }
     }
 
     /// Build display items from loaded data

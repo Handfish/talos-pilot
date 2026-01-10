@@ -182,6 +182,19 @@ impl LifecycleComponent {
             }
         }
 
+        // Get config hash via talosctl for first node
+        let config_hash = self.versions.first()
+            .map(|v| v.node.split(':').next().unwrap_or(&v.node).to_string())
+            .and_then(|node| {
+                match talos_rs::get_machine_config(&node) {
+                    Ok(config) => Some(config.version),
+                    Err(e) => {
+                        tracing::debug!("Failed to get machine config: {}", e);
+                        None
+                    }
+                }
+            });
+
         // Build node statuses combining version and time info
         self.node_statuses = self.versions
             .iter()
@@ -194,7 +207,7 @@ impl LifecycleComponent {
                 NodeStatus {
                     hostname: v.node.clone(),
                     version: v.version.clone(),
-                    config_hash: None, // Needs MachineConfig API
+                    config_hash: config_hash.clone(),
                     time_synced,
                     ready: true,       // Assume ready for now
                     platform: v.platform.clone(),
@@ -234,11 +247,17 @@ impl LifecycleComponent {
             });
         }
 
-        // Placeholder alert for config hash (still needs API)
-        self.alerts.push(Alert {
-            severity: AlertSeverity::Info,
-            message: "Config hash requires MachineConfig API (run: talosctl get machineconfig)".to_string(),
-        });
+        // Check for config hash availability
+        let has_config_hash = self.node_statuses.iter().any(|n| n.config_hash.is_some());
+        if has_config_hash {
+            // Show config version
+            if let Some(hash) = self.node_statuses.first().and_then(|n| n.config_hash.as_ref()) {
+                self.alerts.push(Alert {
+                    severity: AlertSeverity::Info,
+                    message: format!("Config version: {}", hash),
+                });
+            }
+        }
     }
 
     /// Get current Talos version (from first node)
@@ -248,15 +267,23 @@ impl LifecycleComponent {
 
     /// Get K8s version support range for current Talos
     fn k8s_support_range(&self) -> &str {
-        // Talos 1.9.x supports k8s 1.27-1.32
-        // This is hardcoded for now - could be fetched from release API
+        // Talos version to K8s support mapping
+        // See: https://www.talos.dev/latest/introduction/support-matrix/
         let version = self.current_talos_version();
-        if version.starts_with("v1.9") {
+        if version.starts_with("v1.12") {
+            "v1.30 - v1.35"
+        } else if version.starts_with("v1.11") {
+            "v1.29 - v1.34"
+        } else if version.starts_with("v1.10") {
+            "v1.28 - v1.33"
+        } else if version.starts_with("v1.9") {
             "v1.27 - v1.32"
         } else if version.starts_with("v1.8") {
             "v1.26 - v1.31"
         } else if version.starts_with("v1.7") {
             "v1.25 - v1.30"
+        } else if version.starts_with("v1.6") {
+            "v1.24 - v1.29"
         } else {
             "unknown"
         }
@@ -347,13 +374,13 @@ impl LifecycleComponent {
         let rows = self.node_statuses.iter().map(|node| {
             let config_cell = match &node.config_hash {
                 Some(hash) => Span::styled(&hash[..8.min(hash.len())], Style::default().fg(Color::White)),
-                None => Span::styled("-", Style::default().fg(Color::DarkGray)),
+                None => Span::styled("-", Style::default().fg(Color::Gray)),
             };
 
             let time_cell = match node.time_synced {
                 Some(true) => Span::styled("synced", Style::default().fg(Color::Green)),
                 Some(false) => Span::styled("not synced", Style::default().fg(Color::Yellow)),
-                None => Span::styled("-", Style::default().fg(Color::DarkGray)),
+                None => Span::styled("-", Style::default().fg(Color::Gray)),
             };
 
             let status_cell = if node.ready {
@@ -363,7 +390,8 @@ impl LifecycleComponent {
             };
 
             Row::new(vec![
-                ratatui::widgets::Cell::from(node.hostname.clone()),
+                ratatui::widgets::Cell::from(node.hostname.clone())
+                    .style(Style::default().fg(Color::White)),
                 ratatui::widgets::Cell::from(node.version.clone())
                     .style(Style::default().fg(Color::Green)),
                 ratatui::widgets::Cell::from(config_cell),

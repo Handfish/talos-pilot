@@ -4,7 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create generated directory if it doesn't exist
     std::fs::create_dir_all("src/generated")?;
 
-    // Configure tonic-build
+    // Configure tonic-build for Talos Machine API
     tonic_build::configure()
         .build_server(false) // We only need the client
         .build_client(true)
