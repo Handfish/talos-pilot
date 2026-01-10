@@ -1,3 +1,13 @@
+   Compiling talos-pilot-tui v0.1.0 (/home/ken-udovic/Workspace/rust/talos-pilot/crates/talos-pilot-tui)
+warning: value assigned to `br_netfilter_missing` is never read
+   --> crates/talos-pilot-tui/src/components/diagnostics.rs:701:17
+    |
+701 |                 br_netfilter_missing = false;
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
 warning: methods `scroll_up`, `scroll_down`, `scroll_half_page_up`, and `scroll_half_page_down` are never used
    --> crates/talos-pilot-tui/src/components/multi_logs.rs:953:8
     |
@@ -36,6 +46,7 @@ warning: method `get_cpu_percent` is never used
 343 |     fn get_cpu_percent(&self, pid: i32) -> Option<f32> {
     |        ^^^^^^^^^^^^^^^
 
-warning: `talos-pilot-tui` (lib) generated 3 warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+warning: `talos-pilot-tui` (lib) generated 4 warnings
+   Compiling talos-pilot v0.1.0 (/home/ken-udovic/Workspace/rust/talos-pilot)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.30s
      Running `target/debug/talos-pilot`

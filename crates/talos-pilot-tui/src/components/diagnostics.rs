@@ -61,6 +61,8 @@ pub enum FixAction {
     ShowDetails(String),
     /// Install Cilium CNI
     InstallCilium,
+    /// Run a command on the host (for Docker environments)
+    HostCommand { command: String, description: String },
 }
 
 impl FixAction {
@@ -78,6 +80,7 @@ impl FixAction {
             }
             FixAction::ShowDetails(_) => "View details".to_string(),
             FixAction::InstallCilium => "Install Cilium CNI".to_string(),
+            FixAction::HostCommand { description, .. } => description.clone(),
         }
     }
 
@@ -87,6 +90,11 @@ impl FixAction {
             self,
             FixAction::AddKernelModule(_) | FixAction::ApplyConfigPatch { requires_reboot: true, .. }
         )
+    }
+
+    /// Check if this is a host command (manual action)
+    pub fn is_host_command(&self) -> bool {
+        matches!(self, FixAction::HostCommand { .. })
     }
 }
 
@@ -209,6 +217,8 @@ pub struct DiagnosticsComponent {
     address: String,
     /// Node role (controlplane or worker)
     node_role: String,
+    /// Platform type (e.g., "container", "metal", "aws")
+    platform: String,
 
     /// System health checks
     system_checks: Vec<DiagnosticCheck>,
@@ -228,8 +238,10 @@ pub struct DiagnosticsComponent {
     pending_action: Option<PendingAction>,
     /// Whether we're in the confirmation dialog
     show_confirmation: bool,
-    /// Confirmation dialog selection (0 = Cancel, 1 = Apply)
+    /// Confirmation dialog selection (0 = Cancel, 1 = Apply; for host commands: 0 = Copy, 1 = Close)
     confirmation_selection: usize,
+    /// Time when command was copied (for showing feedback)
+    copy_feedback_until: Option<Instant>,
 
     /// Whether we're applying a fix
     applying_fix: bool,
@@ -264,6 +276,7 @@ impl DiagnosticsComponent {
             hostname,
             address,
             node_role,
+            platform: String::new(),
             system_checks: Vec::new(),
             kubernetes_checks: Vec::new(),
             service_checks: Vec::new(),
@@ -272,7 +285,8 @@ impl DiagnosticsComponent {
             table_state,
             pending_action: None,
             show_confirmation: false,
-            confirmation_selection: 1, // Default to Apply
+            confirmation_selection: 1, // Default to Apply (or Close for host commands)
+            copy_feedback_until: None,
             applying_fix: false,
             apply_result: None,
             loading: true,
@@ -283,9 +297,14 @@ impl DiagnosticsComponent {
         }
     }
 
-    /// Set the client for making API calls
+    /// Set the client for making API calls and detect platform
     pub fn set_client(&mut self, client: TalosClient) {
         self.client = Some(client);
+    }
+
+    /// Check if running in a container environment (Docker)
+    pub fn is_container(&self) -> bool {
+        self.platform == "container"
     }
 
     /// Set an error message
@@ -373,24 +392,32 @@ impl DiagnosticsComponent {
                     _ => None,
                 };
 
+                // For host commands, default to Copy (0); for regular actions, default to Apply (1)
+                let is_host_cmd = fix.action.is_host_command();
+
                 self.pending_action = Some(PendingAction {
                     check_id: check.id.clone(),
                     fix: fix.clone(),
                     preview,
                 });
                 self.show_confirmation = true;
-                self.confirmation_selection = 1; // Default to Apply
+                self.confirmation_selection = if is_host_cmd { 0 } else { 1 };
+                self.copy_feedback_until = None; // Reset copy feedback
             }
         }
     }
 
     /// Apply the pending fix action
     pub async fn apply_pending_fix(&mut self) -> Result<()> {
+        tracing::info!("apply_pending_fix called");
+
         let Some(pending) = self.pending_action.take() else {
+            tracing::info!("No pending action to apply");
             return Ok(());
         };
 
         let Some(client) = &self.client else {
+            tracing::error!("No client configured");
             self.set_error("No client configured".to_string());
             return Ok(());
         };
@@ -400,20 +427,49 @@ impl DiagnosticsComponent {
 
         match &pending.fix.action {
             FixAction::AddKernelModule(name) => {
-                let yaml = format!(
+                tracing::info!("Applying kernel module fix: {}", name);
+                // Use talosctl patch command which handles fetching, merging, and applying
+                let patch_yaml = format!(
                     "machine:\n  kernel:\n    modules:\n      - name: {}",
                     name
                 );
-                match client
-                    .apply_configuration(&yaml, ApplyMode::Reboot, false)
-                    .await
-                {
-                    Ok(results) => {
-                        self.apply_result = Some(Ok(results));
+
+                // Write patch to temp file
+                let patch_file = "/tmp/talos-pilot-patch.yaml";
+                if let Err(e) = std::fs::write(patch_file, &patch_yaml) {
+                    tracing::error!("Failed to write patch file: {}", e);
+                    self.apply_result = Some(Err(format!("Failed to write patch file: {}", e)));
+                } else {
+                    // Run talosctl patch
+                    let output = std::process::Command::new("talosctl")
+                        .args([
+                            "-n", &self.address,
+                            "patch", "machineconfig",
+                            "--mode=reboot",
+                            "-p", &format!("@{}", patch_file),
+                        ])
+                        .output();
+
+                    match output {
+                        Ok(result) => {
+                            if result.status.success() {
+                                let stdout = String::from_utf8_lossy(&result.stdout);
+                                tracing::info!("Patch succeeded: {}", stdout);
+                                self.apply_result = Some(Ok(vec![]));
+                            } else {
+                                let stderr = String::from_utf8_lossy(&result.stderr);
+                                tracing::error!("Patch failed: {}", stderr);
+                                self.apply_result = Some(Err(stderr.to_string()));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to run talosctl: {}", e);
+                            self.apply_result = Some(Err(format!("Failed to run talosctl: {}", e)));
+                        }
                     }
-                    Err(e) => {
-                        self.apply_result = Some(Err(e.to_string()));
-                    }
+
+                    // Clean up temp file
+                    let _ = std::fs::remove_file(patch_file);
                 }
             }
             FixAction::ApplyConfigPatch { yaml, requires_reboot } => {
@@ -441,8 +497,8 @@ impl DiagnosticsComponent {
                     }
                 }
             }
-            FixAction::ShowDetails(_) | FixAction::InstallCilium => {
-                // These don't apply directly - they navigate or open wizards
+            FixAction::ShowDetails(_) | FixAction::InstallCilium | FixAction::HostCommand { .. } => {
+                // These don't apply directly - they navigate, open wizards, or show manual instructions
             }
         }
 
@@ -463,13 +519,24 @@ impl DiagnosticsComponent {
         // Run all checks
         let timeout = std::time::Duration::from_secs(15);
 
+        // Fetch platform info first (for container detection)
+        if let Ok(versions) = client.version().await {
+            if let Some(v) = versions.first() {
+                self.platform = v.platform.clone();
+                tracing::info!("Detected platform: {}", self.platform);
+            }
+        }
+        let is_container = self.is_container();
+
         let result = tokio::time::timeout(timeout, async {
             // Fetch data in parallel
+            // Note: Use a smaller log tail (100 lines) to focus on recent activity
+            // Older logs may contain historical errors that have since been resolved
             let (memory_result, load_result, services_result, logs_result, br_netfilter_result) = tokio::join!(
                 client.memory(),
                 client.load_avg(),
                 client.services(),
-                client.logs("kubelet", 500),
+                client.logs("kubelet", 100),
                 client.is_br_netfilter_loaded(),
             );
 
@@ -534,34 +601,21 @@ impl DiagnosticsComponent {
 
             // Kernel modules check - directly check if br_netfilter is loaded
             // by reading /proc/sys/net/bridge/bridge-nf-call-iptables
-            let br_netfilter_missing = match &br_netfilter_result {
+            // Note: In Docker containers, this file may not be accessible even if the module is loaded
+            let br_netfilter_file_missing = match &br_netfilter_result {
                 Ok(loaded) => {
                     tracing::info!("br_netfilter check: loaded = {}", loaded);
                     !loaded
                 }
                 Err(e) => {
                     tracing::info!("br_netfilter check error: {}", e);
-                    true // If we can't check, assume it's missing
+                    true // File not accessible
                 }
             };
 
-            if br_netfilter_missing {
-                system_checks.push(DiagnosticCheck::fail(
-                    "kernel_modules",
-                    "Kernel Modules",
-                    "br_netfilter missing",
-                    Some(DiagnosticFix {
-                        description: "Add br_netfilter kernel module".to_string(),
-                        action: FixAction::AddKernelModule("br_netfilter".to_string()),
-                    }),
-                ).with_details("The br_netfilter kernel module is required for Kubernetes networking. Without it, CNI plugins like Flannel cannot function properly."));
-            } else {
-                system_checks.push(DiagnosticCheck::pass(
-                    "kernel_modules",
-                    "Kernel Modules",
-                    "OK",
-                ));
-            }
+            // Track if br_netfilter is actually missing (will be updated after CNI check)
+            // The actual br_netfilter_missing will be determined after we check CNI status
+            let br_netfilter_missing = br_netfilter_file_missing;
 
             // Service checks
             match services_result {
@@ -609,6 +663,7 @@ impl DiagnosticsComponent {
             }
 
             // Kubernetes checks from kubelet logs
+            let cni_ok;
             match logs_result {
                 Ok(logs) => {
                     // Check for CNI issues
@@ -617,6 +672,7 @@ impl DiagnosticsComponent {
                     let crashloop = logs.contains("CrashLoopBackOff");
 
                     if cni_failed {
+                        cni_ok = false;
                         // If br_netfilter is missing, that's likely the root cause - offer the fix
                         let fix = if br_netfilter_missing {
                             Some(DiagnosticFix {
@@ -640,6 +696,7 @@ impl DiagnosticsComponent {
                             fix,
                         ).with_details(details));
                     } else {
+                        cni_ok = true;
                         kubernetes_checks.push(DiagnosticCheck::pass("cni", "CNI", "OK"));
                     }
 
@@ -658,9 +715,59 @@ impl DiagnosticsComponent {
                     }
                 }
                 Err(_) => {
+                    cni_ok = false;
                     kubernetes_checks.push(DiagnosticCheck::unknown("cni", "CNI"));
                     kubernetes_checks.push(DiagnosticCheck::unknown("pods_crashing", "Pod Health"));
                 }
+            }
+
+            // Now add kernel modules check - if CNI is working, br_netfilter is effectively OK
+            // (This handles Docker containers where the sysctl file may not be accessible)
+            if cni_ok && br_netfilter_file_missing {
+                // CNI works, so br_netfilter is effectively available (maybe via host kernel)
+                system_checks.push(DiagnosticCheck::pass(
+                    "kernel_modules",
+                    "Kernel Modules",
+                    "OK (CNI working)",
+                ));
+                let _ = br_netfilter_missing; // Mark as used - CNI works so module effectively available
+            } else if br_netfilter_missing {
+                // Different fix depending on platform
+                let fix = if is_container {
+                    // For Docker/container environments, user must load module on host
+                    DiagnosticFix {
+                        description: "Load br_netfilter on Docker host".to_string(),
+                        action: FixAction::HostCommand {
+                            command: "sudo modprobe br_netfilter".to_string(),
+                            description: "Load br_netfilter on Docker host".to_string(),
+                        },
+                    }
+                } else {
+                    // For real clusters, patch the machine config
+                    DiagnosticFix {
+                        description: "Add br_netfilter kernel module".to_string(),
+                        action: FixAction::AddKernelModule("br_netfilter".to_string()),
+                    }
+                };
+
+                let details = if is_container {
+                    "The br_netfilter kernel module must be loaded on your Docker host machine.\n\nRun this command on your host (not in the container):\n  sudo modprobe br_netfilter\n\nThen restart the Talos container."
+                } else {
+                    "The br_netfilter kernel module is required for Kubernetes networking. Without it, CNI plugins like Flannel cannot function properly."
+                };
+
+                system_checks.push(DiagnosticCheck::fail(
+                    "kernel_modules",
+                    "Kernel Modules",
+                    if is_container { "br_netfilter (load on host)" } else { "br_netfilter missing" },
+                    Some(fix),
+                ).with_details(details));
+            } else {
+                system_checks.push(DiagnosticCheck::pass(
+                    "kernel_modules",
+                    "Kernel Modules",
+                    "OK",
+                ));
             }
 
             // Etcd check (for control plane nodes)
@@ -810,6 +917,9 @@ impl DiagnosticsComponent {
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
+        // Check if this is a host command (manual action)
+        let is_host_command = pending.fix.action.is_host_command();
+
         // Build dialog content
         let mut lines = vec![
             Line::from(""),
@@ -820,8 +930,26 @@ impl DiagnosticsComponent {
             Line::from(""),
         ];
 
-        // Add preview if available
-        if let Some(preview) = &pending.preview {
+        // For host commands, show the command to run manually
+        if let FixAction::HostCommand { command, .. } = &pending.fix.action {
+            lines.push(Line::from(Span::styled(
+                "Run this command on your Docker host:",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", command),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("Then restart the Talos container:"));
+            lines.push(Line::from(Span::styled(
+                "  docker restart <container-name>",
+                Style::default().fg(Color::Cyan),
+            )));
+            lines.push(Line::from(""));
+        } else if let Some(preview) = &pending.preview {
+            // Add preview if available (for config patches)
             lines.push(Line::from("This will apply the following configuration:"));
             lines.push(Line::from(""));
             for line in preview.lines().take(5) {
@@ -833,8 +961,8 @@ impl DiagnosticsComponent {
             lines.push(Line::from(""));
         }
 
-        // Add reboot warning
-        if pending.fix.action.requires_reboot() {
+        // Add reboot warning (only for non-host commands)
+        if !is_host_command && pending.fix.action.requires_reboot() {
             lines.push(Line::from(Span::styled(
                 "⚠ This requires a node reboot to take effect.",
                 Style::default().fg(Color::Yellow),
@@ -842,31 +970,62 @@ impl DiagnosticsComponent {
             lines.push(Line::from(""));
         }
 
-        // Add buttons
-        let cancel_style = if self.confirmation_selection == 0 {
-            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let apply_style = if self.confirmation_selection == 1 {
-            Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Green)
-        };
+        // Add buttons - for host commands, show Copy and Close
+        if is_host_command {
+            // Check if we're showing copy feedback
+            let show_copied = self.copy_feedback_until
+                .map(|t| t.elapsed() < std::time::Duration::from_secs(2))
+                .unwrap_or(false);
 
-        lines.push(Line::from(vec![
-            Span::raw("         "),
-            Span::styled(" Cancel ", cancel_style),
-            Span::raw("     "),
-            Span::styled(
-                if pending.fix.action.requires_reboot() {
-                    " Apply & Reboot "
-                } else {
-                    " Apply "
-                },
-                apply_style,
-            ),
-        ]));
+            let copy_style = if show_copied {
+                // Show "Copied!" feedback with green background
+                Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)
+            } else if self.confirmation_selection == 0 {
+                Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+
+            let close_style = if self.confirmation_selection == 1 {
+                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            let copy_text = if show_copied { " Copied! " } else { " Copy " };
+
+            lines.push(Line::from(vec![
+                Span::raw("         "),
+                Span::styled(copy_text, copy_style),
+                Span::raw("     "),
+                Span::styled(" Close ", close_style),
+            ]));
+        } else {
+            let cancel_style = if self.confirmation_selection == 0 {
+                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let apply_style = if self.confirmation_selection == 1 {
+                Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("         "),
+                Span::styled(" Cancel ", cancel_style),
+                Span::raw("     "),
+                Span::styled(
+                    if pending.fix.action.requires_reboot() {
+                        " Apply & Reboot "
+                    } else {
+                        " Apply "
+                    },
+                    apply_style,
+                ),
+            ]));
+        }
 
         let content = Paragraph::new(lines);
         frame.render_widget(content, inner);
@@ -877,6 +1036,12 @@ impl Component for DiagnosticsComponent {
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
         // Handle confirmation dialog first
         if self.show_confirmation {
+            // Check if this is a host command (informational only)
+            let is_host_command = self.pending_action
+                .as_ref()
+                .map(|p| p.fix.action.is_host_command())
+                .unwrap_or(false);
+
             match key.code {
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.confirmation_selection = 0;
@@ -887,7 +1052,23 @@ impl Component for DiagnosticsComponent {
                     return Ok(None);
                 }
                 KeyCode::Enter => {
-                    if self.confirmation_selection == 0 {
+                    if is_host_command {
+                        if self.confirmation_selection == 0 {
+                            // Copy command to clipboard
+                            if let Some(pending) = &self.pending_action {
+                                if let FixAction::HostCommand { command, .. } = &pending.fix.action {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard.set_text(command.clone());
+                                        self.copy_feedback_until = Some(Instant::now());
+                                    }
+                                }
+                            }
+                        } else {
+                            // Close
+                            self.show_confirmation = false;
+                            self.pending_action = None;
+                        }
+                    } else if self.confirmation_selection == 0 {
                         // Cancel
                         self.show_confirmation = false;
                         self.pending_action = None;

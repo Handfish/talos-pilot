@@ -101,6 +101,7 @@ impl TalosClient {
                 go_version: msg.version.as_ref().map(|v| v.go_version.clone()).unwrap_or_default(),
                 os: msg.version.as_ref().map(|v| v.os.clone()).unwrap_or_default(),
                 arch: msg.version.as_ref().map(|v| v.arch.clone()).unwrap_or_default(),
+                platform: msg.platform.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
             })
             .collect();
 
@@ -795,6 +796,8 @@ pub struct VersionInfo {
     pub go_version: String,
     pub os: String,
     pub arch: String,
+    /// Platform name (e.g., "container", "metal", "aws", "gcp")
+    pub platform: String,
 }
 
 /// Services running on a node
