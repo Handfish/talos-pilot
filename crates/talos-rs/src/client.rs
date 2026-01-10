@@ -555,9 +555,10 @@ impl TalosClient {
         let mut client = self.machine_client();
 
         // Must explicitly enable TCP protocols and host network
+        // Enable pid feature to get process info for each connection
         let request = self.with_nodes(Request::new(NetstatRequest {
             filter: filter.to_proto(),
-            feature: Some(netstat_request::Feature { pid: false }),
+            feature: Some(netstat_request::Feature { pid: true }),
             l4proto: Some(netstat_request::L4proto {
                 tcp: true,
                 tcp6: true,
@@ -1290,10 +1291,28 @@ pub struct ConnectionInfo {
     pub rx_queue: u64,
     /// Transmit queue size
     pub tx_queue: u64,
+    /// Process ID owning this connection (if available)
+    pub process_pid: Option<u32>,
+    /// Process name owning this connection (if available)
+    pub process_name: Option<String>,
+    /// Network namespace (for container connections)
+    pub netns: Option<String>,
 }
 
 impl ConnectionInfo {
     fn from_proto(record: crate::proto::machine::ConnectRecord) -> Self {
+        // Extract process info if available
+        let (process_pid, process_name) = record.process
+            .map(|p| (Some(p.pid), Some(p.name)))
+            .unwrap_or((None, None));
+
+        // Extract network namespace if non-empty
+        let netns = if record.netns.is_empty() {
+            None
+        } else {
+            Some(record.netns)
+        };
+
         Self {
             protocol: record.l4proto,
             local_ip: record.localip,
@@ -1303,6 +1322,9 @@ impl ConnectionInfo {
             state: ConnectionState::from_proto(record.state),
             rx_queue: record.rxqueue,
             tx_queue: record.txqueue,
+            process_pid,
+            process_name,
+            netns,
         }
     }
 

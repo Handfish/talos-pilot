@@ -17,8 +17,24 @@ use std::collections::HashMap;
 use std::time::Instant;
 use talos_rs::{
     ConnectionCounts, ConnectionInfo, ConnectionState, NetDevRate, NetDevStats, NetstatFilter,
-    TalosClient,
+    ServiceInfo, TalosClient,
 };
+
+/// Well-known Talos/Kubernetes service ports
+fn port_to_service(port: u32) -> Option<&'static str> {
+    match port {
+        50000 => Some("apid"),
+        50001 => Some("trustd"),
+        2379 => Some("etcd-client"),
+        2380 => Some("etcd-peer"),
+        6443 => Some("kube-apiserver"),
+        10250 => Some("kubelet"),
+        10259 => Some("kube-scheduler"),
+        10257 => Some("kube-controller-manager"),
+        51821 => Some("kubernetesd"),
+        _ => None,
+    }
+}
 
 /// Auto-refresh interval in seconds (faster than processes for responsive rates)
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 2;
@@ -94,6 +110,8 @@ pub struct NetworkStatsComponent {
     conn_counts: ConnectionCounts,
     /// Service health status (port -> is_healthy)
     service_health: HashMap<u16, bool>,
+    /// Service info from services API (service_id -> ServiceInfo)
+    services: HashMap<String, ServiceInfo>,
 
     /// Loading state
     loading: bool,
@@ -155,6 +173,7 @@ impl NetworkStatsComponent {
             connections: Vec::new(),
             conn_counts: ConnectionCounts::default(),
             service_health: HashMap::new(),
+            services: HashMap::new(),
             loading: true,
             error: None,
             auto_refresh: true,
@@ -192,13 +211,15 @@ impl NetworkStatsComponent {
 
         let timeout = std::time::Duration::from_secs(10);
 
-        // Fetch both interface stats and netstat data concurrently
+        // Fetch interface stats, netstat data, and services concurrently
         let dev_future = client.network_device_stats();
         let conn_future = client.netstat(NetstatFilter::All);
+        let svc_future = client.services();
 
-        let (dev_result, conn_result) = tokio::join!(
+        let (dev_result, conn_result, svc_result) = tokio::join!(
             tokio::time::timeout(timeout, dev_future),
-            tokio::time::timeout(timeout, conn_future)
+            tokio::time::timeout(timeout, conn_future),
+            tokio::time::timeout(timeout, svc_future)
         );
 
         // Process interface stats
@@ -240,6 +261,24 @@ impl NetworkStatsComponent {
                 // Timeout on netstat - continue with interface data
                 self.connections.clear();
                 self.conn_counts = ConnectionCounts::default();
+            }
+        }
+
+        // Process services data (don't fail if this errors)
+        match svc_result {
+            Ok(Ok(svc_data)) => {
+                if let Some(node_svcs) = svc_data.into_iter().next() {
+                    self.services = node_svcs.services
+                        .into_iter()
+                        .map(|s| (s.id.clone(), s))
+                        .collect();
+                } else {
+                    self.services.clear();
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Silently ignore service errors
+                self.services.clear();
             }
         }
 
@@ -483,6 +522,19 @@ impl NetworkStatsComponent {
         }
     }
 
+    /// Get service info for a listening connection (if known)
+    fn get_service_for_conn(&self, conn: &ConnectionInfo) -> Option<(&'static str, Option<&ServiceInfo>)> {
+        if conn.state != ConnectionState::Listen {
+            return None;
+        }
+
+        // Check if this port maps to a known service
+        port_to_service(conn.local_port).map(|service_name| {
+            let service_info = self.services.get(service_name);
+            (service_name, service_info)
+        })
+    }
+
     /// Format a connection as a string for copying
     fn format_connection(conn: &ConnectionInfo) -> String {
         let local = if !conn.local_ip.is_empty() {
@@ -512,9 +564,17 @@ impl NetworkStatsComponent {
             ConnectionState::Unknown => "UNKNOWN",
         };
 
+        // Format process info
+        let process = match (&conn.process_name, conn.process_pid) {
+            (Some(name), Some(pid)) => format!("{} ({})", name, pid),
+            (Some(name), None) => name.clone(),
+            (None, Some(pid)) => format!("pid:{}", pid),
+            (None, None) => "-".to_string(),
+        };
+
         format!(
-            "{:<6} {:<22} {:<24} {:<12} RX:{} TX:{}",
-            conn.protocol, local, remote, state, conn.rx_queue, conn.tx_queue
+            "{:<6} {:<22} {:<24} {:<12} {}",
+            conn.protocol, local, remote, state, process
         )
     }
 
@@ -1029,8 +1089,7 @@ impl NetworkStatsComponent {
             Cell::from(local_header),
             Cell::from("REMOTE"),
             Cell::from(state_header),
-            Cell::from("RX Q"),
-            Cell::from("TX Q"),
+            Cell::from("PROCESS"),
         ];
         let header = Row::new(header_cells)
             .style(Style::default().add_modifier(Modifier::DIM))
@@ -1072,6 +1131,34 @@ impl NetworkStatsComponent {
                 ConnectionState::Unknown => ("UNKNOWN", Color::DarkGray),
             };
 
+            // Format process/service info
+            // For listening ports, show service name if known
+            let (owner_text, owner_color) = if let Some(service_name) = port_to_service(conn.local_port) {
+                // Check service health
+                let health_status = self.services.get(service_name)
+                    .and_then(|s| s.health.as_ref())
+                    .map(|h| if h.healthy { "+" } else { "!" })
+                    .unwrap_or("?");
+
+                let process_suffix = conn.process_name.as_ref()
+                    .map(|p| format!(" ({})", p))
+                    .unwrap_or_default();
+
+                (format!("[{}{}]{}", health_status, service_name, process_suffix), Color::Cyan)
+            } else {
+                // Regular process info
+                let process = conn.process_name.as_ref()
+                    .map(|name| {
+                        if let Some(pid) = conn.process_pid {
+                            format!("{} ({})", name, pid)
+                        } else {
+                            name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                (process, Color::Yellow)
+            };
+
             // Check if this row is selected in visual mode
             let is_selected = in_visual && self.is_conn_selected(idx);
 
@@ -1087,8 +1174,7 @@ impl NetworkStatsComponent {
                 Cell::from(local),
                 Cell::from(remote),
                 Cell::from(state_str).style(Style::default().fg(state_color)),
-                Cell::from(conn.rx_queue.to_string()).style(Style::default().fg(Color::Green)),
-                Cell::from(conn.tx_queue.to_string()).style(Style::default().fg(Color::Blue)),
+                Cell::from(owner_text).style(Style::default().fg(owner_color)),
             ]).style(row_style)
         }).collect();
 
@@ -1097,8 +1183,7 @@ impl NetworkStatsComponent {
             Constraint::Length(22),   // LOCAL (IP:port)
             Constraint::Length(24),   // REMOTE
             Constraint::Length(12),   // STATE
-            Constraint::Length(8),    // RX Q
-            Constraint::Length(8),    // TX Q
+            Constraint::Min(16),      // PROCESS (takes remaining space)
         ];
 
         let table = Table::new(rows, widths)
@@ -1186,13 +1271,29 @@ impl NetworkStatsComponent {
             _ => ("OTHER", Color::DarkGray),
         };
 
-        let lines = vec![
+        // Format process info
+        let process_info = match (&conn.process_name, conn.process_pid) {
+            (Some(name), Some(pid)) => format!("{} (PID: {})", name, pid),
+            (Some(name), None) => name.clone(),
+            (None, Some(pid)) => format!("PID: {}", pid),
+            (None, None) => "-".to_string(),
+        };
+
+        // Format namespace
+        let netns_info = conn.netns.as_ref()
+            .map(|ns| ns.as_str())
+            .unwrap_or("host");
+
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("Protocol: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(&conn.protocol),
                 Span::raw("   "),
                 Span::styled("State: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(state_str, Style::default().fg(state_color).add_modifier(Modifier::BOLD)),
+                Span::raw("   "),
+                Span::styled("Process: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(&process_info, Style::default().fg(Color::Yellow)),
             ]),
             Line::from(vec![
                 Span::styled("Local:  ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
@@ -1200,6 +1301,9 @@ impl NetworkStatsComponent {
                 Span::raw("   "),
                 Span::styled("Remote: ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
                 Span::raw(&remote_addr),
+                Span::raw("   "),
+                Span::styled("Netns: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(netns_info, Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
                 Span::styled("RX Queue: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -1216,6 +1320,48 @@ impl NetworkStatsComponent {
                 Span::raw(" bytes"),
             ]),
         ];
+
+        // Show service info and available actions
+        if let Some(service_name) = port_to_service(conn.local_port) {
+            let service_info = self.services.get(service_name);
+            let (health_text, health_color) = service_info
+                .and_then(|s| s.health.as_ref())
+                .map(|h| {
+                    if h.healthy {
+                        ("healthy", Color::Green)
+                    } else {
+                        ("unhealthy", Color::Red)
+                    }
+                })
+                .unwrap_or(("unknown", Color::DarkGray));
+
+            let state_text = service_info
+                .map(|s| s.state.as_str())
+                .unwrap_or("unknown");
+
+            lines.push(Line::from(vec![
+                Span::styled("Service: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(service_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(" ("),
+                Span::styled(state_text, Style::default().fg(Color::DarkGray)),
+                Span::raw(", "),
+                Span::styled(health_text, Style::default().fg(health_color)),
+                Span::raw(")   "),
+                Span::styled("[l]", Style::default().fg(Color::Cyan)),
+                Span::styled(" logs  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[R]", Style::default().fg(Color::Cyan)),
+                Span::styled(" restart", Style::default().fg(Color::DarkGray)),
+            ]));
+        } else {
+            // No service - show process info hint
+            lines.push(Line::from(vec![
+                Span::styled("Actions: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[y]", Style::default().fg(Color::Cyan)),
+                Span::styled(" yank  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[V]", Style::default().fg(Color::Cyan)),
+                Span::styled(" visual select", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
 
         let block = Block::default()
             .borders(Borders::TOP)
@@ -1235,7 +1381,7 @@ impl NetworkStatsComponent {
             Constraint::Length(1),  // Header
             Constraint::Length(1),  // Summary bar
             Constraint::Min(5),     // Connection table
-            Constraint::Length(4),  // Detail section
+            Constraint::Length(5),  // Detail section (4 lines + border)
             Constraint::Length(1),  // Footer
         ])
         .split(area);
