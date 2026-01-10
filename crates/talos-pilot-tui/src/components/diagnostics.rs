@@ -666,10 +666,27 @@ impl DiagnosticsComponent {
             let cni_ok;
             match logs_result {
                 Ok(logs) => {
-                    // Check for CNI issues
-                    let cni_failed = logs.contains("failed to setup network for sandbox")
-                        || logs.contains("subnet.env: no such file");
-                    let crashloop = logs.contains("CrashLoopBackOff");
+                    // Check for CNI issues - but be smart about historical vs current failures
+                    // Look at the last portion of logs to determine current state
+                    let log_lines: Vec<&str> = logs.lines().collect();
+                    let recent_logs = if log_lines.len() > 20 {
+                        log_lines[log_lines.len() - 20..].join("\n")
+                    } else {
+                        logs.clone()
+                    };
+
+                    // Check for recent failures vs successes
+                    let has_cni_failure = recent_logs.contains("failed to setup network for sandbox")
+                        || recent_logs.contains("subnet.env: no such file");
+                    let has_cni_success = recent_logs.contains("successfully setup network")
+                        || logs.contains("ADD command succeeded"); // CNI plugin success
+
+                    // CNI is considered failed only if there are recent failures AND no successes
+                    // Or if br_netfilter is missing (definite failure condition)
+                    let cni_failed = (has_cni_failure && !has_cni_success) ||
+                        (br_netfilter_missing && has_cni_failure);
+
+                    let crashloop = recent_logs.contains("CrashLoopBackOff");
 
                     if cni_failed {
                         cni_ok = false;

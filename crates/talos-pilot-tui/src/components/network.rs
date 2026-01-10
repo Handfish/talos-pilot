@@ -132,6 +132,10 @@ pub struct NetworkStatsComponent {
 
     /// Current view mode (Interfaces or Connections drill-down)
     view_mode: ViewMode,
+    /// Selected interface name when in Connections view
+    selected_interface: Option<String>,
+    /// Filtered connections for the selected interface
+    filtered_connections: Vec<ConnectionInfo>,
     /// Selected connection index (for Connections view)
     conn_selected: usize,
     /// Connection table state
@@ -140,6 +144,8 @@ pub struct NetworkStatsComponent {
     conn_sort_by: ConnSortBy,
     /// Filter to listening only
     listening_only: bool,
+    /// Show all connections (bypass interface filter)
+    show_all_connections: bool,
 
     /// Visual selection anchor (for V mode) - stores connection index
     conn_selection_start: Option<usize>,
@@ -193,10 +199,13 @@ impl NetworkStatsComponent {
             auto_refresh: true,
             last_refresh: None,
             view_mode: ViewMode::Interfaces,
+            selected_interface: None,
+            filtered_connections: Vec::new(),
             conn_selected: 0,
             conn_table_state,
             conn_sort_by: ConnSortBy::State,
             listening_only: false,
+            show_all_connections: false,
             conn_selection_start: None,
             conn_viewport_height: 20, // Will be updated on draw
             pending_action: None,
@@ -440,8 +449,18 @@ impl NetworkStatsComponent {
     }
 
     /// Get filtered and sorted connections for display
+    /// Uses pre-filtered connections based on selected interface
     fn filtered_connections(&self) -> Vec<&ConnectionInfo> {
-        let mut conns: Vec<_> = self.connections.iter()
+        // Use the pre-filtered list (filtered by interface) unless showing all
+        let source = if self.show_all_connections || self.view_mode == ViewMode::Interfaces {
+            // Show all connections
+            &self.connections
+        } else {
+            // In connections view, use interface-filtered list
+            &self.filtered_connections
+        };
+
+        let mut conns: Vec<_> = source.iter()
             .filter(|c| !self.listening_only || c.state == ConnectionState::Listen)
             .collect();
 
@@ -505,16 +524,78 @@ impl NetworkStatsComponent {
         }
     }
 
-    /// Enter connection drill-down view
+    /// Enter connection drill-down view for the selected interface
     fn enter_connections_view(&mut self) {
+        // Store the selected interface name
+        self.selected_interface = self.selected_device().map(|d| d.name.clone());
+
+        // Filter connections for this interface
+        self.filter_connections_for_interface();
+
         self.view_mode = ViewMode::Connections;
         self.conn_selected = 0;
         self.conn_table_state.select(Some(0));
     }
 
+    /// Filter connections based on the selected interface
+    fn filter_connections_for_interface(&mut self) {
+        let Some(ref iface) = self.selected_interface else {
+            // No interface selected - show all connections
+            self.filtered_connections = self.connections.clone();
+            return;
+        };
+
+        self.filtered_connections = self.connections.iter()
+            .filter(|conn| Self::connection_matches_interface(conn, iface))
+            .cloned()
+            .collect();
+    }
+
+    /// Check if a connection likely uses the given interface
+    fn connection_matches_interface(conn: &ConnectionInfo, iface: &str) -> bool {
+        match iface {
+            // Loopback - connections to/from localhost
+            "lo" => {
+                conn.local_ip.starts_with("127.") ||
+                conn.local_ip == "::1" ||
+                conn.remote_ip.starts_with("127.") ||
+                conn.remote_ip == "::1"
+            }
+            // CNI bridge - pod network connections (typically 10.x.x.x)
+            "cni0" => {
+                conn.local_ip.starts_with("10.") ||
+                conn.remote_ip.starts_with("10.")
+            }
+            // Flannel overlay - also pod network
+            name if name.starts_with("flannel") => {
+                conn.local_ip.starts_with("10.") ||
+                conn.remote_ip.starts_with("10.")
+            }
+            // Veth pairs - pod connections
+            name if name.starts_with("veth") => {
+                conn.local_ip.starts_with("10.") ||
+                conn.remote_ip.starts_with("10.")
+            }
+            // Main interface (eth0, enp0s*, etc.) - non-loopback, non-pod connections
+            _ => {
+                // Exclude loopback
+                let is_loopback = conn.local_ip.starts_with("127.") ||
+                    conn.local_ip == "::1" ||
+                    conn.remote_ip.starts_with("127.") ||
+                    conn.remote_ip == "::1";
+
+                // Include all external connections and listeners on 0.0.0.0
+                !is_loopback || conn.local_ip == "0.0.0.0" || conn.local_ip == "::"
+            }
+        }
+    }
+
     /// Return to interfaces view
     fn exit_connections_view(&mut self) {
         self.view_mode = ViewMode::Interfaces;
+        self.selected_interface = None;
+        self.filtered_connections.clear();
+        self.show_all_connections = false;
         self.conn_selection_start = None;
     }
 
@@ -1043,12 +1124,18 @@ impl NetworkStatsComponent {
         let conn_count = self.filtered_connections().len();
         let filter_label = if self.listening_only { " [LISTEN ONLY]" } else { "" };
 
+        // Show interface name or "all" if showing all connections
+        let iface_display = if self.show_all_connections {
+            "all".to_string()
+        } else {
+            self.selected_interface.clone().unwrap_or_else(|| "all".to_string())
+        };
+
         let mut spans = vec![
             Span::styled("Connections: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(&iface_display, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" @ ", Style::default().fg(Color::DarkGray)),
             Span::raw(&self.hostname),
-            Span::styled(" (", Style::default().fg(Color::DarkGray)),
-            Span::raw(&self.address),
-            Span::styled(")", Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
             Span::styled(format!("{} connections", conn_count), Style::default().fg(Color::DarkGray)),
             Span::styled(filter_label, Style::default().fg(Color::Yellow)),
@@ -1217,7 +1304,8 @@ impl NetworkStatsComponent {
 
     /// Draw footer for connection view
     fn draw_conn_footer(&self, frame: &mut Frame, area: Rect) {
-        let listen_label = if self.listening_only { "all" } else { "listen only" };
+        let listen_label = if self.listening_only { "all" } else { "listen" };
+        let all_label = if self.show_all_connections { "iface" } else { "all" };
 
         let spans = if self.conn_in_visual_mode() {
             // Visual mode footer
@@ -1240,12 +1328,12 @@ impl NetworkStatsComponent {
                 Span::raw(" port  "),
                 Span::styled("[l]", Style::default().fg(Color::Cyan)),
                 Span::raw(format!(" {}  ", listen_label)),
+                Span::styled("[a]", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" {}  ", all_label)),
                 Span::styled("[V]", Style::default().fg(Color::Cyan)),
                 Span::raw(" visual  "),
                 Span::styled("[y]", Style::default().fg(Color::Cyan)),
                 Span::raw(" yank  "),
-                Span::styled("[r]", Style::default().fg(Color::Cyan)),
-                Span::raw(" refresh  "),
                 Span::styled("[q]", Style::default().fg(Color::Cyan)),
                 Span::raw(" back"),
             ]
@@ -1531,6 +1619,15 @@ impl NetworkStatsComponent {
             // Filter
             KeyCode::Char('l') => {
                 self.listening_only = !self.listening_only;
+                self.conn_selected = 0;
+                self.conn_table_state.select(Some(0));
+                self.conn_selection_start = None;
+                Ok(None)
+            }
+
+            // Toggle show all connections (bypass interface filter)
+            KeyCode::Char('a') => {
+                self.show_all_connections = !self.show_all_connections;
                 self.conn_selected = 0;
                 self.conn_table_state.select(Some(0));
                 self.conn_selection_start = None;

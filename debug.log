@@ -19,12 +19,12 @@ warning: methods `scroll_up`, `scroll_down`, `scroll_half_page_up`, and `scroll_
     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 warning: method `get_service_for_conn` is never used
-   --> crates/talos-pilot-tui/src/components/network.rs:543:8
+   --> crates/talos-pilot-tui/src/components/network.rs:624:8
     |
-166 | impl NetworkStatsComponent {
+172 | impl NetworkStatsComponent {
     | -------------------------- method in this implementation
 ...
-543 |     fn get_service_for_conn(&self, conn: &ConnectionInfo) -> Option<(&'static str, Option<&ServiceInfo>)> {
+624 |     fn get_service_for_conn(&self, conn: &ConnectionInfo) -> Option<(&'static str, Option<&ServiceInfo>)> {
     |        ^^^^^^^^^^^^^^^^^^^^
 
 warning: method `get_cpu_percent` is never used
@@ -37,5 +37,5 @@ warning: method `get_cpu_percent` is never used
     |        ^^^^^^^^^^^^^^^
 
 warning: `talos-pilot-tui` (lib) generated 3 warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
      Running `target/debug/talos-pilot`
