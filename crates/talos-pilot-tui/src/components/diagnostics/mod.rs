@@ -12,6 +12,7 @@
 pub mod addons;
 pub mod cni;
 pub mod core;
+pub mod k8s;
 pub mod types;
 
 use crate::action::Action;
@@ -356,8 +357,10 @@ impl DiagnosticsComponent {
             }
         }
 
-        // Detect CNI type
-        self.context.cni_type = cni::detect_cni(client).await;
+        // Detect CNI type (tries K8s API, falls back to logs)
+        let (cni_type, cni_info) = cni::detect_cni(client).await;
+        self.context.cni_type = cni_type;
+        self.context.cni_info = cni_info;
         tracing::info!("Detected CNI: {:?}", self.context.cni_type);
 
         let result = tokio::time::timeout(timeout, async {

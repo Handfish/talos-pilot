@@ -32,3 +32,10 @@ tracing.workspace = true
 
 # Clipboard
 arboard.workspace = true
+
+# Kubernetes client
+kube.workspace = true
+k8s-openapi.workspace = true
+
+# Serialization
+serde_yaml.workspace = true

@@ -224,6 +224,57 @@ impl CniType {
     }
 }
 
+/// Information about a CNI pod
+#[derive(Debug, Clone)]
+pub struct CniPodInfo {
+    /// Pod name
+    pub name: String,
+    /// Pod phase (Running, Pending, etc.)
+    pub phase: String,
+    /// Whether pod is ready
+    pub ready: bool,
+    /// Number of restarts
+    pub restart_count: i32,
+}
+
+/// CNI information from K8s API
+#[derive(Debug, Clone, Default)]
+pub struct CniInfo {
+    /// Detected CNI type
+    pub cni_type: CniType,
+    /// CNI pods in kube-system
+    pub pods: Vec<CniPodInfo>,
+}
+
+impl CniInfo {
+    /// Check if all CNI pods are healthy
+    pub fn are_pods_healthy(&self) -> bool {
+        if self.pods.is_empty() {
+            return false;
+        }
+        self.pods.iter().all(|pod| pod.phase == "Running" && pod.ready)
+    }
+
+    /// Get summary of CNI pod health
+    pub fn pod_health_summary(&self) -> String {
+        if self.pods.is_empty() {
+            return "No CNI pods found".to_string();
+        }
+
+        let total = self.pods.len();
+        let healthy = self.pods.iter().filter(|p| p.phase == "Running" && p.ready).count();
+        let total_restarts: i32 = self.pods.iter().map(|p| p.restart_count).sum();
+
+        if healthy == total && total_restarts == 0 {
+            format!("{}/{} pods healthy", healthy, total)
+        } else if healthy == total {
+            format!("{}/{} pods healthy ({} restarts)", healthy, total, total_restarts)
+        } else {
+            format!("{}/{} pods healthy", healthy, total)
+        }
+    }
+}
+
 /// Context passed to diagnostic providers
 #[derive(Clone)]
 pub struct DiagnosticContext {
@@ -237,6 +288,8 @@ pub struct DiagnosticContext {
     pub node_role: String,
     /// Node hostname (used as container name in Docker)
     pub hostname: String,
+    /// CNI information from K8s API (if available)
+    pub cni_info: Option<CniInfo>,
 }
 
 impl DiagnosticContext {
@@ -247,6 +300,7 @@ impl DiagnosticContext {
             cni_type: CniType::Unknown,
             node_role: String::new(),
             hostname: String::new(),
+            cni_info: None,
         }
     }
 }

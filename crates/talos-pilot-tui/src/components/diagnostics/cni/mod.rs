@@ -9,15 +9,57 @@ mod flannel;
 
 pub use flannel::run_flannel_checks;
 
-use super::types::{CniType, DiagnosticCheck, DiagnosticContext};
+use super::k8s;
+use super::types::{CniInfo, CniPodInfo, CniType, DiagnosticCheck, DiagnosticContext};
 use talos_rs::TalosClient;
 
 /// Detect which CNI is installed in the cluster
 ///
-/// For now, we detect based on kubelet logs and known patterns.
-/// In Phase 2, we'll use the Kubernetes API to check pods in kube-system.
-pub async fn detect_cni(client: &TalosClient) -> CniType {
-    // Try to detect CNI from kubelet logs
+/// Tries K8s API first (more reliable), falls back to kubelet log parsing.
+/// Returns both the CNI type and detailed pod info if K8s API is available.
+pub async fn detect_cni(client: &TalosClient) -> (CniType, Option<CniInfo>) {
+    // Try K8s API detection first
+    match k8s::create_k8s_client(client).await {
+        Ok(k8s_client) => {
+            match k8s::detect_cni_from_k8s(&k8s_client).await {
+                Ok(info) => {
+                    if info.cni_type != CniType::Unknown {
+                        tracing::info!(
+                            "CNI detected via K8s API: {:?} ({} pods)",
+                            info.cni_type,
+                            info.pods.len()
+                        );
+                        // Convert k8s::CniInfo to types::CniInfo
+                        let cni_info = CniInfo {
+                            cni_type: info.cni_type.clone(),
+                            pods: info.pods.iter().map(|p| CniPodInfo {
+                                name: p.name.clone(),
+                                phase: p.phase.clone(),
+                                ready: p.ready,
+                                restart_count: p.restart_count,
+                            }).collect(),
+                        };
+                        return (info.cni_type, Some(cni_info));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("K8s CNI detection failed: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create K8s client: {}", e);
+        }
+    }
+
+    // Fall back to kubelet log parsing
+    tracing::info!("Falling back to log-based CNI detection");
+    let cni_type = detect_cni_from_logs(client).await;
+    (cni_type, None)
+}
+
+/// Detect CNI from kubelet logs (fallback method)
+async fn detect_cni_from_logs(client: &TalosClient) -> CniType {
     match client.logs("kubelet", 200).await {
         Ok(logs) => {
             // Check for Flannel indicators
@@ -76,45 +118,84 @@ async fn run_generic_cni_checks(
     checks
 }
 
-/// Cilium-specific checks (stub for Phase 2)
+/// Cilium-specific checks
 async fn run_cilium_checks(
     _client: &TalosClient,
-    _ctx: &DiagnosticContext,
+    ctx: &DiagnosticContext,
 ) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
-    // TODO: Implement Cilium-specific checks in Phase 2
-    // - Cilium agent health
-    // - BPF filesystem mounted
-    // - Cilium connectivity test
-    // - No br_netfilter requirement (eBPF handles it)
+    // Check Cilium pod health if we have K8s API info
+    if let Some(ref cni_info) = ctx.cni_info {
+        checks.push(check_cni_pods("Cilium Pods", cni_info));
+    }
 
+    // Note: Cilium uses eBPF, so br_netfilter is NOT required
     checks.push(DiagnosticCheck::pass(
         "cni",
         "CNI (Cilium)",
-        "Detected (checks coming soon)",
+        if ctx.cni_info.is_some() { "OK" } else { "Detected" },
     ));
 
     checks
 }
 
-/// Calico-specific checks (stub for Phase 2)
+/// Calico-specific checks
 async fn run_calico_checks(
     _client: &TalosClient,
-    _ctx: &DiagnosticContext,
+    ctx: &DiagnosticContext,
 ) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
-    // TODO: Implement Calico-specific checks in Phase 2
-    // - Felix health
-    // - BGP peers (if using BGP mode)
-    // - br_netfilter (depends on datapath mode)
+    // Check Calico pod health if we have K8s API info
+    if let Some(ref cni_info) = ctx.cni_info {
+        checks.push(check_cni_pods("Calico Pods", cni_info));
+    }
+
+    // TODO: Check br_netfilter (depends on Calico datapath mode)
+    // - iptables mode: requires br_netfilter
+    // - eBPF mode: does not require br_netfilter
 
     checks.push(DiagnosticCheck::pass(
         "cni",
         "CNI (Calico)",
-        "Detected (checks coming soon)",
+        if ctx.cni_info.is_some() { "OK" } else { "Detected" },
     ));
 
     checks
+}
+
+/// Generic helper to check CNI pod health
+fn check_cni_pods(name: &str, cni_info: &CniInfo) -> DiagnosticCheck {
+    if cni_info.pods.is_empty() {
+        return DiagnosticCheck::warn(
+            "cni_pods",
+            name,
+            "No pods found",
+        ).with_details("Could not find CNI pods in kube-system namespace.");
+    }
+
+    let healthy = cni_info.are_pods_healthy();
+    let summary = cni_info.pod_health_summary();
+
+    if healthy {
+        DiagnosticCheck::pass("cni_pods", name, &summary)
+    } else {
+        // Find unhealthy pods
+        let unhealthy: Vec<_> = cni_info.pods.iter()
+            .filter(|p| p.phase != "Running" || !p.ready)
+            .collect();
+
+        let details = unhealthy.iter()
+            .map(|p| format!("  {} - {} (ready: {})", p.name, p.phase, p.ready))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        DiagnosticCheck::fail(
+            "cni_pods",
+            name,
+            &summary,
+            None,
+        ).with_details(&format!("Unhealthy pods:\n{}", details))
+    }
 }
