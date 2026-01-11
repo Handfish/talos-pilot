@@ -9,5 +9,7 @@ pub mod audit;
 pub mod clipboard;
 pub mod components;
 pub mod tui;
+pub mod ui_ext;
 
 pub use app::App;
+pub use ui_ext::*;

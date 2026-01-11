@@ -7,6 +7,7 @@ use crate::components::Component;
 use crate::components::diagnostics::k8s::{
     check_pdb_health, check_pod_health, create_k8s_client, PdbHealthInfo, PodHealthInfo,
 };
+use crate::ui_ext::HealthIndicatorExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use kube::Client;
@@ -18,7 +19,7 @@ use ratatui::{
     Frame,
 };
 use std::time::Instant;
-use talos_pilot_core::SelectableList;
+use talos_pilot_core::{HasHealth, HealthIndicator, SelectableList};
 use talos_rs::{get_discovery_members_for_context, DiscoveryMember, NodeTimeInfo, TalosClient, TalosConfig, VersionInfo};
 
 /// Auto-refresh interval in seconds
@@ -57,13 +58,19 @@ pub enum AlertSeverity {
     Error,
 }
 
+impl HasHealth for AlertSeverity {
+    fn health(&self) -> HealthIndicator {
+        match self {
+            AlertSeverity::Info => HealthIndicator::Info,
+            AlertSeverity::Warning => HealthIndicator::Warning,
+            AlertSeverity::Error => HealthIndicator::Error,
+        }
+    }
+}
+
 impl AlertSeverity {
     fn indicator(&self) -> (&'static str, Color) {
-        match self {
-            AlertSeverity::Info => ("i", Color::Cyan),
-            AlertSeverity::Warning => ("!", Color::Yellow),
-            AlertSeverity::Error => ("X", Color::Red),
-        }
+        self.health().symbol_and_color()
     }
 }
 

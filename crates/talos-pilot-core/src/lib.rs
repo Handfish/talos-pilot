@@ -14,13 +14,19 @@
 //! - [`indicators`] - Health and status indicators for consistent UI representation
 //! - [`formatting`] - Utilities for formatting bytes, durations, percentages, etc.
 //! - [`selection`] - Generic selection logic for list-based UI components
+//! - [`async_state`] - Async component state management (loading, error, refresh)
+//! - [`errors`] - Error formatting utilities for user-friendly messages
 
+pub mod async_state;
+pub mod errors;
 pub mod formatting;
 pub mod indicators;
 pub mod selection;
 pub mod types;
 
 // Re-export commonly used items at crate root
+pub use async_state::*;
+pub use errors::*;
 pub use formatting::*;
 pub use indicators::*;
 pub use selection::*;

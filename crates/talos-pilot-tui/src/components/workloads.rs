@@ -9,6 +9,7 @@
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::ui_ext::HealthIndicatorExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
@@ -26,6 +27,7 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::time::Instant;
+use talos_pilot_core::{HasHealth, HealthIndicator};
 
 /// Health state of a workload or pod
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,23 +42,24 @@ pub enum HealthState {
     Healthy,
 }
 
+impl HasHealth for HealthState {
+    fn health(&self) -> HealthIndicator {
+        match self {
+            HealthState::Failing => HealthIndicator::Error,
+            HealthState::Degraded => HealthIndicator::Warning,
+            HealthState::Pending => HealthIndicator::Pending,
+            HealthState::Healthy => HealthIndicator::Healthy,
+        }
+    }
+}
+
 impl HealthState {
     pub fn indicator(&self) -> (&'static str, Color) {
-        match self {
-            HealthState::Failing => ("✗", Color::Red),
-            HealthState::Degraded => ("◐", Color::Yellow),
-            HealthState::Pending => ("○", Color::Blue),
-            HealthState::Healthy => ("●", Color::Green),
-        }
+        self.health().symbol_and_color()
     }
 
     pub fn color(&self) -> Color {
-        match self {
-            HealthState::Failing => Color::Red,
-            HealthState::Degraded => Color::Yellow,
-            HealthState::Pending => Color::Blue,
-            HealthState::Healthy => Color::Green,
-        }
+        self.health().color()
     }
 }
 

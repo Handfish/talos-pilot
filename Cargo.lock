@@ -2797,6 +2797,7 @@ dependencies = [
  "serde",
  "talos-rs",
  "thiserror 2.0.17",
+ "tonic",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::ui_ext::QuorumStateExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -14,7 +15,7 @@ use ratatui::{
     Frame,
 };
 use std::time::Instant;
-use talos_pilot_core::{format_bytes_signed, HasHealth, QuorumState, SelectableList};
+use talos_pilot_core::{format_bytes_signed, format_talos_error, QuorumState, SelectableList};
 use talos_rs::{EtcdAlarm, EtcdMemberInfo, EtcdMemberStatus, TalosClient};
 
 /// Combined etcd member data (from member list + status)
@@ -24,40 +25,6 @@ pub struct EtcdMember {
     pub info: EtcdMemberInfo,
     /// Status from status call (None if unreachable)
     pub status: Option<EtcdMemberStatus>,
-}
-
-/// Extension trait to add Color conversion for QuorumState
-trait QuorumStateExt {
-    fn indicator_with_color(&self) -> (&'static str, Color);
-    fn display_with_color(&self) -> (&'static str, Color);
-}
-
-impl QuorumStateExt for QuorumState {
-    fn indicator_with_color(&self) -> (&'static str, Color) {
-        let indicator = self.health();
-        (
-            indicator.symbol(),
-            match self {
-                QuorumState::Healthy => Color::Green,
-                QuorumState::Degraded { .. } => Color::Yellow,
-                QuorumState::NoQuorum { .. } => Color::Red,
-                QuorumState::Unknown => Color::DarkGray,
-            },
-        )
-    }
-
-    fn display_with_color(&self) -> (&'static str, Color) {
-        let (text, _) = self.display();
-        (
-            text,
-            match self {
-                QuorumState::Healthy => Color::Green,
-                QuorumState::Degraded { .. } => Color::Yellow,
-                QuorumState::NoQuorum { .. } => Color::Red,
-                QuorumState::Unknown => Color::DarkGray,
-            },
-        )
-    }
 }
 
 /// Default auto-refresh interval in seconds
@@ -176,7 +143,7 @@ impl EtcdComponent {
             }
             Err(e) => {
                 self.retry_count += 1;
-                let msg = Self::format_error(&e);
+                let msg = format_talos_error(&e);
                 self.set_error(format!("Failed to fetch members: {} (retry {})", msg, self.retry_count));
                 return Ok(());
             }
@@ -272,61 +239,6 @@ impl EtcdComponent {
         self.members.select_next_no_wrap();
         self.table_state.select(Some(self.members.selected_index()));
     }
-
-    /// Format error messages for user-friendly display
-    fn format_error(error: &talos_rs::TalosError) -> String {
-        match error {
-            talos_rs::TalosError::Connection(msg) => {
-                if msg.contains("certificate") || msg.contains("tls") || msg.contains("ssl") {
-                    "TLS/certificate error - check talosconfig credentials".to_string()
-                } else if msg.contains("refused") {
-                    "Connection refused - is the node reachable?".to_string()
-                } else if msg.contains("timeout") {
-                    "Connection timed out - node may be slow or unreachable".to_string()
-                } else {
-                    format!("Connection failed: {}", msg)
-                }
-            }
-            talos_rs::TalosError::Grpc(status) => {
-                let msg = status.message().to_lowercase();
-                if msg.contains("unavailable") {
-                    "Service unavailable - node may be down".to_string()
-                } else if msg.contains("permission denied") {
-                    "Permission denied - check RBAC/credentials".to_string()
-                } else if msg.contains("unauthenticated") {
-                    "Authentication failed - check talosconfig".to_string()
-                } else if msg.contains("deadline exceeded") || msg.contains("timeout") {
-                    "Request timed out".to_string()
-                } else {
-                    format!("gRPC error: {}", status.message())
-                }
-            }
-            talos_rs::TalosError::Transport(e) => {
-                let msg = e.to_string();
-                if msg.contains("refused") {
-                    "Connection refused - is the node reachable?".to_string()
-                } else if msg.contains("timeout") || msg.contains("timed out") {
-                    "Connection timed out".to_string()
-                } else {
-                    format!("Transport error: {}", msg)
-                }
-            }
-            talos_rs::TalosError::Tls(msg) => {
-                format!("TLS error: {} - check talosconfig credentials", msg)
-            }
-            talos_rs::TalosError::ConfigNotFound(path) => {
-                format!("Config not found: {}", path)
-            }
-            talos_rs::TalosError::ConfigInvalid(msg) => {
-                format!("Invalid config: {}", msg)
-            }
-            talos_rs::TalosError::ContextNotFound(ctx) => {
-                format!("Context '{}' not found in talosconfig", ctx)
-            }
-            _ => error.to_string(),
-        }
-    }
-
 
     /// Draw the status bar
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {

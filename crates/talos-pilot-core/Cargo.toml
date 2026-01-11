@@ -8,6 +8,7 @@ description = "Core business logic for talos-pilot"
 
 [dependencies]
 talos-rs.workspace = true
+tonic.workspace = true
 
 # Serialization
 serde.workspace = true
