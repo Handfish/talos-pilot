@@ -930,6 +930,106 @@ impl TalosClient {
         promiscuous: bool,
         snap_len: u32,
     ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, TalosError> {
+        self.packet_capture_with_filter(interface, promiscuous, snap_len, Vec::new())
+            .await
+    }
+
+    /// Start packet capture with BPF filter to exclude the Talos API port.
+    ///
+    /// This prevents feedback loops when capturing on the management interface
+    /// by filtering out traffic on port 50000 (Talos apid).
+    pub async fn packet_capture_exclude_api(
+        &self,
+        interface: &str,
+        promiscuous: bool,
+        snap_len: u32,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, TalosError> {
+        let bpf_filter = Self::build_port_exclusion_filter(50000);
+        self.packet_capture_with_filter(interface, promiscuous, snap_len, bpf_filter)
+            .await
+    }
+
+    /// Build BPF filter to exclude a specific TCP/UDP port.
+    ///
+    /// Returns BPF bytecode that accepts all packets EXCEPT those with
+    /// the specified port as either source or destination (TCP or UDP).
+    fn build_port_exclusion_filter(port: u16) -> Vec<crate::proto::machine::BpfInstruction> {
+        use crate::proto::machine::BpfInstruction;
+
+        // BPF opcodes
+        const BPF_LD: u32 = 0x00;
+        const BPF_LDX: u32 = 0x01;
+        const BPF_JMP: u32 = 0x05;
+        const BPF_RET: u32 = 0x06;
+
+        const BPF_H: u32 = 0x08; // half-word (2 bytes)
+        const BPF_B: u32 = 0x10; // byte
+
+        const BPF_ABS: u32 = 0x20; // absolute offset
+        const BPF_IND: u32 = 0x40; // indirect offset
+        const BPF_MSH: u32 = 0xa0; // IP header length
+
+        const BPF_JEQ: u32 = 0x10; // jump if equal
+        const BPF_K: u32 = 0x00; // constant
+
+        let port_k = port as u32;
+
+        // BPF program: "not (tcp port <port> or udp port <port>)"
+        // This is for raw IP packets (no Ethernet header) as captured by Talos
+        //
+        // Offsets for raw IP:
+        // - IP protocol at offset 9
+        // - IP header length at offset 0 (masked with 0x0f, multiply by 4)
+        // - TCP/UDP src port at IP header + 0
+        // - TCP/UDP dst port at IP header + 2
+        vec![
+            // (000) ldh [0]                 ; Load IP version/IHL
+            BpfInstruction { op: BPF_LD | BPF_H | BPF_ABS, jt: 0, jf: 0, k: 0 },
+            // (001) jset #0x4000, 6, 0      ; Check fragment offset, if fragmented skip port check
+            BpfInstruction { op: BPF_JMP | 0x40 | BPF_K, jt: 14, jf: 0, k: 0x1fff },
+            // (002) ldb [9]                 ; Load IP protocol
+            BpfInstruction { op: BPF_LD | BPF_B | BPF_ABS, jt: 0, jf: 0, k: 9 },
+            // (003) jeq #6, 0, 4            ; If TCP (6), continue; else check UDP
+            BpfInstruction { op: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 4, k: 6 },
+            // (004) ldx 4*([0]&0xf)         ; Load IP header length into X
+            BpfInstruction { op: BPF_LDX | BPF_MSH, jt: 0, jf: 0, k: 0 },
+            // (005) ldh [x+0]               ; Load TCP src port
+            BpfInstruction { op: BPF_LD | BPF_H | BPF_IND, jt: 0, jf: 0, k: 0 },
+            // (006) jeq #port, 14, 0        ; If src port matches, reject
+            BpfInstruction { op: BPF_JMP | BPF_JEQ | BPF_K, jt: 10, jf: 0, k: port_k },
+            // (007) ldh [x+2]               ; Load TCP dst port
+            BpfInstruction { op: BPF_LD | BPF_H | BPF_IND, jt: 0, jf: 0, k: 2 },
+            // (008) jeq #port, 12, 11       ; If dst port matches, reject; else accept
+            BpfInstruction { op: BPF_JMP | BPF_JEQ | BPF_K, jt: 8, jf: 7, k: port_k },
+            // (009) ldb [9]                 ; Load IP protocol (for UDP check)
+            BpfInstruction { op: BPF_LD | BPF_B | BPF_ABS, jt: 0, jf: 0, k: 9 },
+            // (010) jeq #17, 0, 5           ; If UDP (17), continue; else accept
+            BpfInstruction { op: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 5, k: 17 },
+            // (011) ldx 4*([0]&0xf)         ; Load IP header length into X
+            BpfInstruction { op: BPF_LDX | BPF_MSH, jt: 0, jf: 0, k: 0 },
+            // (012) ldh [x+0]               ; Load UDP src port
+            BpfInstruction { op: BPF_LD | BPF_H | BPF_IND, jt: 0, jf: 0, k: 0 },
+            // (013) jeq #port, 3, 0         ; If src port matches, reject
+            BpfInstruction { op: BPF_JMP | BPF_JEQ | BPF_K, jt: 3, jf: 0, k: port_k },
+            // (014) ldh [x+2]               ; Load UDP dst port
+            BpfInstruction { op: BPF_LD | BPF_H | BPF_IND, jt: 0, jf: 0, k: 2 },
+            // (015) jeq #port, 1, 0         ; If dst port matches, reject; else accept
+            BpfInstruction { op: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: port_k },
+            // (016) ret #262144             ; Accept packet (max snap length)
+            BpfInstruction { op: BPF_RET | BPF_K, jt: 0, jf: 0, k: 262144 },
+            // (017) ret #0                  ; Reject packet
+            BpfInstruction { op: BPF_RET | BPF_K, jt: 0, jf: 0, k: 0 },
+        ]
+    }
+
+    /// Internal packet capture with explicit BPF filter
+    async fn packet_capture_with_filter(
+        &self,
+        interface: &str,
+        promiscuous: bool,
+        snap_len: u32,
+        bpf_filter: Vec<crate::proto::machine::BpfInstruction>,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, TalosError> {
         use crate::proto::machine::PacketCaptureRequest;
 
         let mut client = self.machine_client();
@@ -938,7 +1038,7 @@ impl TalosClient {
             interface: interface.to_string(),
             promiscuous,
             snap_len: if snap_len == 0 { 65535 } else { snap_len },
-            bpf_filter: Vec::new(), // Empty = capture all traffic
+            bpf_filter,
         }));
 
         let response = client.packet_capture(request).await?;

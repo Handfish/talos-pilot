@@ -39,8 +39,8 @@ fn port_to_service(port: u32) -> Option<&'static str> {
 /// Auto-refresh interval in seconds (faster than processes for responsive rates)
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 2;
 
-/// Max capture size before auto-stop (500 KB - quick sample, not full capture)
-const MAX_CAPTURE_SIZE: usize = 500 * 1024;
+/// Max capture size before auto-stop (40 MB)
+const MAX_CAPTURE_SIZE: usize = 40 * 1024 * 1024;
 
 /// Sort order for device list
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2058,9 +2058,15 @@ impl NetworkStatsComponent {
                 self.view_mode = self.view_mode.prev();
                 Ok(None)
             }
-            // Packet capture disabled - causes feedback loop without BPF filter
-            // (capturing on management interface captures its own gRPC traffic)
-            // TODO: Re-enable when BPF filter support is added (e.g., "not port 50000")
+            // Packet capture (uses BPF filter to exclude port 50000, preventing feedback loop)
+            KeyCode::Char('c') => {
+                self.toggle_capture();
+                Ok(None)
+            }
+            KeyCode::Char('s') => {
+                self.save_capture();
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }
@@ -2260,8 +2266,15 @@ impl NetworkStatsComponent {
                 Ok(None)
             }
 
-            // Packet capture disabled - causes feedback loop without BPF filter
-            // TODO: Re-enable when BPF filter support is added
+            // Packet capture (uses BPF filter to exclude port 50000, preventing feedback loop)
+            KeyCode::Char('c') => {
+                self.toggle_capture();
+                Ok(None)
+            }
+            KeyCode::Char('s') => {
+                self.save_capture();
+                Ok(None)
+            }
 
             _ => Ok(None),
         }
@@ -3154,9 +3167,11 @@ impl NetworkStatsComponent {
                 return;
             };
 
-            // Use snap_len=256 to capture headers only (not full payloads)
-            // This dramatically reduces capture size while keeping useful info
-            match client.packet_capture(interface, false, 256).await {
+            // Use snap_len=65535 to capture full packets
+            // NOTE: BPF filter disabled for now - was causing issues with Docker-based clusters
+            // The filter assumed raw IP packets but Docker may use Ethernet framing
+            // TODO: Detect link type and adjust BPF offsets accordingly
+            match client.packet_capture(interface, false, 65535).await {
                 Ok(receiver) => {
                     self.capture.receiver = Some(receiver);
                     self.status_message = Some((
@@ -3207,8 +3222,20 @@ impl NetworkStatsComponent {
         matches!(self.capture.state, CaptureState::Capturing(..))
     }
 
-    /// Save capture data to file
+    /// Save capture data to file (also stops capture if running)
     fn save_capture(&mut self) {
+        // Get interface name before stopping
+        let interface = match &self.capture.state {
+            CaptureState::Capturing(iface, ..) => iface.clone(),
+            CaptureState::Idle => "capture".to_string(),
+        };
+
+        // Stop capture if running
+        if self.is_capturing() {
+            self.capture.state = CaptureState::Idle;
+            self.capture.receiver = None;
+        }
+
         if self.capture.data.is_empty() {
             self.status_message = Some((
                 "No capture data to save".to_string(),
@@ -3222,19 +3249,25 @@ impl NetworkStatsComponent {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let interface = match &self.capture.state {
-            CaptureState::Capturing(iface, ..) => iface.clone(),
-            CaptureState::Idle => "capture".to_string(),
-        };
         let filename = format!("{}_{}.pcap", interface, timestamp);
         let path = std::path::Path::new("/tmp").join(&filename);
 
+        let bytes_saved = self.capture.data.len();
         match std::fs::write(&path, &self.capture.data) {
             Ok(_) => {
+                let size_str = if bytes_saved >= 1_048_576 {
+                    format!("{:.1} MB", bytes_saved as f64 / 1_048_576.0)
+                } else if bytes_saved >= 1024 {
+                    format!("{:.1} KB", bytes_saved as f64 / 1024.0)
+                } else {
+                    format!("{} B", bytes_saved)
+                };
                 self.status_message = Some((
-                    format!("Saved to {}", path.display()),
+                    format!("Saved {} to {}", size_str, path.display()),
                     Instant::now(),
                 ));
+                // Clear capture data after successful save
+                self.capture.data.clear();
             }
             Err(e) => {
                 self.status_message = Some((
