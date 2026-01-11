@@ -99,6 +99,8 @@ pub struct DiagnosticsComponent {
 
     /// Client for API calls
     client: Option<TalosClient>,
+    /// Control plane endpoint for fetching kubeconfig (used for worker nodes)
+    controlplane_endpoint: Option<String>,
 }
 
 impl Default for DiagnosticsComponent {
@@ -145,12 +147,18 @@ impl DiagnosticsComponent {
             last_refresh: None,
             auto_refresh: true,
             client: None,
+            controlplane_endpoint: None,
         }
     }
 
     /// Set the client for making API calls
     pub fn set_client(&mut self, client: TalosClient) {
         self.client = Some(client);
+    }
+
+    /// Set the control plane endpoint for fetching kubeconfig (used for worker nodes)
+    pub fn set_controlplane_endpoint(&mut self, endpoint: Option<String>) {
+        self.controlplane_endpoint = endpoint;
     }
 
     /// Set an error message
@@ -407,7 +415,20 @@ impl DiagnosticsComponent {
         }
 
         // Try to create K8s client once for all K8s-based checks
-        let k8s_client = match k8s::create_k8s_client(client).await {
+        // For worker nodes, use the control plane endpoint to fetch kubeconfig
+        let kubeconfig_client = if let Some(ref cp_endpoint) = self.controlplane_endpoint {
+            tracing::info!("Worker node: using control plane {} for kubeconfig", cp_endpoint);
+            Some(client.with_node(cp_endpoint))
+        } else {
+            None
+        };
+
+        let k8s_client = match k8s::create_k8s_client_with_kubeconfig_source(
+            client,
+            kubeconfig_client.as_ref(),
+        )
+        .await
+        {
             Ok(client) => {
                 tracing::info!("K8s client created successfully");
                 self.context.k8s_error = None;
@@ -415,7 +436,10 @@ impl DiagnosticsComponent {
             }
             Err(e) => {
                 let error_msg = format!("{}", e);
-                tracing::warn!("Failed to create K8s client: {} - K8s-based checks will be limited", error_msg);
+                tracing::warn!(
+                    "Failed to create K8s client: {} - K8s-based checks will be limited",
+                    error_msg
+                );
                 self.context.k8s_error = Some(error_msg);
                 None
             }

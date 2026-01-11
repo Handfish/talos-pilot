@@ -563,12 +563,18 @@ impl App {
             Action::ShowNodeDetails(_, _) => {
                 // Legacy - no longer used, we use ShowMultiLogs now
             }
-            Action::ShowDiagnostics(hostname, address, role) => {
+            Action::ShowDiagnostics(hostname, address, role, cp_endpoint) => {
                 // Switch to diagnostics view for a node
-                tracing::info!("ShowDiagnostics: hostname='{}', address='{}', role='{}'", hostname, address, role);
+                tracing::info!(
+                    "ShowDiagnostics: hostname='{}', address='{}', role='{}', cp_endpoint={:?}",
+                    hostname, address, role, cp_endpoint
+                );
 
                 // Create diagnostics component
                 let mut diagnostics = DiagnosticsComponent::new(hostname, address.clone(), role);
+
+                // Set the control plane endpoint for worker nodes to fetch kubeconfig
+                diagnostics.set_controlplane_endpoint(cp_endpoint);
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {

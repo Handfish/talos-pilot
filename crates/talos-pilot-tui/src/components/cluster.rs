@@ -672,6 +672,17 @@ impl ClusterComponent {
             .unwrap_or_else(|| EMPTY.get_or_init(HashMap::new))
     }
 
+    /// Get a control plane node IP from the active cluster
+    /// Used to fetch kubeconfig when diagnosing worker nodes
+    fn get_controlplane_endpoint(&self) -> Option<String> {
+        let cp_nodes = self.controlplane_nodes_for(self.active_cluster);
+        if let Some((_, node)) = cp_nodes.first() {
+            self.node_ips().get(&node.node).cloned()
+        } else {
+            None
+        }
+    }
+
     /// Get service count for current node
     fn current_service_count(&self) -> usize {
         let Some(node_name) = self.current_node_name() else {
@@ -757,7 +768,13 @@ impl ClusterComponent {
                 if let Some(node_name) = self.current_node_name() {
                     let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or(node_name.clone());
                     let node_role = self.current_node_role();
-                    Ok(Some(Action::ShowDiagnostics(node_name, node_ip, node_role)))
+                    // For worker nodes, provide a control plane endpoint to fetch kubeconfig from
+                    let cp_endpoint = if node_role == "worker" {
+                        self.get_controlplane_endpoint()
+                    } else {
+                        None
+                    };
+                    Ok(Some(Action::ShowDiagnostics(node_name, node_ip, node_role, cp_endpoint)))
                 } else {
                     Ok(None)
                 }
@@ -934,7 +951,13 @@ impl Component for ClusterComponent {
                 if let Some(node_name) = self.current_node_name() {
                     let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or(node_name.clone());
                     let node_role = self.current_node_role();
-                    Ok(Some(Action::ShowDiagnostics(node_name, node_ip, node_role)))
+                    // For worker nodes, provide a control plane endpoint to fetch kubeconfig from
+                    let cp_endpoint = if node_role == "worker" {
+                        self.get_controlplane_endpoint()
+                    } else {
+                        None
+                    };
+                    Ok(Some(Action::ShowDiagnostics(node_name, node_ip, node_role, cp_endpoint)))
                 } else {
                     Ok(None)
                 }

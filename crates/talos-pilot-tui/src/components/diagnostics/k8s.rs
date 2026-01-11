@@ -25,9 +25,25 @@ pub enum K8sError {
 }
 
 /// Create a Kubernetes client from Talos-provided kubeconfig
+///
+/// If `kubeconfig_client` is provided, it will be used to fetch the kubeconfig.
+/// This is useful when diagnosing worker nodes that don't have the kubeconfig endpoint.
 pub async fn create_k8s_client(talos_client: &TalosClient) -> Result<Client, K8sError> {
+    create_k8s_client_with_kubeconfig_source(talos_client, None).await
+}
+
+/// Create a Kubernetes client, optionally using a different client to fetch kubeconfig
+///
+/// This allows fetching kubeconfig from a control plane node while diagnosing a worker node.
+pub async fn create_k8s_client_with_kubeconfig_source(
+    _talos_client: &TalosClient,
+    kubeconfig_client: Option<&TalosClient>,
+) -> Result<Client, K8sError> {
+    // Use the provided kubeconfig_client if available, otherwise use the main client
+    let client_for_kubeconfig = kubeconfig_client.unwrap_or(_talos_client);
+
     // Get kubeconfig from Talos
-    let kubeconfig_yaml = talos_client
+    let kubeconfig_yaml = client_for_kubeconfig
         .kubeconfig()
         .await
         .map_err(|e| K8sError::KubeconfigFetch(e.to_string()))?;
