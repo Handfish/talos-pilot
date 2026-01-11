@@ -1180,6 +1180,57 @@ impl TalosClient {
 
         Ok(rx)
     }
+
+    /// Reboot the node
+    ///
+    /// # Arguments
+    /// * `mode` - Reboot mode (default, powercycle)
+    pub async fn reboot(&self, mode: RebootMode) -> Result<RebootResult, TalosError> {
+        use crate::proto::machine::{RebootRequest, reboot_request::Mode};
+
+        let proto_mode = match mode {
+            RebootMode::Default => Mode::Default,
+            RebootMode::Powercycle => Mode::Powercycle,
+        };
+
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(RebootRequest {
+            mode: proto_mode as i32,
+        }));
+
+        let response = client.reboot(request).await?;
+        let inner = response.into_inner();
+
+        // Get the first message (we're typically rebooting one node at a time)
+        let msg = inner.messages.into_iter().next();
+
+        Ok(RebootResult {
+            node: msg.as_ref()
+                .and_then(|m| m.metadata.as_ref())
+                .map(|m| m.hostname.clone())
+                .unwrap_or_else(|| self.nodes.first().cloned().unwrap_or_default()),
+            success: msg.is_some(),
+        })
+    }
+}
+
+/// Reboot mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RebootMode {
+    /// Default reboot
+    #[default]
+    Default,
+    /// Power cycle (hard reboot)
+    Powercycle,
+}
+
+/// Result of a reboot operation
+#[derive(Debug, Clone)]
+pub struct RebootResult {
+    /// Node that was rebooted
+    pub node: String,
+    /// Whether the reboot was initiated successfully
+    pub success: bool,
 }
 
 // ==================== Configuration Types ====================

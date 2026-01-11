@@ -2,12 +2,13 @@
 //!
 //! Creates a K8s client from Talos-provided kubeconfig.
 
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Node, Pod};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{
-    api::{Api, ListParams},
+    api::{Api, EvictParams, ListParams, Patch, PatchParams},
     Client, Config,
 };
+use k8s_openapi::serde_json::json;
 use talos_rs::TalosClient;
 
 /// Error type for K8s operations
@@ -396,4 +397,284 @@ pub async fn check_pdb_health(client: &Client) -> Result<PdbHealthInfo, K8sError
     }
 
     Ok(info)
+}
+
+// ==================== Node Operations ====================
+
+/// Result of a cordon operation
+#[derive(Debug, Clone)]
+pub struct CordonResult {
+    /// Node name
+    pub node: String,
+    /// Whether the operation succeeded
+    pub success: bool,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Result of a drain operation
+#[derive(Debug, Clone)]
+pub struct DrainResult {
+    /// Node name
+    pub node: String,
+    /// Whether the operation succeeded
+    pub success: bool,
+    /// Number of pods evicted
+    pub pods_evicted: usize,
+    /// Pods that failed to evict
+    pub failed_pods: Vec<String>,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Cordon a node (mark as unschedulable)
+pub async fn cordon_node(client: &Client, node_name: &str) -> Result<CordonResult, K8sError> {
+    let nodes: Api<Node> = Api::all(client.clone());
+
+    // Patch the node to set unschedulable = true
+    let patch = json!({
+        "spec": {
+            "unschedulable": true
+        }
+    });
+
+    match nodes
+        .patch(
+            node_name,
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(CordonResult {
+            node: node_name.to_string(),
+            success: true,
+            error: None,
+        }),
+        Err(e) => Ok(CordonResult {
+            node: node_name.to_string(),
+            success: false,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+/// Uncordon a node (mark as schedulable)
+pub async fn uncordon_node(client: &Client, node_name: &str) -> Result<CordonResult, K8sError> {
+    let nodes: Api<Node> = Api::all(client.clone());
+
+    // Patch the node to set unschedulable = false
+    let patch = json!({
+        "spec": {
+            "unschedulable": false
+        }
+    });
+
+    match nodes
+        .patch(
+            node_name,
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(CordonResult {
+            node: node_name.to_string(),
+            success: true,
+            error: None,
+        }),
+        Err(e) => Ok(CordonResult {
+            node: node_name.to_string(),
+            success: false,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+/// Progress callback type for drain operations
+pub type DrainProgressCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Drain a node (evict all pods)
+///
+/// This will:
+/// 1. Get all pods on the node
+/// 2. Filter out DaemonSet pods and mirror pods
+/// 3. Evict each pod, respecting PDBs
+pub async fn drain_node(
+    client: &Client,
+    node_name: &str,
+    ignore_daemonsets: bool,
+    delete_emptydir_data: bool,
+    _timeout_seconds: u64,
+) -> Result<DrainResult, K8sError> {
+    drain_node_with_progress(client, node_name, ignore_daemonsets, delete_emptydir_data, None).await
+}
+
+/// Drain a node with progress callback
+pub async fn drain_node_with_progress(
+    client: &Client,
+    node_name: &str,
+    ignore_daemonsets: bool,
+    delete_emptydir_data: bool,
+    progress_callback: Option<DrainProgressCallback>,
+) -> Result<DrainResult, K8sError> {
+    let pods: Api<Pod> = Api::all(client.clone());
+
+    // List pods on this node
+    let list_params = ListParams::default()
+        .fields(&format!("spec.nodeName={}", node_name));
+
+    let pod_list = pods
+        .list(&list_params)
+        .await
+        .map_err(|e| K8sError::ApiError(format!("Failed to list pods: {}", e)))?;
+
+    let mut pods_to_evict = Vec::new();
+    let mut skipped_daemonset = 0;
+
+    for pod in pod_list.items {
+        let pod_name = pod.metadata.name.clone().unwrap_or_default();
+        let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+
+        // Skip mirror pods (created by kubelet, not managed by API server)
+        if let Some(annotations) = &pod.metadata.annotations {
+            if annotations.contains_key("kubernetes.io/config.mirror") {
+                continue;
+            }
+        }
+
+        // Check if pod is owned by a DaemonSet
+        let is_daemonset_pod = pod.metadata.owner_references.as_ref().map_or(false, |refs| {
+            refs.iter().any(|r| r.kind == "DaemonSet")
+        });
+
+        if is_daemonset_pod {
+            if ignore_daemonsets {
+                skipped_daemonset += 1;
+                continue;
+            }
+            // DaemonSet pods can't be evicted without ignoring them
+        }
+
+        // Check for local storage (emptyDir)
+        let has_emptydir = pod.spec.as_ref().map_or(false, |spec| {
+            spec.volumes.as_ref().map_or(false, |volumes| {
+                volumes.iter().any(|v| v.empty_dir.is_some())
+            })
+        });
+
+        if has_emptydir && !delete_emptydir_data {
+            // Skip pods with emptyDir unless explicitly allowed
+            continue;
+        }
+
+        pods_to_evict.push((namespace, pod_name));
+    }
+
+    let total_pods = pods_to_evict.len();
+    let mut evicted = 0;
+    let mut failed_pods = Vec::new();
+
+    // Report initial count
+    if let Some(ref cb) = progress_callback {
+        cb(&format!("Found {} pods to evict", total_pods));
+    }
+
+    // Evict pods one at a time, respecting PDBs
+    // PDBs may temporarily block eviction, so we retry with backoff
+    for (idx, (namespace, pod_name)) in pods_to_evict.into_iter().enumerate() {
+        let ns_pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+        let evict_params = EvictParams::default();
+
+        // Report which pod we're evicting
+        if let Some(ref cb) = progress_callback {
+            cb(&format!("Evicting {}/{} ({}/{})", namespace, pod_name, idx + 1, total_pods));
+        }
+
+        let mut attempts = 0;
+        let max_attempts = 5; // 5 attempts * 2 seconds = 10 seconds max per pod
+        let mut success = false;
+
+        while attempts < max_attempts && !success {
+            match ns_pods.evict(&pod_name, &evict_params).await {
+                Ok(_) => {
+                    evicted += 1;
+                    tracing::info!("Evicted pod {}/{}", namespace, pod_name);
+                    success = true;
+
+                    // Report success
+                    if let Some(ref cb) = progress_callback {
+                        cb(&format!("Evicted {}/{} ({}/{})", namespace, pod_name, evicted, total_pods));
+                    }
+
+                    // Wait briefly for pod to start terminating before next eviction
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+
+                    // Pod already gone - count as success
+                    if err_str.contains("404") || err_str.contains("not found") {
+                        evicted += 1;
+                        success = true;
+                        if let Some(ref cb) = progress_callback {
+                            cb(&format!("Pod gone {}/{} ({}/{})", namespace, pod_name, evicted, total_pods));
+                        }
+                        continue;
+                    }
+
+                    // PDB blocking eviction - retry after delay
+                    // Error codes: 429 (Too Many Requests) or message about disruption budget
+                    if err_str.contains("429")
+                        || err_str.contains("disruption budget")
+                        || err_str.contains("PodDisruptionBudget")
+                        || err_str.contains("Cannot evict")
+                    {
+                        attempts += 1;
+                        tracing::debug!(
+                            "PDB blocking eviction of {}/{}, attempt {}/{}",
+                            namespace,
+                            pod_name,
+                            attempts,
+                            max_attempts
+                        );
+                        // Report PDB wait
+                        if let Some(ref cb) = progress_callback {
+                            cb(&format!("Waiting for PDB: {}/{} (retry {}/{})", namespace, pod_name, attempts, max_attempts));
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+
+                    // Other error - fail immediately
+                    tracing::warn!("Failed to evict {}/{}: {}", namespace, pod_name, e);
+                    failed_pods.push(format!("{}/{}", namespace, pod_name));
+                    if let Some(ref cb) = progress_callback {
+                        cb(&format!("Failed: {}/{}", namespace, pod_name));
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !success && attempts >= max_attempts {
+            tracing::warn!(
+                "Timed out waiting for PDB to allow eviction of {}/{}",
+                namespace,
+                pod_name
+            );
+            failed_pods.push(format!("{}/{}", namespace, pod_name));
+            if let Some(ref cb) = progress_callback {
+                cb(&format!("Timeout: {}/{}", namespace, pod_name));
+            }
+        }
+    }
+
+    Ok(DrainResult {
+        node: node_name.to_string(),
+        success: failed_pods.is_empty(),
+        pods_evicted: evicted,
+        failed_pods,
+        error: None,
+    })
 }

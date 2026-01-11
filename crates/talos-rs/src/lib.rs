@@ -78,6 +78,8 @@ pub use client::{
     ApplyConfigResult, ApplyMode,
     // Time types
     NodeTimeInfo,
+    // Operation types
+    RebootMode, RebootResult,
 };
 pub use config::{Context, TalosConfig};
 pub use error::TalosError;

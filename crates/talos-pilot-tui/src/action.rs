@@ -43,6 +43,8 @@ pub enum Action {
     ShowLifecycle,
     /// Show workload health view
     ShowWorkloads,
+    /// Show node operations overlay: (hostname, address, is_controlplane)
+    ShowNodeOperations(String, String, bool),
 
     // UI state
     Tick,

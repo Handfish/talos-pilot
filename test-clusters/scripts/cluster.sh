@@ -970,9 +970,44 @@ EOF
             echo "  Press 'w' to view workload health"
             ;;
 
+        drainable)
+            log_info "Creating drainable workloads for testing node operations..."
+            kubectl create namespace test-drainable 2>/dev/null || true
+
+            # Uncordon all nodes (in case they were cordoned from previous drain tests)
+            log_info "Uncordoning all nodes..."
+            kubectl uncordon --all 2>/dev/null || true
+
+            # Remove control plane taint so pods can schedule
+            log_info "Removing control plane taint..."
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+
+            # Give scheduler a moment to pick up the changes
+            sleep 2
+
+            # Simple deployments without PDB (PDBs don't work on single-node clusters)
+            kubectl create deployment web --image=nginx:alpine --replicas=3 -n test-drainable
+            kubectl create deployment api --image=nginx:alpine --replicas=2 -n test-drainable
+
+            log_success "Created drainable workloads in test-drainable namespace"
+            echo ""
+            echo "These workloads CAN be drained:"
+            echo "  - web (3 replicas, no PDB)"
+            echo "  - api (2 replicas, no PDB)"
+            echo ""
+            echo "NOTE: PDBs are not used because they don't work on single-node clusters"
+            echo "(evicted pods can't reschedule when the only node is cordoned)"
+            echo ""
+            echo "Test drain with: press 'o' on the node, then 'd' for drain"
+            echo ""
+            echo "NOTE: Docker-based Talos clusters support reboot, but it's a"
+            echo "container restart rather than a true node reboot. The operation"
+            echo "will complete quickly (~5-10 seconds) vs a real node reboot."
+            ;;
+
         clean)
             log_info "Cleaning up test workloads..."
-            kubectl delete namespace test-healthy test-failing test-degraded test-stateful test-daemonset test-pdb test-mixed 2>/dev/null || true
+            kubectl delete namespace test-healthy test-failing test-degraded test-stateful test-daemonset test-pdb test-mixed test-drainable 2>/dev/null || true
             log_success "Cleaned up all test namespaces"
             ;;
 
@@ -980,6 +1015,7 @@ EOF
             log_error "Unknown workload type: ${workload_type}"
             echo "Available types:"
             echo "  kitchen-sink - [RECOMMENDED] All scenarios + removes control plane taint"
+            echo "  drainable    - Workloads for testing drain/reboot operations"
             echo "  healthy      - Healthy Deployments and StatefulSet"
             echo "  crashloop    - CrashLoopBackOff deployment"
             echo "  imagepull    - ImagePullBackOff deployment"
@@ -989,7 +1025,7 @@ EOF
             echo "  degraded     - Partially ready deployment"
             echo "  statefulset  - StatefulSet examples"
             echo "  daemonset    - DaemonSet example"
-            echo "  pdb          - Deployment with PodDisruptionBudget"
+            echo "  pdb          - Deployment with PodDisruptionBudget (blocks drain)"
             echo "  mixed        - Mixed healthy/failing namespace"
             echo "  all          - Create all test workloads (no taint removal)"
             echo "  clean        - Delete all test workloads"
@@ -1029,6 +1065,7 @@ PROFILES:
 
 WORKLOAD TYPES:
     kitchen-sink        [RECOMMENDED] All scenarios + removes control plane taint
+    drainable           Workloads for testing drain/reboot operations
     healthy             Healthy Deployments and StatefulSet
     crashloop           CrashLoopBackOff deployment
     imagepull           ImagePullBackOff deployment
@@ -1038,7 +1075,7 @@ WORKLOAD TYPES:
     degraded            Partially ready deployment
     statefulset         StatefulSet examples (healthy + failing)
     daemonset           DaemonSet example
-    pdb                 Deployment with PodDisruptionBudget
+    pdb                 Deployment with PodDisruptionBudget (blocks drain)
     mixed               Mixed healthy/failing namespace
     all                 Create all test workloads (no taint removal)
     clean               Delete all test workloads

@@ -766,6 +766,16 @@ impl Component for ClusterComponent {
             KeyCode::Char('c') => Ok(Some(Action::ShowSecurity)),
             KeyCode::Char('y') => Ok(Some(Action::ShowLifecycle)),
             KeyCode::Char('w') => Ok(Some(Action::ShowWorkloads)),
+            KeyCode::Char('o') => {
+                // Show node operations overlay for selected node
+                if let Some(node_name) = self.current_node_name() {
+                    let node_ip = self.node_ips.get(&node_name).cloned().unwrap_or_else(|| node_name.clone());
+                    let is_controlplane = self.current_node_role() == "controlplane";
+                    Ok(Some(Action::ShowNodeOperations(node_name, node_ip, is_controlplane)))
+                } else {
+                    Ok(None)
+                }
+            }
 
             // Toggle auto-refresh
             KeyCode::Char('a') => {
@@ -822,6 +832,9 @@ impl Component for ClusterComponent {
             Span::raw("  "),
             Span::styled("[l]", Style::default().fg(Color::Yellow)),
             Span::styled(" logs", Style::default().dim()),
+            Span::raw("  "),
+            Span::styled("[o]", Style::default().fg(Color::Yellow)),
+            Span::styled(" ops", Style::default().dim()),
             Span::raw("  "),
             Span::styled("[r]", Style::default().fg(Color::Yellow)),
             Span::styled(" refresh", Style::default().dim()),

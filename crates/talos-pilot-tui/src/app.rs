@@ -1,7 +1,7 @@
 //! Application state and main loop
 
 use crate::action::Action;
-use crate::components::{ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent, MultiLogsComponent, NetworkStatsComponent, ProcessesComponent, SecurityComponent, WorkloadHealthComponent};
+use crate::components::{ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent, MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent, SecurityComponent, WorkloadHealthComponent};
 use crate::tui::{self, Tui};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -20,6 +20,7 @@ enum View {
     Security,
     Lifecycle,
     Workloads,
+    NodeOperations,
 }
 
 /// Main application state
@@ -46,6 +47,8 @@ pub struct App {
     lifecycle: Option<LifecycleComponent>,
     /// Workload health component (created when viewing workloads)
     workloads: Option<WorkloadHealthComponent>,
+    /// Node operations component (overlay for node operations)
+    node_operations: Option<NodeOperationsComponent>,
     /// Number of log lines to fetch per service
     tail_lines: i32,
     /// Tick rate for animations (ms)
@@ -87,6 +90,7 @@ impl App {
             security: None,
             lifecycle: None,
             workloads: None,
+            node_operations: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
@@ -164,6 +168,13 @@ impl App {
                             let _ = workloads.draw(frame, area);
                         }
                     }
+                    View::NodeOperations => {
+                        // Draw cluster in background, then overlay
+                        let _ = self.cluster.draw(frame, area);
+                        if let Some(node_ops) = &mut self.node_operations {
+                            let _ = node_ops.draw(frame, area);
+                        }
+                    }
                 }
             })?;
 
@@ -225,6 +236,13 @@ impl App {
                             View::Workloads => {
                                 if let Some(workloads) = &mut self.workloads {
                                     workloads.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                            View::NodeOperations => {
+                                if let Some(node_ops) = &mut self.node_operations {
+                                    node_ops.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -310,6 +328,9 @@ impl App {
                     View::Workloads => {
                         self.workloads = None;
                     }
+                    View::NodeOperations => {
+                        self.node_operations = None;
+                    }
                     View::Cluster => {}
                 }
                 // Return to cluster view
@@ -379,6 +400,13 @@ impl App {
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads
                             && let Some(next_action) = workloads.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::NodeOperations => {
+                        if let Some(node_ops) = &mut self.node_operations
+                            && let Some(next_action) = node_ops.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -455,6 +483,13 @@ impl App {
                         if let Some(workloads) = &mut self.workloads {
                             if let Err(e) = workloads.refresh().await {
                                 workloads.set_error(e.to_string());
+                            }
+                        }
+                    }
+                    View::NodeOperations => {
+                        if let Some(node_ops) = &mut self.node_operations {
+                            if let Err(e) = node_ops.refresh().await {
+                                node_ops.set_error(e.to_string());
                             }
                         }
                     }
@@ -659,6 +694,27 @@ impl App {
                 self.workloads = Some(workloads);
                 self.view = View::Workloads;
             }
+            Action::ShowNodeOperations(hostname, address, is_controlplane) => {
+                // Show node operations overlay
+                tracing::info!("Viewing node operations for: {} ({})", hostname, address);
+
+                // Create node operations component
+                let mut node_ops = NodeOperationsComponent::new(hostname, address, is_controlplane);
+
+                // Set the Talos client
+                if let Some(talos_client) = self.cluster.client() {
+                    node_ops.set_client(talos_client.clone());
+                }
+
+                // Refresh to load safety checks
+                if let Err(e) = node_ops.refresh().await {
+                    tracing::error!("Node operations refresh error: {:?}", e);
+                    node_ops.set_error(e.to_string());
+                }
+
+                self.node_operations = Some(node_ops);
+                self.view = View::NodeOperations;
+            }
             _ => {
                 // Forward to current component
                 match self.view {
@@ -719,6 +775,13 @@ impl App {
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads
                             && let Some(next_action) = workloads.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::NodeOperations => {
+                        if let Some(node_ops) = &mut self.node_operations
+                            && let Some(next_action) = node_ops.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
