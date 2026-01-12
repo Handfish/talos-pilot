@@ -7,7 +7,8 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Ken Udovic"]
 license = "MIT"
-repository = "https://github.com/ken-udovic/talos-pilot"
+repository = "https://github.com/Handfish/talos-pilot"
+homepage = "https://github.com/Handfish/talos-pilot"
 
 [workspace.dependencies]
 # Async runtime
@@ -22,7 +23,11 @@ prost-types = "0.13"
 
 # TLS
 tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "ring",
+] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 
@@ -54,7 +59,12 @@ dirs-next = "2"
 arboard = "3"
 
 # Kubernetes client
-kube = { version = "0.98", features = ["client", "config", "runtime", "rustls-tls"], default-features = false }
+kube = { version = "0.98", features = [
+    "client",
+    "config",
+    "runtime",
+    "rustls-tls",
+], default-features = false }
 k8s-openapi = { version = "0.24", features = ["latest"] }
 
 # Certificate parsing
@@ -71,6 +81,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "A terminal UI for managing and monitoring Talos Linux Kubernetes clusters"
 
 [dependencies]
@@ -81,3 +93,8 @@ tokio.workspace = true
 color-eyre.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
