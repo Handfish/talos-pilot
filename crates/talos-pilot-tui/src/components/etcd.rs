@@ -94,11 +94,6 @@ impl EtcdComponent {
         self.state.data()
     }
 
-    /// Helper to get mutable data reference
-    fn data_mut(&mut self) -> Option<&mut EtcdData> {
-        self.state.data_mut()
-    }
-
     /// Refresh etcd data from the cluster
     pub async fn refresh(&mut self) -> Result<()> {
         let Some(client) = &self.client else {

@@ -814,21 +814,6 @@ impl NetworkStatsComponent {
         }
     }
 
-    /// Get service info for a listening connection (if known)
-    fn get_service_for_conn(&self, conn: &ConnectionInfo) -> Option<(&'static str, bool)> {
-        if conn.state != ConnectionState::Listen {
-            return None;
-        }
-
-        // Check if this port maps to a known service
-        port_to_service(conn.local_port).map(|service_name| {
-            let has_service = self.data()
-                .map(|d| d.services.contains_key(service_name))
-                .unwrap_or(false);
-            (service_name, has_service)
-        })
-    }
-
     /// Format a connection as a string for copying
     fn format_connection(conn: &ConnectionInfo) -> String {
         let local = if !conn.local_ip.is_empty() {

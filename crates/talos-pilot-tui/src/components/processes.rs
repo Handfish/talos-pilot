@@ -72,43 +72,43 @@ struct DisplayEntry {
 
 /// Loaded process data (wrapped by AsyncState)
 #[derive(Debug, Clone, Default)]
-pub struct ProcessesData {
+pub(crate) struct ProcessesData {
     /// Node hostname
-    pub hostname: String,
+    hostname: String,
     /// Node address
-    pub address: String,
+    address: String,
 
     /// All processes from the node
-    pub processes: Vec<ProcessInfo>,
+    processes: Vec<ProcessInfo>,
     /// Filtered process indices (into processes vec)
-    pub filtered_indices: Vec<usize>,
+    filtered_indices: Vec<usize>,
     /// Display entries for tree view (with depth and connector info)
-    pub display_entries: Vec<DisplayEntry>,
+    display_entries: Vec<DisplayEntry>,
 
     /// State counts for summary
-    pub state_counts: StateCounts,
+    state_counts: StateCounts,
     /// Total memory on node (for percentage calc)
-    pub total_memory: u64,
+    total_memory: u64,
     /// Memory used on node
-    pub memory_used: u64,
+    memory_used: u64,
     /// Memory usage percentage (from system, not process sum)
-    pub memory_usage_percent: f32,
+    memory_usage_percent: f32,
 
     /// Previous CPU stats (for calculating usage delta)
-    pub prev_cpu_stat: Option<CpuStat>,
+    prev_cpu_stat: Option<CpuStat>,
     /// Current CPU usage percentage
-    pub cpu_usage_percent: f32,
+    cpu_usage_percent: f32,
     /// Number of CPUs on node
-    pub cpu_count: usize,
+    cpu_count: usize,
     /// Load average (1, 5, 15 min)
-    pub load_avg: (f64, f64, f64),
+    load_avg: (f64, f64, f64),
 
     /// Previous CPU time per process (for calculating per-process CPU %)
-    pub prev_cpu_times: HashMap<i32, f64>,
+    prev_cpu_times: HashMap<i32, f64>,
     /// Calculated CPU percentage per process
-    pub cpu_percentages: HashMap<i32, f32>,
+    cpu_percentages: HashMap<i32, f32>,
     /// Time of last CPU measurement
-    pub last_cpu_sample: Option<Instant>,
+    last_cpu_sample: Option<Instant>,
 }
 
 /// Processes component for viewing node processes
@@ -523,11 +523,6 @@ impl ProcessesComponent {
             data.prev_cpu_times.insert(proc.pid, proc.cpu_time);
         }
         data.last_cpu_sample = Some(now);
-    }
-
-    /// Get CPU percentage for a process (returns None if not yet calculated)
-    fn get_cpu_percent(&self, pid: i32) -> Option<f32> {
-        self.data().and_then(|d| d.cpu_percentages.get(&pid).copied())
     }
 
     /// Sort processes based on current sort order (operates on data)

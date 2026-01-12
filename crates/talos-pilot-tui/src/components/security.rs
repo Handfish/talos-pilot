@@ -135,11 +135,6 @@ impl SecurityComponent {
         self.state.data()
     }
 
-    /// Helper to get mutable data reference
-    fn data_mut(&mut self) -> Option<&mut SecurityData> {
-        self.state.data_mut()
-    }
-
     /// Refresh security data
     pub async fn refresh(&mut self) -> Result<()> {
         self.state.start_loading();

@@ -95,7 +95,7 @@ impl LogLevel {
 
 /// A log entry from any service
 #[derive(Debug, Clone)]
-struct MultiLogEntry {
+pub(crate) struct MultiLogEntry {
     /// Service this entry came from
     service_id: String,
     /// Assigned color for this service
@@ -151,11 +151,11 @@ struct LevelState {
 
 /// Data for multi-logs component managed by AsyncState
 #[derive(Debug, Clone, Default)]
-pub struct MultiLogsData {
+pub(crate) struct MultiLogsData {
     /// All log entries (sorted by timestamp)
-    pub entries: Vec<MultiLogEntry>,
+    pub(crate) entries: Vec<MultiLogEntry>,
     /// Filtered entries (indices into entries vec, only active services/levels)
-    pub visible_indices: Vec<usize>,
+    pub(crate) visible_indices: Vec<usize>,
 }
 
 /// Multi-service logs component
@@ -1013,33 +1013,6 @@ impl MultiLogsComponent {
     /// Count active levels
     fn active_level_count(&self) -> usize {
         self.levels.iter().filter(|l| l.active).count()
-    }
-
-    /// Scroll up
-    fn scroll_up(&mut self, amount: u16) {
-        self.scroll = self.scroll.saturating_sub(amount);
-        self.following = false;
-    }
-
-    /// Scroll down
-    fn scroll_down(&mut self, amount: u16) {
-        let total = self.data().map(|d| d.visible_indices.len()).unwrap_or(0);
-        let viewport = self.viewport_height as usize;
-        // Max scroll is where last entry is at bottom of viewport
-        let max = total.saturating_sub(viewport) as u16;
-        self.scroll = (self.scroll + amount).min(max);
-    }
-
-    /// Scroll half page up (Ctrl+U)
-    fn scroll_half_page_up(&mut self) {
-        let half = (self.viewport_height / 2).max(1);
-        self.scroll_up(half);
-    }
-
-    /// Scroll half page down (Ctrl+D)
-    fn scroll_half_page_down(&mut self) {
-        let half = (self.viewport_height / 2).max(1);
-        self.scroll_down(half);
     }
 
     /// Scroll to bottom and enable following

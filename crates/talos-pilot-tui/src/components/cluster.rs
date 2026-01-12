@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, ListState, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use std::collections::HashMap;
@@ -26,16 +26,6 @@ struct EtcdSummary {
     total: usize,
     /// Whether etcd has quorum
     has_quorum: bool,
-}
-
-/// VIP (Virtual IP) info
-#[derive(Debug, Clone)]
-struct VipInfo {
-    /// The VIP address
-    address: String,
-    /// Node currently holding the VIP
-    #[allow(dead_code)]
-    holder: String,
 }
 
 /// Which pane is currently focused
@@ -143,8 +133,6 @@ struct ClusterData {
     etcd_summary: Option<EtcdSummary>,
     /// Node hostname to IP mapping
     node_ips: HashMap<String, String>,
-    /// VIP info (if configured)
-    vip_info: Option<VipInfo>,
     /// Whether this cluster accordion is expanded
     expanded: bool,
     /// Whether control plane group is expanded
@@ -161,8 +149,6 @@ pub struct ClusterComponent {
     active_cluster: usize,
     /// Currently selected service index within the node
     selected_service: usize,
-    /// List state for selection
-    list_state: ListState,
     /// Last refresh time
     last_refresh: Option<std::time::Instant>,
     /// Which pane is currently focused
@@ -185,14 +171,10 @@ impl Default for ClusterComponent {
 
 impl ClusterComponent {
     pub fn new(_context: Option<String>) -> Self {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
-
         Self {
             clusters: Vec::new(),
             active_cluster: 0,
             selected_service: 0,
-            list_state,
             last_refresh: None,
             focused_pane: FocusedPane::Nodes,
             selected_menu_item: 0,
