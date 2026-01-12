@@ -14,8 +14,8 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
-use std::time::Instant;
-use talos_pilot_core::{format_bytes_signed, format_talos_error, QuorumState, SelectableList};
+use std::time::Duration;
+use talos_pilot_core::{format_bytes_signed, format_talos_error, AsyncState, QuorumState, SelectableList};
 use talos_rs::{EtcdAlarm, EtcdMemberInfo, EtcdMemberStatus, TalosClient};
 
 /// Combined etcd member data (from member list + status)
@@ -30,31 +30,29 @@ pub struct EtcdMember {
 /// Default auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 
+/// Loaded etcd data (wrapped by AsyncState)
+#[derive(Debug, Clone, Default)]
+pub struct EtcdData {
+    /// Combined member data with selection
+    pub members: SelectableList<EtcdMember>,
+    /// Alarms
+    pub alarms: Vec<EtcdAlarm>,
+    /// Quorum state
+    pub quorum_state: QuorumState,
+    /// Total DB size (from largest member)
+    pub total_db_size: i64,
+    /// Current revision (from leader)
+    pub revision: u64,
+}
+
 /// Etcd cluster status component
 pub struct EtcdComponent {
-    /// Combined member data with selection
-    members: SelectableList<EtcdMember>,
-    /// Alarms
-    alarms: Vec<EtcdAlarm>,
-    /// Quorum state
-    quorum_state: QuorumState,
-    /// Total DB size (sum of all members)
-    total_db_size: i64,
-    /// Current revision (from leader)
-    revision: u64,
+    /// Async state wrapping all etcd data (loading, error, data)
+    state: AsyncState<EtcdData>,
 
     /// Table state for rendering (synced with members selection)
     table_state: TableState,
 
-    /// Loading state
-    loading: bool,
-    /// Error message
-    error: Option<String>,
-    /// Retry count for error recovery
-    retry_count: u32,
-
-    /// Last refresh time
-    last_refresh: Option<Instant>,
     /// Auto-refresh enabled
     auto_refresh: bool,
 
@@ -74,16 +72,8 @@ impl EtcdComponent {
         table_state.select(Some(0));
 
         Self {
-            members: SelectableList::default(),
-            alarms: Vec::new(),
-            quorum_state: QuorumState::Unknown,
-            total_db_size: 0,
-            revision: 0,
+            state: AsyncState::new(),
             table_state,
-            loading: true,
-            error: None,
-            retry_count: 0,
-            last_refresh: None,
             auto_refresh: true,
             client: None,
         }
@@ -96,21 +86,30 @@ impl EtcdComponent {
 
     /// Set an error message
     pub fn set_error(&mut self, error: String) {
-        self.error = Some(error);
-        self.loading = false;
+        self.state.set_error(error);
+    }
+
+    /// Helper to get data reference (convenience method)
+    fn data(&self) -> Option<&EtcdData> {
+        self.state.data()
+    }
+
+    /// Helper to get mutable data reference
+    fn data_mut(&mut self) -> Option<&mut EtcdData> {
+        self.state.data_mut()
     }
 
     /// Refresh etcd data from the cluster
     pub async fn refresh(&mut self) -> Result<()> {
         let Some(client) = &self.client else {
-            self.set_error("No client configured".to_string());
+            self.state.set_error("No client configured");
             return Ok(());
         };
 
-        self.loading = true;
+        self.state.start_loading();
 
         // Fetch member list, status, and alarms in parallel with timeout
-        let timeout = std::time::Duration::from_secs(10);
+        let timeout = Duration::from_secs(10);
         let fetch_result = tokio::time::timeout(
             timeout,
             async {
@@ -125,11 +124,9 @@ impl EtcdComponent {
         let (members_result, status_result, alarms_result) = match fetch_result {
             Ok(results) => results,
             Err(_) => {
-                self.retry_count += 1;
-                self.set_error(format!(
-                    "Request timed out after {}s (retry {})",
-                    timeout.as_secs(),
-                    self.retry_count
+                self.state.set_error_with_retry(format!(
+                    "Request timed out after {}s",
+                    timeout.as_secs()
                 ));
                 return Ok(());
             }
@@ -137,14 +134,10 @@ impl EtcdComponent {
 
         // Process member list - this is critical, fail if we can't get it
         let member_infos = match members_result {
-            Ok(members) => {
-                self.error = None; // Clear error on partial success
-                members
-            }
+            Ok(members) => members,
             Err(e) => {
-                self.retry_count += 1;
                 let msg = format_talos_error(&e);
-                self.set_error(format!("Failed to fetch members: {} (retry {})", msg, self.retry_count));
+                self.state.set_error_with_retry(format!("Failed to fetch members: {}", msg));
                 return Ok(());
             }
         };
@@ -159,7 +152,7 @@ impl EtcdComponent {
         };
 
         // Process alarms - non-critical
-        self.alarms = match alarms_result {
+        let alarms = match alarms_result {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!("Failed to fetch etcd alarms: {}", e);
@@ -176,40 +169,31 @@ impl EtcdComponent {
             })
             .collect();
 
-        // Update items, preserving selection if possible
-        self.members.update_items(members);
+        // Build EtcdData with calculated fields
+        let mut data = if let Some(existing) = self.state.data_mut() {
+            // Preserve selection state from existing data
+            existing.members.update_items(members);
+            std::mem::take(existing)
+        } else {
+            EtcdData {
+                members: SelectableList::new(members),
+                alarms: Vec::new(),
+                quorum_state: QuorumState::Unknown,
+                total_db_size: 0,
+                revision: 0,
+            }
+        };
 
-        // Success - reset retry count and clear error
-        self.retry_count = 0;
-        self.error = None;
-
-        tracing::info!("Loaded {} etcd members", self.members.len());
-
-        // Sync table state with SelectableList
-        self.table_state.select(Some(self.members.selected_index()));
+        // Update alarms
+        data.alarms = alarms;
 
         // Calculate quorum state
-        self.calculate_quorum_state();
+        let total = data.members.len();
+        let healthy = data.members.items().iter().filter(|m| m.status.is_some()).count();
+        data.quorum_state = QuorumState::from_counts(healthy, total);
 
         // Calculate totals
-        self.calculate_totals();
-
-        self.loading = false;
-        self.last_refresh = Some(Instant::now());
-
-        Ok(())
-    }
-
-    /// Calculate the quorum state based on member statuses
-    fn calculate_quorum_state(&mut self) {
-        let total = self.members.len();
-        let healthy = self.members.items().iter().filter(|m| m.status.is_some()).count();
-        self.quorum_state = QuorumState::from_counts(healthy, total);
-    }
-
-    /// Calculate total DB size and revision
-    fn calculate_totals(&mut self) {
-        self.total_db_size = self
+        data.total_db_size = data
             .members
             .items()
             .iter()
@@ -218,7 +202,7 @@ impl EtcdComponent {
             .max()
             .unwrap_or(0);
 
-        self.revision = self
+        data.revision = data
             .members
             .items()
             .iter()
@@ -226,40 +210,58 @@ impl EtcdComponent {
             .map(|s| s.raft_index)
             .max()
             .unwrap_or(0);
+
+        tracing::info!("Loaded {} etcd members", data.members.len());
+
+        // Sync table state with SelectableList
+        self.table_state.select(Some(data.members.selected_index()));
+
+        // Set the data (clears error, resets retry count, updates last_refresh)
+        self.state.set_data(data);
+
+        Ok(())
     }
 
     /// Navigate to previous member
     fn select_prev(&mut self) {
-        self.members.select_prev_no_wrap();
-        self.table_state.select(Some(self.members.selected_index()));
+        if let Some(data) = self.state.data_mut() {
+            data.members.select_prev_no_wrap();
+            self.table_state.select(Some(data.members.selected_index()));
+        }
     }
 
     /// Navigate to next member
     fn select_next(&mut self) {
-        self.members.select_next_no_wrap();
-        self.table_state.select(Some(self.members.selected_index()));
+        if let Some(data) = self.state.data_mut() {
+            data.members.select_next_no_wrap();
+            self.table_state.select(Some(data.members.selected_index()));
+        }
     }
 
     /// Draw the status bar
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let (indicator, color) = self.quorum_state.indicator_with_color();
-        let (state_text, _) = self.quorum_state.display_with_color();
+        let Some(data) = self.data() else {
+            return;
+        };
 
-        let member_count = match &self.quorum_state {
-            QuorumState::Healthy => format!("{}/{}", self.members.len(), self.members.len()),
+        let (indicator, color) = data.quorum_state.indicator_with_color();
+        let (state_text, _) = data.quorum_state.display_with_color();
+
+        let member_count = match &data.quorum_state {
+            QuorumState::Healthy => format!("{}/{}", data.members.len(), data.members.len()),
             QuorumState::Degraded { healthy, total } => format!("{}/{}", healthy, total),
             QuorumState::NoQuorum { healthy, total } => format!("{}/{}", healthy, total),
             QuorumState::Unknown => "?/?".to_string(),
         };
 
-        let db_size = format_bytes_signed(self.total_db_size);
+        let db_size = format_bytes_signed(data.total_db_size);
 
         let line = Line::from(vec![
             Span::styled(format!("{} ", indicator), Style::default().fg(color)),
             Span::styled(state_text, Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Span::raw(format!("  {} members    ", member_count)),
-            Span::raw(format!("Quorum: {} ", if matches!(self.quorum_state, QuorumState::NoQuorum { .. }) { "No" } else { "Yes" })),
-            Span::raw(format!("   DB: {}    Rev: {}", db_size, self.revision)),
+            Span::raw(format!("Quorum: {} ", if matches!(data.quorum_state, QuorumState::NoQuorum { .. }) { "No" } else { "Yes" })),
+            Span::raw(format!("   DB: {}    Rev: {}", db_size, data.revision)),
         ]);
 
         let para = Paragraph::new(line)
@@ -269,7 +271,11 @@ impl EtcdComponent {
 
     /// Draw the member table
     fn draw_member_table(&mut self, frame: &mut Frame, area: Rect) {
-        let rows: Vec<Row> = self
+        let Some(data) = self.data() else {
+            return;
+        };
+
+        let rows: Vec<Row> = data
             .members
             .items()
             .iter()
@@ -356,7 +362,10 @@ impl EtcdComponent {
 
     /// Draw the detail section for selected member
     fn draw_detail_section(&self, frame: &mut Frame, area: Rect) {
-        let Some(member) = self.members.selected() else {
+        let Some(data) = self.data() else {
+            return;
+        };
+        let Some(member) = data.members.selected() else {
             return;
         };
 
@@ -441,13 +450,17 @@ impl EtcdComponent {
 
     /// Draw the alarms section
     fn draw_alarms(&self, frame: &mut Frame, area: Rect) {
-        let content = if self.alarms.is_empty() {
+        let Some(data) = self.data() else {
+            return;
+        };
+
+        let content = if data.alarms.is_empty() {
             Line::from(vec![
                 Span::raw("Alarms: "),
                 Span::styled("None", Style::default().fg(Color::Green)),
             ])
         } else {
-            let alarm_text: Vec<Span> = self
+            let alarm_text: Vec<Span> = data
                 .alarms
                 .iter()
                 .flat_map(|a| {
@@ -518,13 +531,15 @@ impl Component for EtcdComponent {
             }
             KeyCode::Char('l') => {
                 // View etcd logs for all control plane nodes
-                // Collect all member hostnames and show etcd logs for each
-                if self.members.is_empty() {
+                let Some(data) = self.data() else {
+                    return Ok(None);
+                };
+                if data.members.is_empty() {
                     return Ok(None);
                 }
                 // Use first member's hostname as the "node" but show all etcd services
                 // In practice, with the current API this shows etcd logs from all connected nodes
-                let node = self.members.items().first()
+                let node = data.members.items().first()
                     .map(|m| m.info.hostname.clone())
                     .unwrap_or_else(|| "controlplane".to_string());
                 let etcd_vec = vec!["etcd".to_string()];
@@ -537,18 +552,19 @@ impl Component for EtcdComponent {
             }
             KeyCode::Enter => {
                 // View etcd logs for selected member
-                if let Some(member) = self.members.selected() {
-                    let node = member.info.hostname.clone();
-                    let etcd_vec = vec!["etcd".to_string()];
-                    Ok(Some(Action::ShowMultiLogs(
-                        node,
-                        "controlplane".to_string(),
-                        etcd_vec.clone(),
-                        etcd_vec,
-                    )))
-                } else {
-                    Ok(None)
+                if let Some(data) = self.data() {
+                    if let Some(member) = data.members.selected() {
+                        let node = member.info.hostname.clone();
+                        let etcd_vec = vec!["etcd".to_string()];
+                        return Ok(Some(Action::ShowMultiLogs(
+                            node,
+                            "controlplane".to_string(),
+                            etcd_vec.clone(),
+                            etcd_vec,
+                        )));
+                    }
                 }
+                Ok(None)
             }
             _ => Ok(None),
         }
@@ -556,39 +572,44 @@ impl Component for EtcdComponent {
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         if let Action::Tick = action {
-            // Check for auto-refresh
-            if self.auto_refresh && !self.loading {
-                if let Some(last) = self.last_refresh {
-                    let interval = std::time::Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS);
-                    if last.elapsed() >= interval {
-                        return Ok(Some(Action::Refresh));
-                    }
-                }
+            // Check for auto-refresh using AsyncState helper
+            let interval = Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS);
+            if self.state.should_auto_refresh(self.auto_refresh, interval) {
+                return Ok(Some(Action::Refresh));
             }
         }
         Ok(None)
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
-        if self.loading {
+        // Show loading state (only if no data yet)
+        if self.state.is_loading() && !self.state.has_data() {
             let loading = Paragraph::new("Loading...")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(loading, area);
             return Ok(());
         }
 
-        if let Some(ref err) = self.error {
-            let error = Paragraph::new(format!("Error: {}", err))
-                .style(Style::default().fg(Color::Red));
-            frame.render_widget(error, area);
-            return Ok(());
+        // Show error state (only if no data to display)
+        if let Some(err) = self.state.error() {
+            if !self.state.has_data() {
+                let error = Paragraph::new(format!("Error: {}", err))
+                    .style(Style::default().fg(Color::Red));
+                frame.render_widget(error, area);
+                return Ok(());
+            }
         }
 
+        // Get data for layout calculations
+        let Some(data) = self.data() else {
+            return Ok(());
+        };
+
         // Calculate dynamic heights
-        let member_count = self.members.len().max(1);
+        let member_count = data.members.len().max(1);
         let table_height = (member_count + 2) as u16; // header + members + padding
         let detail_height = 6u16;
-        let alarm_height = if self.alarms.is_empty() { 2 } else { (self.alarms.len() + 2) as u16 };
+        let alarm_height = if data.alarms.is_empty() { 2 } else { (data.alarms.len() + 2) as u16 };
 
         // Total content height (excluding flexible space)
         let content_height = 3 + table_height + 1 + detail_height + 1 + alarm_height + 1;

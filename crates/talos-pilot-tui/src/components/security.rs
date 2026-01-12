@@ -17,37 +17,33 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use std::time::Instant;
+use std::time::Duration;
+use talos_pilot_core::AsyncState;
 use talos_rs::TalosClient;
 
 /// Auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 30;
 
+/// Loaded security data (wrapped by AsyncState)
+#[derive(Debug, Clone, Default)]
+pub struct SecurityData {
+    /// Context name (cluster identifier)
+    pub context_name: String,
+    /// PKI status (certificates)
+    pub pki_status: PkiStatus,
+    /// Encryption status
+    pub encryption_status: EncryptionStatus,
+    /// All displayable items (for selection)
+    pub items: Vec<SecurityItem>,
+}
+
 /// Security component for viewing PKI, RBAC, and encryption status
 pub struct SecurityComponent {
-    /// Context name (cluster identifier)
-    context_name: String,
-
-    /// PKI status (certificates)
-    pki_status: PkiStatus,
-
-    /// Encryption status
-    encryption_status: EncryptionStatus,
+    /// Async state wrapping all security data
+    state: AsyncState<SecurityData>,
 
     /// Currently selected item index
     selected: usize,
-
-    /// All displayable items (for selection)
-    items: Vec<SecurityItem>,
-
-    /// Loading state
-    loading: bool,
-
-    /// Error message
-    error: Option<String>,
-
-    /// Last refresh time
-    last_refresh: Option<Instant>,
 
     /// Auto-refresh enabled
     auto_refresh: bool,
@@ -58,21 +54,21 @@ pub struct SecurityComponent {
 
 /// A selectable item in the security view
 #[derive(Debug, Clone)]
-struct SecurityItem {
+pub struct SecurityItem {
     /// Item type
-    kind: SecurityItemKind,
+    pub kind: SecurityItemKind,
     /// Display name
-    name: String,
+    pub name: String,
     /// Status indicator
-    status: ItemStatus,
+    pub status: ItemStatus,
     /// Status message
-    message: String,
+    pub message: String,
     /// Detailed info (shown when selected)
-    details: Option<String>,
+    pub details: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-enum SecurityItemKind {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecurityItemKind {
     SectionHeader,
     Certificate,
     Rbac,
@@ -80,7 +76,7 @@ enum SecurityItemKind {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ItemStatus {
+pub enum ItemStatus {
     Good,
     Warning,
     Critical,
@@ -108,15 +104,17 @@ impl Default for SecurityComponent {
 
 impl SecurityComponent {
     pub fn new(context_name: String) -> Self {
-        Self {
+        // Initialize with context name in the data
+        let initial_data = SecurityData {
             context_name,
-            pki_status: PkiStatus::default(),
-            encryption_status: EncryptionStatus::default(),
+            ..Default::default()
+        };
+        let mut state = AsyncState::new();
+        state.set_data(initial_data);
+
+        Self {
+            state,
             selected: 0,
-            items: Vec::new(),
-            loading: true,
-            error: None,
-            last_refresh: None,
             auto_refresh: true,
             client: None,
         }
@@ -129,40 +127,61 @@ impl SecurityComponent {
 
     /// Set error message
     pub fn set_error(&mut self, error: String) {
-        self.error = Some(error);
-        self.loading = false;
+        self.state.set_error(error);
+    }
+
+    /// Helper to get data reference
+    fn data(&self) -> Option<&SecurityData> {
+        self.state.data()
+    }
+
+    /// Helper to get mutable data reference
+    fn data_mut(&mut self) -> Option<&mut SecurityData> {
+        self.state.data_mut()
     }
 
     /// Refresh security data
     pub async fn refresh(&mut self) -> Result<()> {
-        self.loading = true;
-        self.error = None;
+        self.state.start_loading();
+
+        // Get or create data
+        let mut data = self.state.take_data().unwrap_or_default();
 
         // Load PKI status from talosconfig
-        self.load_pki_status().await;
+        Self::load_pki_status_into(&mut data).await;
 
-        // Load encryption status (if client available)
-        if self.client.is_some() {
-            self.load_encryption_status().await;
+        // Load kubeconfig certs and encryption status (if client available)
+        if let Some(client) = &self.client {
+            Self::load_kubeconfig_certs(&mut data, client).await;
+            Self::load_encryption_status_into(&mut data, client).await;
         }
 
-        // Build display items
-        self.build_items();
+        // Build display items from loaded data
+        Self::build_items_into(&mut data);
 
-        self.loading = false;
-        self.last_refresh = Some(Instant::now());
+        // Set initial selection to first non-header item
+        if !data.items.is_empty() {
+            self.selected = data
+                .items
+                .iter()
+                .position(|i| i.kind != SecurityItemKind::SectionHeader)
+                .unwrap_or(0);
+        }
+
+        // Store the data
+        self.state.set_data(data);
         Ok(())
     }
 
-    /// Load PKI status from talosconfig and kubeconfig
-    async fn load_pki_status(&mut self) {
+    /// Load PKI status from talosconfig (static method)
+    async fn load_pki_status_into(data: &mut SecurityData) {
         let mut pki = PkiStatus::default();
 
         // Load talosconfig
         match talos_rs::TalosConfig::load_default() {
             Ok(config) => {
                 // Get context name
-                self.context_name = config.context.clone();
+                data.context_name = config.context.clone();
 
                 if let Some(context) = config.current_context() {
                     // Parse client certificate
@@ -194,57 +213,55 @@ impl SecurityComponent {
             }
         }
 
-        // Load kubeconfig certificate (from API if available)
-        if let Some(client) = &self.client {
-            if let Ok(kubeconfig_yaml) = client.kubeconfig().await {
-                if let Ok(kc) = serde_yaml::from_str::<serde_yaml::Value>(&kubeconfig_yaml) {
-                    // Parse kubeconfig CA
-                    if let Some(clusters) = kc.get("clusters").and_then(|c| c.as_sequence()) {
-                        for cluster in clusters {
-                            if let Some(cluster_data) = cluster.get("cluster") {
-                                if let Some(ca_data) = cluster_data
-                                    .get("certificate-authority-data")
-                                    .and_then(|c| c.as_str())
+        data.pki_status = pki;
+    }
+
+    /// Load kubeconfig certificates via client (static method)
+    async fn load_kubeconfig_certs(data: &mut SecurityData, client: &TalosClient) {
+        if let Ok(kubeconfig_yaml) = client.kubeconfig().await {
+            if let Ok(kc) = serde_yaml::from_str::<serde_yaml::Value>(&kubeconfig_yaml) {
+                // Parse kubeconfig CA
+                if let Some(clusters) = kc.get("clusters").and_then(|c| c.as_sequence()) {
+                    for cluster in clusters {
+                        if let Some(cluster_data) = cluster.get("cluster") {
+                            if let Some(ca_data) = cluster_data
+                                .get("certificate-authority-data")
+                                .and_then(|c| c.as_str())
+                            {
+                                if let Ok(cert_info) =
+                                    pki::parse_base64_certificate("Kubernetes CA", ca_data)
                                 {
-                                    if let Ok(cert_info) =
-                                        pki::parse_base64_certificate("Kubernetes CA", ca_data)
-                                    {
-                                        pki.cas.push(cert_info);
-                                    }
+                                    data.pki_status.cas.push(cert_info);
                                 }
                             }
                         }
                     }
+                }
 
-                    // Parse kubeconfig client cert
-                    if let Some(users) = kc.get("users").and_then(|u| u.as_sequence()) {
-                        for user in users {
-                            if let Some(user_data) = user.get("user") {
-                                if let Some(cert_data) = user_data
-                                    .get("client-certificate-data")
-                                    .and_then(|c| c.as_str())
+                // Parse kubeconfig client cert
+                if let Some(users) = kc.get("users").and_then(|u| u.as_sequence()) {
+                    for user in users {
+                        if let Some(user_data) = user.get("user") {
+                            if let Some(cert_data) = user_data
+                                .get("client-certificate-data")
+                                .and_then(|c| c.as_str())
+                            {
+                                if let Ok(cert_info) =
+                                    pki::parse_base64_certificate("kubeconfig", cert_data)
                                 {
-                                    if let Ok(cert_info) =
-                                        pki::parse_base64_certificate("kubeconfig", cert_data)
-                                    {
-                                        pki.client_certs.push(cert_info);
-                                    }
-                                    break;
+                                    data.pki_status.client_certs.push(cert_info);
                                 }
+                                break;
                             }
                         }
                     }
                 }
             }
         }
-
-        self.pki_status = pki;
     }
 
-    /// Load encryption status from node via talosctl
-    ///
-    /// Executes `talosctl get volumestatus` to get encryption info.
-    async fn load_encryption_status(&mut self) {
+    /// Load encryption status from node via talosctl (static method)
+    async fn load_encryption_status_into(data: &mut SecurityData, _client: &TalosClient) {
         // Get the first node from talosconfig to query
         let node = match talos_rs::TalosConfig::load_default() {
             Ok(config) => {
@@ -262,7 +279,7 @@ impl SecurityComponent {
         };
 
         let Some(node) = node else {
-            self.encryption_status = EncryptionStatus {
+            data.encryption_status = EncryptionStatus {
                 volumes: vec![
                     VolumeEncryption {
                         name: "STATE".to_string(),
@@ -314,11 +331,11 @@ impl SecurityComponent {
                     });
                 }
 
-                self.encryption_status = EncryptionStatus { volumes };
+                data.encryption_status = EncryptionStatus { volumes };
             }
             Err(e) => {
                 tracing::warn!("Failed to get volume status: {}", e);
-                self.encryption_status = EncryptionStatus {
+                data.encryption_status = EncryptionStatus {
                     volumes: vec![
                         VolumeEncryption {
                             name: "STATE".to_string(),
@@ -334,12 +351,12 @@ impl SecurityComponent {
         }
     }
 
-    /// Build display items from loaded data
-    fn build_items(&mut self) {
-        self.items.clear();
+    /// Build display items from loaded data (static method)
+    fn build_items_into(data: &mut SecurityData) {
+        data.items.clear();
 
         // Certificate Authorities section
-        self.items.push(SecurityItem {
+        data.items.push(SecurityItem {
             kind: SecurityItemKind::SectionHeader,
             name: "Certificate Authorities".to_string(),
             status: ItemStatus::Header,
@@ -347,12 +364,12 @@ impl SecurityComponent {
             details: None,
         });
 
-        for ca in &self.pki_status.cas {
-            self.items.push(cert_to_item(ca));
+        for ca in &data.pki_status.cas {
+            data.items.push(cert_to_item(ca));
         }
 
-        if self.pki_status.cas.is_empty() {
-            self.items.push(SecurityItem {
+        if data.pki_status.cas.is_empty() {
+            data.items.push(SecurityItem {
                 kind: SecurityItemKind::Certificate,
                 name: "No CAs found".to_string(),
                 status: ItemStatus::Info,
@@ -362,7 +379,7 @@ impl SecurityComponent {
         }
 
         // Client Certificates section
-        self.items.push(SecurityItem {
+        data.items.push(SecurityItem {
             kind: SecurityItemKind::SectionHeader,
             name: "Client Certificates".to_string(),
             status: ItemStatus::Header,
@@ -370,12 +387,12 @@ impl SecurityComponent {
             details: None,
         });
 
-        for cert in &self.pki_status.client_certs {
-            self.items.push(cert_to_item(cert));
+        for cert in &data.pki_status.client_certs {
+            data.items.push(cert_to_item(cert));
         }
 
-        if self.pki_status.client_certs.is_empty() {
-            self.items.push(SecurityItem {
+        if data.pki_status.client_certs.is_empty() {
+            data.items.push(SecurityItem {
                 kind: SecurityItemKind::Certificate,
                 name: "No client certs".to_string(),
                 status: ItemStatus::Info,
@@ -385,7 +402,7 @@ impl SecurityComponent {
         }
 
         // RBAC section
-        self.items.push(SecurityItem {
+        data.items.push(SecurityItem {
             kind: SecurityItemKind::SectionHeader,
             name: "RBAC".to_string(),
             status: ItemStatus::Header,
@@ -393,12 +410,12 @@ impl SecurityComponent {
             details: None,
         });
 
-        let rbac_role = self
+        let rbac_role = data
             .pki_status
             .rbac_role
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        self.items.push(SecurityItem {
+        data.items.push(SecurityItem {
             kind: SecurityItemKind::Rbac,
             name: "Current Role".to_string(),
             status: ItemStatus::Info,
@@ -406,12 +423,12 @@ impl SecurityComponent {
             details: Some(format!(
                 "Role: {}\nRBAC Enabled: {}\n\nThis role is derived from your talosconfig certificate subject.",
                 rbac_role,
-                if self.pki_status.rbac_enabled { "Yes" } else { "No" }
+                if data.pki_status.rbac_enabled { "Yes" } else { "No" }
             )),
         });
 
         // Encryption section
-        self.items.push(SecurityItem {
+        data.items.push(SecurityItem {
             kind: SecurityItemKind::SectionHeader,
             name: "Encryption".to_string(),
             status: ItemStatus::Header,
@@ -419,7 +436,7 @@ impl SecurityComponent {
             details: None,
         });
 
-        for vol in &self.encryption_status.volumes {
+        for vol in &data.encryption_status.volumes {
             let status = match &vol.provider {
                 EncryptionProvider::Tpm | EncryptionProvider::Kms => ItemStatus::Good,
                 EncryptionProvider::None => ItemStatus::Warning,
@@ -427,7 +444,7 @@ impl SecurityComponent {
                 EncryptionProvider::Unknown(_) => ItemStatus::Info,
             };
 
-            self.items.push(SecurityItem {
+            data.items.push(SecurityItem {
                 kind: SecurityItemKind::Encryption,
                 name: format!("{} partition", vol.name),
                 status,
@@ -448,34 +465,31 @@ impl SecurityComponent {
                 )),
             });
         }
-
-        // Skip headers when selecting
-        if !self.items.is_empty() {
-            self.selected = self
-                .items
-                .iter()
-                .position(|i| !matches!(i.kind, SecurityItemKind::SectionHeader))
-                .unwrap_or(0);
-        }
     }
 
     /// Move selection up
     fn select_prev(&mut self) {
-        if self.items.is_empty() {
+        let Some(data) = self.data() else {
+            return;
+        };
+        if data.items.is_empty() {
             return;
         }
 
+        let items_len = data.items.len();
         let mut new_sel = self.selected;
         loop {
             new_sel = if new_sel == 0 {
-                self.items.len() - 1
+                items_len - 1
             } else {
                 new_sel - 1
             };
 
-            // Skip headers
-            if !matches!(self.items[new_sel].kind, SecurityItemKind::SectionHeader) {
-                break;
+            // Skip headers (need to re-borrow data)
+            if let Some(d) = self.data() {
+                if d.items[new_sel].kind != SecurityItemKind::SectionHeader {
+                    break;
+                }
             }
 
             // Prevent infinite loop
@@ -488,17 +502,23 @@ impl SecurityComponent {
 
     /// Move selection down
     fn select_next(&mut self) {
-        if self.items.is_empty() {
+        let Some(data) = self.data() else {
+            return;
+        };
+        if data.items.is_empty() {
             return;
         }
 
+        let items_len = data.items.len();
         let mut new_sel = self.selected;
         loop {
-            new_sel = (new_sel + 1) % self.items.len();
+            new_sel = (new_sel + 1) % items_len;
 
-            // Skip headers
-            if !matches!(self.items[new_sel].kind, SecurityItemKind::SectionHeader) {
-                break;
+            // Skip headers (need to re-borrow data)
+            if let Some(d) = self.data() {
+                if d.items[new_sel].kind != SecurityItemKind::SectionHeader {
+                    break;
+                }
             }
 
             // Prevent infinite loop
@@ -511,7 +531,7 @@ impl SecurityComponent {
 
     /// Get currently selected item
     fn selected_item(&self) -> Option<&SecurityItem> {
-        self.items.get(self.selected)
+        self.data().and_then(|d| d.items.get(self.selected))
     }
 }
 
@@ -568,12 +588,10 @@ impl Component for SecurityComponent {
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         if let Action::Tick = action {
-            if self.auto_refresh && !self.loading {
-                if let Some(last) = self.last_refresh {
-                    if last.elapsed().as_secs() >= AUTO_REFRESH_INTERVAL_SECS {
-                        return Ok(Some(Action::Refresh));
-                    }
-                }
+            // Check for auto-refresh using AsyncState helper
+            let interval = Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS);
+            if self.state.should_auto_refresh(self.auto_refresh, interval) {
+                return Ok(Some(Action::Refresh));
             }
         }
         Ok(None)
@@ -588,19 +606,21 @@ impl Component for SecurityComponent {
         ])
         .split(area);
 
-        // Header
-        let context_display = if self.context_name.is_empty() {
-            "default".to_string()
+        // Get data for rendering (default values if not yet loaded)
+        let (context_display, cert_summary) = if let Some(data) = self.data() {
+            let context = if data.context_name.is_empty() {
+                "default".to_string()
+            } else {
+                data.context_name.clone()
+            };
+            let (valid, warning, _critical, expired) = data.pki_status.summary();
+            let summary = format!("{} valid, {} warning, {} expired", valid, warning, expired);
+            (context, summary)
         } else {
-            self.context_name.clone()
+            ("default".to_string(), "loading...".to_string())
         };
 
-        let (valid, warning, _critical, expired) = self.pki_status.summary();
-        let cert_summary = format!(
-            "{} valid, {} warning, {} expired",
-            valid, warning, expired
-        );
-
+        // Header
         let header = Paragraph::new(Line::from(vec![
             Span::styled(" Security ", Style::default().bold().fg(Color::Cyan)),
             Span::raw("─ "),
@@ -615,11 +635,19 @@ impl Component for SecurityComponent {
         );
         frame.render_widget(header, chunks[0]);
 
-        // Content - render items
-        if let Some(error) = &self.error {
-            let error_msg = Paragraph::new(format!("Error: {}", error))
-                .style(Style::default().fg(Color::Red));
-            frame.render_widget(error_msg, chunks[1]);
+        // Content - render items or error/loading state
+        if self.state.is_loading() && !self.state.has_data() {
+            let loading = Paragraph::new("Loading...")
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(loading, chunks[1]);
+        } else if let Some(error) = self.state.error() {
+            if !self.state.has_data() {
+                let error_msg = Paragraph::new(format!("Error: {}", error))
+                    .style(Style::default().fg(Color::Red));
+                frame.render_widget(error_msg, chunks[1]);
+            } else {
+                self.render_items(frame, chunks[1]);
+            }
         } else {
             self.render_items(frame, chunks[1]);
         }
@@ -660,9 +688,13 @@ impl SecurityComponent {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let Some(data) = self.data() else {
+            return;
+        };
+
         let mut lines: Vec<Line> = Vec::new();
 
-        for (i, item) in self.items.iter().enumerate() {
+        for (i, item) in data.items.iter().enumerate() {
             let is_selected = i == self.selected;
 
             let line = match item.kind {

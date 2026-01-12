@@ -23,18 +23,7 @@ use talos_rs::{
 
 /// Well-known Talos/Kubernetes service ports
 fn port_to_service(port: u32) -> Option<&'static str> {
-    match port {
-        50000 => Some("apid"),
-        50001 => Some("trustd"),
-        2379 => Some("etcd-client"),
-        2380 => Some("etcd-peer"),
-        6443 => Some("kube-apiserver"),
-        10250 => Some("kubelet"),
-        10259 => Some("kube-scheduler"),
-        10257 => Some("kube-controller-manager"),
-        51821 => Some("kubernetesd"),
-        _ => None,
-    }
+    talos_pilot_core::network::port_to_service_u32(port)
 }
 
 /// Auto-refresh interval in seconds (faster than processes for responsive rates)

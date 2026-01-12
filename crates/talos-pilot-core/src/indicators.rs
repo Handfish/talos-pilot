@@ -254,14 +254,17 @@ impl Default for QuorumState {
 }
 
 /// Safety status for operations that may have risks
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SafetyStatus {
     /// Operation is safe to proceed
+    #[default]
     Safe,
     /// Operation has warnings but can proceed
     Warning(String),
     /// Operation is unsafe and should not proceed
     Unsafe(String),
+    /// Safety status is unknown (still loading)
+    Unknown,
 }
 
 impl SafetyStatus {
@@ -270,10 +273,15 @@ impl SafetyStatus {
         matches!(self, SafetyStatus::Safe)
     }
 
+    /// Check if unknown (still loading)
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, SafetyStatus::Unknown)
+    }
+
     /// Get the reason if unsafe or warning
     pub fn reason(&self) -> Option<&str> {
         match self {
-            SafetyStatus::Safe => None,
+            SafetyStatus::Safe | SafetyStatus::Unknown => None,
             SafetyStatus::Warning(reason) | SafetyStatus::Unsafe(reason) => Some(reason),
         }
     }
@@ -285,13 +293,8 @@ impl HasHealth for SafetyStatus {
             SafetyStatus::Safe => HealthIndicator::Healthy,
             SafetyStatus::Warning(_) => HealthIndicator::Warning,
             SafetyStatus::Unsafe(_) => HealthIndicator::Error,
+            SafetyStatus::Unknown => HealthIndicator::Unknown,
         }
-    }
-}
-
-impl Default for SafetyStatus {
-    fn default() -> Self {
-        SafetyStatus::Safe
     }
 }
 

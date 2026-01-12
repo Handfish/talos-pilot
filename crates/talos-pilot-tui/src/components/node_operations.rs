@@ -5,6 +5,7 @@
 use crate::action::Action;
 use crate::components::Component;
 use crate::components::diagnostics::k8s::{check_pdb_health, create_k8s_client, DrainOptions, PdbHealthInfo};
+use crate::ui_ext::SafetyStatusExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use kube::Client;
@@ -17,32 +18,9 @@ use ratatui::{
 };
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use talos_pilot_core::SafetyStatus;
 use talos_rs::TalosClient;
 use tokio::task::JoinHandle;
-
-/// Safety status for an operation
-#[derive(Debug, Clone, PartialEq)]
-pub enum SafetyStatus {
-    /// Operation is safe to perform
-    Safe,
-    /// Operation has warnings but can proceed
-    Warning(String),
-    /// Operation is unsafe and should not be performed
-    Unsafe(String),
-    /// Safety status is unknown (still loading)
-    Unknown,
-}
-
-impl SafetyStatus {
-    fn indicator(&self) -> (&'static str, Color) {
-        match self {
-            SafetyStatus::Safe => ("✓", Color::Green),
-            SafetyStatus::Warning(_) => ("!", Color::Yellow),
-            SafetyStatus::Unsafe(_) => ("✗", Color::Red),
-            SafetyStatus::Unknown => ("?", Color::DarkGray),
-        }
-    }
-}
 
 /// etcd quorum information for the node
 #[derive(Debug, Clone, Default)]
@@ -1013,7 +991,7 @@ impl NodeOperationsComponent {
             ]));
 
             if let Some(ref etcd) = self.etcd_info {
-                let (indicator, color) = etcd.safety_status().indicator();
+                let (indicator, color) = etcd.safety_status().indicator_with_color();
                 let role = if etcd.is_leader { "leader" } else { "member" };
 
                 lines.push(Line::from(vec![
@@ -1049,7 +1027,7 @@ impl NodeOperationsComponent {
         ]));
 
         if let Some(ref pdb) = self.pdb_info {
-            let (indicator, color) = self.drain_safety.indicator();
+            let (indicator, color) = self.drain_safety.indicator_with_color();
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(indicator, Style::default().fg(color)),
@@ -1089,7 +1067,7 @@ impl NodeOperationsComponent {
         ]));
 
         // Reboot operation
-        let (reboot_ind, reboot_color) = self.reboot_safety.indicator();
+        let (reboot_ind, reboot_color) = self.reboot_safety.indicator_with_color();
         let reboot_style = if self.selected_op == 0 {
             Style::default().fg(reboot_color).add_modifier(Modifier::REVERSED)
         } else {
@@ -1102,7 +1080,7 @@ impl NodeOperationsComponent {
         ]));
 
         // Drain operation
-        let (drain_ind, drain_color) = self.drain_safety.indicator();
+        let (drain_ind, drain_color) = self.drain_safety.indicator_with_color();
         let drain_style = if self.selected_op == 1 {
             Style::default().fg(drain_color).add_modifier(Modifier::REVERSED)
         } else {

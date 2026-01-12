@@ -16,11 +16,13 @@
 //! - [`selection`] - Generic selection logic for list-based UI components
 //! - [`async_state`] - Async component state management (loading, error, refresh)
 //! - [`errors`] - Error formatting utilities for user-friendly messages
+//! - [`network`] - Network analysis utilities (port mapping, connection classification)
 
 pub mod async_state;
 pub mod errors;
 pub mod formatting;
 pub mod indicators;
+pub mod network;
 pub mod selection;
 pub mod types;
 
@@ -31,3 +33,6 @@ pub use formatting::*;
 pub use indicators::*;
 pub use selection::*;
 pub use types::*;
+
+// Network is not re-exported at root to avoid name conflicts
+// Use talos_pilot_core::network::* explicitly
