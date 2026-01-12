@@ -7,7 +7,7 @@ A terminal UI (TUI) for managing and monitoring [Talos Linux](https://www.talos.
 ![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-https://github.com/Handfish/talos-pilot/raw/main/assets/initialDemo.mp4
+https://github.com/user-attachments/assets/4c946c32-1f7e-4ab8-9d88-9937516015d1
 
 ## Why talos-pilot?
 
