@@ -223,13 +223,12 @@ impl LifecycleComponent {
         match client.version().await {
             Ok(versions) => {
                 // Get context name from first node
-                if !versions.is_empty()
-                    && data.context_name.is_empty() {
-                        // Try to get from talosconfig
-                        if let Ok(config) = talos_rs::TalosConfig::load_default() {
-                            data.context_name = config.context;
-                        }
+                if !versions.is_empty() && data.context_name.is_empty() {
+                    // Try to get from talosconfig
+                    if let Ok(config) = talos_rs::TalosConfig::load_default() {
+                        data.context_name = config.context;
                     }
+                }
 
                 data.versions = versions;
             }

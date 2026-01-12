@@ -2779,11 +2779,10 @@ impl Component for NetworkStatsComponent {
         }
 
         // If output pane is shown, Esc closes it
-        if self.show_output_pane
-            && matches!(key.code, KeyCode::Esc) {
-                self.show_output_pane = false;
-                return Ok(None);
-            }
+        if self.show_output_pane && matches!(key.code, KeyCode::Esc) {
+            self.show_output_pane = false;
+            return Ok(None);
+        }
 
         // If there's a pending confirmation, handle that first
         if self.pending_action.is_some() {
@@ -2801,9 +2800,10 @@ impl Component for NetworkStatsComponent {
         if let Action::Tick = action {
             // Clear old status messages (after 3 seconds)
             if let Some((_, time)) = &self.status_message
-                && time.elapsed() > std::time::Duration::from_secs(3) {
-                    self.status_message = None;
-                }
+                && time.elapsed() > std::time::Duration::from_secs(3)
+            {
+                self.status_message = None;
+            }
 
             // Poll packet capture for new data
             if self.is_capturing() {
@@ -2811,13 +2811,15 @@ impl Component for NetworkStatsComponent {
             }
 
             // Check for auto-refresh
-            if self.auto_refresh && !self.state.is_loading()
-                && let Some(last) = self.state.last_refresh() {
-                    let interval = std::time::Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS);
-                    if last.elapsed() >= interval {
-                        return Ok(Some(Action::Refresh));
-                    }
+            if self.auto_refresh
+                && !self.state.is_loading()
+                && let Some(last) = self.state.last_refresh()
+            {
+                let interval = std::time::Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS);
+                if last.elapsed() >= interval {
+                    return Ok(Some(Action::Refresh));
                 }
+            }
         }
         Ok(None)
     }

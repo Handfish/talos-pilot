@@ -1306,9 +1306,10 @@ impl Component for NodeOperationsComponent {
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         // Poll operation on every tick while executing
         if matches!(action, Action::Tick)
-            && matches!(self.operation_state, OperationState::Executing(_, _)) {
-                self.poll_operation();
-            }
+            && matches!(self.operation_state, OperationState::Executing(_, _))
+        {
+            self.poll_operation();
+        }
         Ok(None)
     }
 

@@ -530,16 +530,17 @@ impl ClusterComponent {
 
                 // Fetch etcd status for header summary
                 if let Some(client) = &cluster.client
-                    && let Ok(statuses) = client.etcd_status().await {
-                        let total = cluster.etcd_members.len();
-                        let healthy = statuses.len();
-                        let quorum_needed = total / 2 + 1;
-                        cluster.etcd_summary = Some(EtcdSummary {
-                            healthy,
-                            total,
-                            has_quorum: healthy >= quorum_needed,
-                        });
-                    }
+                    && let Ok(statuses) = client.etcd_status().await
+                {
+                    let total = cluster.etcd_members.len();
+                    let healthy = statuses.len();
+                    let quorum_needed = total / 2 + 1;
+                    cluster.etcd_summary = Some(EtcdSummary {
+                        healthy,
+                        total,
+                        has_quorum: healthy >= quorum_needed,
+                    });
+                }
             }
         }
     }

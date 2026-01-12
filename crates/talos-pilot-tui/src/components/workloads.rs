@@ -555,9 +555,11 @@ impl WorkloadHealthComponent {
 
         // Reset selection if needed
         if let Some(d) = self.data()
-            && !d.namespaces.is_empty() && self.selected_namespace >= d.namespaces.len() {
-                self.selected_namespace = 0;
-            }
+            && !d.namespaces.is_empty()
+            && self.selected_namespace >= d.namespaces.len()
+        {
+            self.selected_namespace = 0;
+        }
         self.table_state.select(Some(self.selected_namespace));
 
         tracing::info!(

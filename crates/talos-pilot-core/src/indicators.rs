@@ -248,7 +248,6 @@ impl HasHealth for QuorumState {
     }
 }
 
-
 /// Safety status for operations that may have risks
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SafetyStatus {

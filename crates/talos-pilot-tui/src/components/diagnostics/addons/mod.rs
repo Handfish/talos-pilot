@@ -170,14 +170,15 @@ async fn detect_addons_via_pods(client: &Client) -> Result<DetectedAddons, kube:
     for ns in namespaces {
         let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
         if let Ok(pod_list) = pods.list(&ListParams::default().limit(1)).await
-            && !pod_list.items.is_empty() {
-                match ns {
-                    "ingress-nginx" => addons.ingress_nginx = true,
-                    "traefik" => addons.traefik = true,
-                    "monitoring" | "prometheus" => addons.prometheus = true,
-                    _ => {}
-                }
+            && !pod_list.items.is_empty()
+        {
+            match ns {
+                "ingress-nginx" => addons.ingress_nginx = true,
+                "traefik" => addons.traefik = true,
+                "monitoring" | "prometheus" => addons.prometheus = true,
+                _ => {}
             }
+        }
     }
 
     // Also check kube-system for ingress controllers

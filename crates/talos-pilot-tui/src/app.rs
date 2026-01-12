@@ -457,15 +457,17 @@ impl App {
                     }
                     View::Etcd => {
                         if let Some(etcd) = &mut self.etcd
-                            && let Err(e) = etcd.refresh().await {
-                                etcd.set_error(e.to_string());
-                            }
+                            && let Err(e) = etcd.refresh().await
+                        {
+                            etcd.set_error(e.to_string());
+                        }
                     }
                     View::Processes => {
                         if let Some(processes) = &mut self.processes
-                            && let Err(e) = processes.refresh().await {
-                                processes.set_error(e.to_string());
-                            }
+                            && let Err(e) = processes.refresh().await
+                        {
+                            processes.set_error(e.to_string());
+                        }
                     }
                     View::Network => {
                         if let Some(network) = &mut self.network {
@@ -491,33 +493,38 @@ impl App {
                     }
                     View::Diagnostics => {
                         if let Some(diagnostics) = &mut self.diagnostics
-                            && let Err(e) = diagnostics.refresh().await {
-                                diagnostics.set_error(e.to_string());
-                            }
+                            && let Err(e) = diagnostics.refresh().await
+                        {
+                            diagnostics.set_error(e.to_string());
+                        }
                     }
                     View::Security => {
                         if let Some(security) = &mut self.security
-                            && let Err(e) = security.refresh().await {
-                                security.set_error(e.to_string());
-                            }
+                            && let Err(e) = security.refresh().await
+                        {
+                            security.set_error(e.to_string());
+                        }
                     }
                     View::Lifecycle => {
                         if let Some(lifecycle) = &mut self.lifecycle
-                            && let Err(e) = lifecycle.refresh().await {
-                                lifecycle.set_error(e.to_string());
-                            }
+                            && let Err(e) = lifecycle.refresh().await
+                        {
+                            lifecycle.set_error(e.to_string());
+                        }
                     }
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads
-                            && let Err(e) = workloads.refresh().await {
-                                workloads.set_error(e.to_string());
-                            }
+                            && let Err(e) = workloads.refresh().await
+                        {
+                            workloads.set_error(e.to_string());
+                        }
                     }
                     View::NodeOperations => {
                         if let Some(node_ops) = &mut self.node_operations
-                            && let Err(e) = node_ops.refresh().await {
-                                node_ops.set_error(e.to_string());
-                            }
+                            && let Err(e) = node_ops.refresh().await
+                        {
+                            node_ops.set_error(e.to_string());
+                        }
                     }
                     View::RollingOperations => {
                         // Rolling operations doesn't have a refresh method

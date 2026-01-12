@@ -410,19 +410,21 @@ impl DiagnosticsComponent {
         // Fetch platform info first
         if let Ok(versions) = client.version().await
             && let Some(v) = versions.first()
-                && let Some(data) = self.data_mut() {
-                    data.context.platform = v.platform.clone();
-                    data.context.is_container = v.platform == "container";
-                    tracing::info!("Detected platform: {}", data.context.platform);
-                }
+            && let Some(data) = self.data_mut()
+        {
+            data.context.platform = v.platform.clone();
+            data.context.is_container = v.platform == "container";
+            tracing::info!("Detected platform: {}", data.context.platform);
+        }
 
         // Get CPU count for load threshold scaling
         if let Ok(cpu_info) = client.cpu_info().await
             && let Some(info) = cpu_info.first()
-                && let Some(data) = self.data_mut() {
-                    data.context.cpu_count = info.cpu_count.max(1);
-                    tracing::info!("Detected {} CPUs", data.context.cpu_count);
-                }
+            && let Some(data) = self.data_mut()
+        {
+            data.context.cpu_count = info.cpu_count.max(1);
+            tracing::info!("Detected {} CPUs", data.context.cpu_count);
+        }
 
         // Try to create K8s client once for all K8s-based checks
         // For worker nodes, use the control plane endpoint to fetch kubeconfig
@@ -903,21 +905,19 @@ impl Component for DiagnosticsComponent {
                         if self.confirmation_selection == 0 {
                             if let Some(pending) = &self.pending_action
                                 && let FixAction::HostCommand { command, .. } = &pending.fix.action
-                                {
-                                    // Spawn a thread to copy to clipboard and keep it alive
-                                    // This prevents the "clipboard dropped quickly" warning
-                                    let cmd = command.clone();
-                                    std::thread::spawn(move || {
-                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                            let _ = clipboard.set_text(cmd);
-                                            // Keep clipboard alive for a bit so clipboard managers can read
-                                            std::thread::sleep(std::time::Duration::from_millis(
-                                                100,
-                                            ));
-                                        }
-                                    });
-                                    self.copy_feedback_until = Some(Instant::now());
-                                }
+                            {
+                                // Spawn a thread to copy to clipboard and keep it alive
+                                // This prevents the "clipboard dropped quickly" warning
+                                let cmd = command.clone();
+                                std::thread::spawn(move || {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard.set_text(cmd);
+                                        // Keep clipboard alive for a bit so clipboard managers can read
+                                        std::thread::sleep(std::time::Duration::from_millis(100));
+                                    }
+                                });
+                                self.copy_feedback_until = Some(Instant::now());
+                            }
                         } else {
                             self.show_confirmation = false;
                             self.pending_action = None;

@@ -17,20 +17,21 @@ pub async fn run_system_checks(
     match client.memory().await {
         Ok(mem_list) => {
             if let Some(mem) = mem_list.first()
-                && let Some(info) = &mem.meminfo {
-                    let usage_pct = info.usage_percent();
-                    let used_gb = (info.mem_total - info.mem_available) as f64 / 1_073_741_824.0;
-                    let total_gb = info.mem_total as f64 / 1_073_741_824.0;
-                    let msg = format!("{:.1} / {:.1} GB ({:.0}%)", used_gb, total_gb, usage_pct);
+                && let Some(info) = &mem.meminfo
+            {
+                let usage_pct = info.usage_percent();
+                let used_gb = (info.mem_total - info.mem_available) as f64 / 1_073_741_824.0;
+                let total_gb = info.mem_total as f64 / 1_073_741_824.0;
+                let msg = format!("{:.1} / {:.1} GB ({:.0}%)", used_gb, total_gb, usage_pct);
 
-                    if usage_pct > 90.0 {
-                        checks.push(DiagnosticCheck::fail("memory", "Memory", &msg, None));
-                    } else if usage_pct > 80.0 {
-                        checks.push(DiagnosticCheck::warn("memory", "Memory", &msg));
-                    } else {
-                        checks.push(DiagnosticCheck::pass("memory", "Memory", &msg));
-                    }
+                if usage_pct > 90.0 {
+                    checks.push(DiagnosticCheck::fail("memory", "Memory", &msg, None));
+                } else if usage_pct > 80.0 {
+                    checks.push(DiagnosticCheck::warn("memory", "Memory", &msg));
+                } else {
+                    checks.push(DiagnosticCheck::pass("memory", "Memory", &msg));
                 }
+            }
         }
         Err(e) => {
             checks.push(
@@ -336,40 +337,38 @@ pub async fn run_certificate_checks(
         Ok(kubeconfig_yaml) => {
             // Parse kubeconfig YAML to extract client certificate
             if let Ok(kc) = serde_yaml::from_str::<serde_yaml::Value>(&kubeconfig_yaml)
-                && let Some(users) = kc.get("users").and_then(|u| u.as_sequence()) {
-                    for user in users {
-                        if let Some(user_data) = user.get("user") {
-                            // Check for client-certificate-data (base64 encoded PEM)
-                            if let Some(cert_data) = user_data
-                                .get("client-certificate-data")
-                                .and_then(|c| c.as_str())
-                            {
-                                match pki::parse_base64_certificate("kubeconfig", cert_data) {
-                                    Ok(cert_info) => {
-                                        checks.push(cert_to_diagnostic_check(
-                                            "kubeconfig_cert",
-                                            "kubeconfig",
-                                            &cert_info,
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        checks.push(
-                                            DiagnosticCheck::unknown(
-                                                "kubeconfig_cert",
-                                                "kubeconfig",
-                                            )
+                && let Some(users) = kc.get("users").and_then(|u| u.as_sequence())
+            {
+                for user in users {
+                    if let Some(user_data) = user.get("user") {
+                        // Check for client-certificate-data (base64 encoded PEM)
+                        if let Some(cert_data) = user_data
+                            .get("client-certificate-data")
+                            .and_then(|c| c.as_str())
+                        {
+                            match pki::parse_base64_certificate("kubeconfig", cert_data) {
+                                Ok(cert_info) => {
+                                    checks.push(cert_to_diagnostic_check(
+                                        "kubeconfig_cert",
+                                        "kubeconfig",
+                                        &cert_info,
+                                    ));
+                                }
+                                Err(e) => {
+                                    checks.push(
+                                        DiagnosticCheck::unknown("kubeconfig_cert", "kubeconfig")
                                             .with_details(&format!(
                                                 "Failed to parse kubeconfig cert: {}",
                                                 e
                                             )),
-                                        );
-                                    }
+                                    );
                                 }
-                                break; // Only check first user
                             }
+                            break; // Only check first user
                         }
                     }
                 }
+            }
         }
         Err(e) => {
             // kubeconfig may not be available yet during cluster bootstrap

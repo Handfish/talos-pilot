@@ -187,9 +187,10 @@ impl RollingOperationsComponent {
                     // Renumber nodes with higher order numbers
                     for n in &mut self.nodes {
                         if let Some(order) = n.selection_order
-                            && order > removed {
-                                n.selection_order = Some(order - 1);
-                            }
+                            && order > removed
+                        {
+                            n.selection_order = Some(order - 1);
+                        }
                     }
                 }
             } else {
@@ -598,10 +599,9 @@ impl Component for RollingOperationsComponent {
     }
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
-        if matches!(action, Action::Tick)
-            && matches!(self.state, RollingState::InProgress { .. }) {
-                self.poll_operation();
-            }
+        if matches!(action, Action::Tick) && matches!(self.state, RollingState::InProgress { .. }) {
+            self.poll_operation();
+        }
         Ok(None)
     }
 

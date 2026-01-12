@@ -598,9 +598,10 @@ pub async fn drain_node_with_progress(
 
         // Skip mirror pods (created by kubelet, not managed by API server)
         if let Some(annotations) = &pod.metadata.annotations
-            && annotations.contains_key("kubernetes.io/config.mirror") {
-                continue;
-            }
+            && annotations.contains_key("kubernetes.io/config.mirror")
+        {
+            continue;
+        }
 
         // Check if pod is owned by a controller (managed)
         let owner_refs = pod.metadata.owner_references.as_ref();
@@ -615,18 +616,17 @@ pub async fn drain_node_with_progress(
             })
         });
 
-        if is_daemonset_pod
-            && options.ignore_daemonsets {
-                _skipped_daemonset += 1;
-                continue;
-            }
-            // DaemonSet pods can't be evicted without ignoring them
+        if is_daemonset_pod && options.ignore_daemonsets {
+            _skipped_daemonset += 1;
+            continue;
+        }
+        // DaemonSet pods can't be evicted without ignoring them
 
         // Check for local storage (emptyDir)
         let has_emptydir = pod.spec.as_ref().is_some_and(|spec| {
-            spec.volumes.as_ref().is_some_and(|volumes| {
-                volumes.iter().any(|v| v.empty_dir.is_some())
-            })
+            spec.volumes
+                .as_ref()
+                .is_some_and(|volumes| volumes.iter().any(|v| v.empty_dir.is_some()))
         });
 
         if has_emptydir && !options.delete_emptydir_data {

@@ -331,9 +331,10 @@ impl ProcessesComponent {
             let proc = &data.processes[idx];
 
             if let Some(ref desc) = descendants
-                && !desc.contains(&proc.pid) {
-                    continue;
-                }
+                && !desc.contains(&proc.pid)
+            {
+                continue;
+            }
 
             let ppid = proc.ppid;
             let parent_in_list = pid_to_idx
@@ -430,34 +431,38 @@ impl ProcessesComponent {
         // Handle memory result (for total memory and usage)
         if let Ok(Ok(mem_info)) = mem_result
             && let Some(node_mem) = mem_info.into_iter().next()
-                && let Some(meminfo) = node_mem.meminfo {
-                    data.total_memory = meminfo.mem_total;
-                    data.memory_used = meminfo.mem_total.saturating_sub(meminfo.mem_available);
-                    data.memory_usage_percent = meminfo.usage_percent();
-                }
+            && let Some(meminfo) = node_mem.meminfo
+        {
+            data.total_memory = meminfo.mem_total;
+            data.memory_used = meminfo.mem_total.saturating_sub(meminfo.mem_available);
+            data.memory_usage_percent = meminfo.usage_percent();
+        }
 
         // Handle CPU info result (for CPU count)
         if let Ok(Ok(cpu_info)) = cpu_info_result
-            && let Some(node_cpu) = cpu_info.into_iter().next() {
-                data.cpu_count = node_cpu.cpu_count;
-            }
+            && let Some(node_cpu) = cpu_info.into_iter().next()
+        {
+            data.cpu_count = node_cpu.cpu_count;
+        }
 
         // Handle load average result
         if let Ok(Ok(load_info)) = load_result
-            && let Some(node_load) = load_info.into_iter().next() {
-                data.load_avg = (node_load.load1, node_load.load5, node_load.load15);
-            }
+            && let Some(node_load) = load_info.into_iter().next()
+        {
+            data.load_avg = (node_load.load1, node_load.load5, node_load.load15);
+        }
 
         // Handle system stat result (for CPU usage)
         if let Ok(Ok(stats)) = stat_result
-            && let Some(node_stat) = stats.into_iter().next() {
-                let curr_cpu = node_stat.cpu_total;
-                // Calculate CPU usage from delta if we have previous stats
-                if let Some(ref prev_cpu) = data.prev_cpu_stat {
-                    data.cpu_usage_percent = CpuStat::usage_percent_from(prev_cpu, &curr_cpu);
-                }
-                data.prev_cpu_stat = Some(curr_cpu);
+            && let Some(node_stat) = stats.into_iter().next()
+        {
+            let curr_cpu = node_stat.cpu_total;
+            // Calculate CPU usage from delta if we have previous stats
+            if let Some(ref prev_cpu) = data.prev_cpu_stat {
+                data.cpu_usage_percent = CpuStat::usage_percent_from(prev_cpu, &curr_cpu);
             }
+            data.prev_cpu_stat = Some(curr_cpu);
+        }
 
         // Handle processes result
         let node_processes = match procs_result {
@@ -664,9 +669,10 @@ impl ProcessesComponent {
 
             // If subtree mode, skip processes not in the subtree
             if let Some(ref desc) = descendants
-                && !desc.contains(&proc.pid) {
-                    continue;
-                }
+                && !desc.contains(&proc.pid)
+            {
+                continue;
+            }
 
             let ppid = proc.ppid;
 
