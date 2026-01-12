@@ -71,6 +71,27 @@ Use **talos-pilot** for "why won't my node join the cluster?"
 
 ## Installation
 
+### From Releases (Recommended)
+
+Download the latest release for your platform from the [Releases](https://github.com/yourorg/talos-pilot/releases) page.
+
+```bash
+# Linux x64
+curl -LO https://github.com/yourorg/talos-pilot/releases/latest/download/talos-pilot-<version>-x86_64-unknown-linux-gnu.tar.gz
+tar xzf talos-pilot-*.tar.gz
+sudo mv talos-pilot /usr/local/bin/
+
+# macOS (Apple Silicon)
+curl -LO https://github.com/yourorg/talos-pilot/releases/latest/download/talos-pilot-<version>-aarch64-apple-darwin.tar.gz
+tar xzf talos-pilot-*.tar.gz
+sudo mv talos-pilot /usr/local/bin/
+
+# macOS (Intel)
+curl -LO https://github.com/yourorg/talos-pilot/releases/latest/download/talos-pilot-<version>-x86_64-apple-darwin.tar.gz
+tar xzf talos-pilot-*.tar.gz
+sudo mv talos-pilot /usr/local/bin/
+```
+
 ### From Source
 
 ```bash
@@ -82,9 +103,9 @@ cargo build --release
 
 ### Requirements
 
-- Rust 2024 edition (1.85+)
 - Valid `~/.talos/config` (talosconfig)
 - Network access to Talos nodes on port 50000
+- (Building from source) Rust 2024 edition (1.85+)
 
 ## Usage
 
