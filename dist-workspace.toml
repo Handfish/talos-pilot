@@ -24,7 +24,7 @@ install-path = "CARGO_HOME"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 # Whether to install an updater program
-install-updater = false
+install-updater = true
 
 [dist.dependencies.homebrew]
 protobuf = "*"

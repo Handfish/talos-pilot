@@ -77,21 +77,18 @@ Use **talos-pilot** for "why won't my node join the cluster?"
 
 Download the latest release for your platform from the [Releases](https://github.com/Handfish/talos-pilot/releases) page.
 
+Install prebuilt binaries via shell script:
 ```bash
-# Linux x64
-curl -LO https://github.com/Handfish/talos-pilot/releases/latest/download/talos-pilot-<version>-x86_64-unknown-linux-gnu.tar.gz
-tar xzf talos-pilot-*.tar.gz
-sudo mv talos-pilot /usr/local/bin/
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Handfish/talos-pilot/releases/download/<version>/talos-pilot-installer.sh | sh
+```
+Install prebuilt binaries via powershell script:
+```bash
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Handfish/talos-pilot/releases/download/<version>/talos-pilot-installer.ps1 | iex"
+```
 
-# macOS (Apple Silicon)
-curl -LO https://github.com/Handfish/talos-pilot/releases/latest/download/talos-pilot-<version>-aarch64-apple-darwin.tar.gz
-tar xzf talos-pilot-*.tar.gz
-sudo mv talos-pilot /usr/local/bin/
-
-# macOS (Intel)
-curl -LO https://github.com/Handfish/talos-pilot/releases/latest/download/talos-pilot-<version>-x86_64-apple-darwin.tar.gz
-tar xzf talos-pilot-*.tar.gz
-sudo mv talos-pilot /usr/local/bin/
+Install prebuilt binaries via Homebrew
+```bash
+brew install Handfish/tap/talos-pilot
 ```
 
 ### From Source
