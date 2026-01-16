@@ -59,4 +59,24 @@ pub enum Action {
     // Effects
     StartFadeIn,
     StartFadeOut,
+
+    // Insecure mode actions (legacy)
+    /// Generate Talos config: (cluster_name, k8s_endpoint, output_dir)
+    InsecureGenConfig(String, String, String),
+    /// Apply config to node: (config_path)
+    InsecureApplyConfig(String),
+
+    // Wizard actions
+    /// Generate config in wizard
+    WizardGenConfig,
+    /// Apply config in wizard
+    WizardApplyConfig,
+    /// Bootstrap cluster in wizard
+    WizardBootstrap,
+    /// Retry after error in wizard
+    WizardRetry,
+    /// Wizard complete - transition to secure mode (context_name)
+    WizardComplete(Option<String>),
+    /// Tick for wizard polling
+    WizardTick,
 }

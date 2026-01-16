@@ -2,11 +2,11 @@
 
 use crate::action::Action;
 use crate::components::rolling_operations::RollingNodeInfo;
+use crate::components::wizard::{WizardComponent, WizardState};
 use crate::components::{
-    ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, InsecureComponent,
-    LifecycleComponent, MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent,
-    ProcessesComponent, RollingOperationsComponent, SecurityComponent, StorageComponent,
-    WorkloadHealthComponent,
+    ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent,
+    MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent,
+    RollingOperationsComponent, SecurityComponent, StorageComponent, WorkloadHealthComponent,
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
@@ -148,35 +148,65 @@ impl App {
         result
     }
 
-    /// Insecure mode event loop - simplified for maintenance mode nodes
+    /// Insecure mode event loop - Bootstrap Wizard
     async fn insecure_loop(&mut self, terminal: &mut Tui) -> Result<()> {
         let endpoint = self
             .insecure_endpoint
             .clone()
             .expect("Insecure mode requires endpoint");
 
-        let mut insecure = InsecureComponent::new(endpoint);
+        let mut wizard = WizardComponent::new(endpoint);
 
         // Connect on startup
-        insecure.connect().await?;
+        wizard.connect().await?;
+
+        // Polling interval for wait states
+        let poll_interval = Duration::from_secs(5);
+        let mut last_poll = std::time::Instant::now();
+
+        // Spinner animation interval
+        let spinner_interval = Duration::from_millis(100);
+        let mut last_spinner = std::time::Instant::now();
 
         loop {
+            // Advance spinner for animations
+            if last_spinner.elapsed() >= spinner_interval {
+                last_spinner = std::time::Instant::now();
+                wizard.data_mut().advance_spinner();
+            }
+
             // Draw
             terminal.draw(|frame| {
-                let _ = insecure.draw(frame, frame.area());
+                let _ = wizard.draw(frame, frame.area());
             })?;
 
             // Handle events with timeout
             if event::poll(self.tick_rate)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if let Some(action) = insecure.handle_key_event(key)? {
+                        if let Some(action) = wizard.handle_key_event(key)? {
                             match action {
                                 Action::Quit => {
                                     self.should_quit = true;
                                 }
-                                Action::Refresh => {
-                                    insecure.refresh().await?;
+                                Action::WizardGenConfig => {
+                                    self.wizard_generate_config(&mut wizard).await;
+                                }
+                                Action::WizardApplyConfig => {
+                                    self.wizard_apply_config(&mut wizard).await;
+                                }
+                                Action::WizardBootstrap => {
+                                    self.wizard_bootstrap(&mut wizard).await;
+                                }
+                                Action::WizardRetry => {
+                                    wizard.connect().await?;
+                                }
+                                Action::WizardComplete(context) => {
+                                    // Exit wizard - print instructions
+                                    self.should_quit = true;
+                                    if let Some(ctx) = context {
+                                        tracing::info!("Wizard complete. Context: {}", ctx);
+                                    }
                                 }
                                 _ => {}
                             }
@@ -189,12 +219,265 @@ impl App {
                 }
             }
 
+            // Polling for wait states
+            if last_poll.elapsed() >= poll_interval {
+                last_poll = std::time::Instant::now();
+                self.wizard_poll(&mut wizard).await;
+            }
+
             if self.should_quit {
                 break;
             }
         }
 
         Ok(())
+    }
+
+    /// Generate config in wizard
+    async fn wizard_generate_config(&self, wizard: &mut WizardComponent) {
+        use talos_rs::gen_config;
+
+        // Extract data we need before any mutations
+        let cluster_name = wizard.data().cluster_name.clone();
+        let k8s_endpoint = wizard.data().k8s_endpoint.clone();
+        let output_dir = wizard.data().output_dir.clone();
+        let endpoint = wizard.data().endpoint.clone();
+        // TODO: Use disk with gen_config_with_disk when --install-disk flag support is added
+        let _disk = wizard
+            .data()
+            .selected_disk
+            .as_ref()
+            .map(|d| d.dev_path.clone());
+
+        // Build additional SANs
+        let sans: Vec<&str> = vec![&endpoint, "127.0.0.1"];
+
+        // Generate config
+        // Note: For now we use gen_config without disk selection
+        // TODO: Add gen_config_with_disk that uses --install-disk flag
+        match gen_config(&cluster_name, &k8s_endpoint, &output_dir, Some(&sans), true).await {
+            Ok(result) => {
+                // Merge talosconfig and set endpoint/node
+                let merge_success = self
+                    .wizard_merge_config(&result.talosconfig_path, &cluster_name, &endpoint)
+                    .await;
+
+                if merge_success {
+                    wizard.data_mut().config_result = Some(result);
+                    wizard.data_mut().context_name = Some(cluster_name);
+                    wizard.transition(WizardState::ConfigReady);
+                } else {
+                    wizard.set_error("Failed to merge talosconfig".to_string());
+                }
+            }
+            Err(e) => {
+                wizard.set_error(format!("Failed to generate config: {}", e));
+            }
+        }
+    }
+
+    /// Merge talosconfig into user's config
+    async fn wizard_merge_config(
+        &self,
+        config_path: &str,
+        context_name: &str,
+        endpoint: &str,
+    ) -> bool {
+        use tokio::process::Command;
+
+        // Run: talosctl config merge <path>
+        let merge_output = Command::new("talosctl")
+            .args(["config", "merge", config_path])
+            .output()
+            .await;
+
+        if let Err(e) = &merge_output {
+            tracing::warn!("Failed to run talosctl config merge: {}", e);
+            return false;
+        }
+
+        if let Ok(out) = &merge_output {
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::warn!("Failed to merge config: {}", stderr);
+                return false;
+            }
+        }
+
+        // Set the endpoint on the context
+        let endpoint_output = Command::new("talosctl")
+            .args(["--context", context_name, "config", "endpoint", endpoint])
+            .output()
+            .await;
+
+        if let Err(e) = &endpoint_output {
+            tracing::warn!("Failed to set endpoint: {}", e);
+            return false;
+        }
+
+        // Set the node on the context
+        let node_output = Command::new("talosctl")
+            .args(["--context", context_name, "config", "node", endpoint])
+            .output()
+            .await;
+
+        if let Err(e) = &node_output {
+            tracing::warn!("Failed to set node: {}", e);
+            return false;
+        }
+
+        true
+    }
+
+    /// Apply config in wizard
+    async fn wizard_apply_config(&self, wizard: &mut WizardComponent) {
+        use std::time::Instant;
+        use talos_rs::apply_config_insecure;
+
+        wizard.transition(WizardState::Applying);
+
+        // Extract values we need before mutating
+        let endpoint = wizard.data().endpoint.clone();
+        let cluster_name = wizard.data().cluster_name.clone();
+        let config_path = {
+            let data = wizard.data();
+            data.config_result.as_ref().map(|r| match data.node_type {
+                crate::components::wizard::NodeType::Controlplane => r.controlplane_path.clone(),
+                crate::components::wizard::NodeType::Worker => r.worker_path.clone(),
+            })
+        };
+
+        if let Some(path) = config_path {
+            match apply_config_insecure(&endpoint, &path).await {
+                Ok(result) => {
+                    if result.success {
+                        // Start waiting for reboot
+                        wizard.data_mut().wait_started = Some(Instant::now());
+                        wizard.data_mut().context_name = Some(cluster_name);
+                        wizard.transition(WizardState::WaitingReboot);
+                    } else {
+                        wizard.set_error(result.message);
+                    }
+                }
+                Err(e) => {
+                    wizard.set_error(format!("Failed to apply config: {}", e));
+                }
+            }
+        } else {
+            wizard.set_error("No config generated".to_string());
+        }
+    }
+
+    /// Bootstrap cluster in wizard
+    async fn wizard_bootstrap(&self, wizard: &mut WizardComponent) {
+        use std::time::Instant;
+        use tokio::process::Command;
+
+        wizard.transition(WizardState::Bootstrapping);
+
+        let context = wizard.data().context_name.clone();
+
+        if let Some(ctx) = context {
+            let output = Command::new("talosctl")
+                .args(["--context", &ctx, "bootstrap"])
+                .output()
+                .await;
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    wizard.data_mut().wait_started = Some(Instant::now());
+                    wizard.transition(WizardState::WaitingHealthy);
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    wizard.set_error(format!("Bootstrap failed: {}", stderr));
+                }
+                Err(e) => {
+                    wizard.set_error(format!("Failed to run bootstrap: {}", e));
+                }
+            }
+        } else {
+            wizard.set_error("No context available for bootstrap".to_string());
+        }
+    }
+
+    /// Poll for state changes in wait states
+    async fn wizard_poll(&self, wizard: &mut WizardComponent) {
+        use tokio::process::Command;
+
+        match wizard.state() {
+            WizardState::WaitingReboot => {
+                // Increment poll attempts
+                wizard.data_mut().poll_attempts += 1;
+
+                // Check if node is back online (with TLS)
+                if let Some(ctx) = wizard.data().context_name.clone() {
+                    let output = Command::new("talosctl")
+                        .args(["--context", &ctx, "version"])
+                        .output()
+                        .await;
+
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            wizard.data_mut().last_poll_error = None;
+                            wizard.transition(WizardState::ReadyToBootstrap);
+                        }
+                        Ok(out) => {
+                            // Command ran but failed - capture error
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            wizard.data_mut().last_poll_error =
+                                Some(stderr.lines().next().unwrap_or("Unknown error").to_string());
+                        }
+                        Err(e) => {
+                            wizard.data_mut().last_poll_error = Some(e.to_string());
+                        }
+                    }
+                }
+
+                // Check for timeout (5 minutes)
+                if let Some(started) = wizard.data().wait_started
+                    && started.elapsed().as_secs() > 300
+                {
+                    wizard.set_error("Timeout waiting for node to reboot".to_string());
+                }
+            }
+            WizardState::WaitingHealthy => {
+                // Increment poll attempts
+                wizard.data_mut().poll_attempts += 1;
+
+                // Check if cluster is healthy
+                if let Some(ctx) = wizard.data().context_name.clone() {
+                    // Check etcd health
+                    let output = Command::new("talosctl")
+                        .args(["--context", &ctx, "etcd", "status"])
+                        .output()
+                        .await;
+
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            wizard.data_mut().last_poll_error = None;
+                            wizard.transition(WizardState::Complete);
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            wizard.data_mut().last_poll_error =
+                                Some(stderr.lines().next().unwrap_or("Unknown error").to_string());
+                        }
+                        Err(e) => {
+                            wizard.data_mut().last_poll_error = Some(e.to_string());
+                        }
+                    }
+                }
+
+                // Check for timeout (5 minutes)
+                if let Some(started) = wizard.data().wait_started
+                    && started.elapsed().as_secs() > 300
+                {
+                    wizard.set_error("Timeout waiting for cluster to become healthy".to_string());
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Main event loop

@@ -286,9 +286,16 @@ pub async fn get_disks_insecure(endpoint: &str) -> Result<Vec<DiskInfo>, TalosEr
 ///
 /// Executes: talosctl get volumestatus --insecure -n <endpoint> -o yaml
 pub async fn get_volume_status_insecure(endpoint: &str) -> Result<Vec<VolumeStatus>, TalosError> {
-    let output =
-        exec_talosctl_async(&["get", "volumestatus", "--insecure", "-n", endpoint, "-o", "yaml"])
-            .await?;
+    let output = exec_talosctl_async(&[
+        "get",
+        "volumestatus",
+        "--insecure",
+        "-n",
+        endpoint,
+        "-o",
+        "yaml",
+    ])
+    .await?;
     parse_volume_status_yaml(&output)
 }
 
@@ -346,6 +353,119 @@ pub async fn get_version_insecure(endpoint: &str) -> Result<InsecureVersionInfo,
 pub async fn check_insecure_connection(endpoint: &str) -> bool {
     // Try to get disks - this works in maintenance mode
     get_disks_insecure(endpoint).await.is_ok()
+}
+
+/// Result of generating Talos configuration
+#[derive(Debug, Clone)]
+pub struct GenConfigResult {
+    /// Path to generated controlplane.yaml
+    pub controlplane_path: String,
+    /// Path to generated worker.yaml
+    pub worker_path: String,
+    /// Path to generated talosconfig
+    pub talosconfig_path: String,
+    /// Output directory
+    pub output_dir: String,
+}
+
+/// Generate Talos machine configuration
+///
+/// Executes: talosctl gen config <cluster-name> <endpoint> --output-dir <dir> [--force]
+///
+/// This generates controlplane.yaml, worker.yaml, and talosconfig in the output directory.
+pub async fn gen_config(
+    cluster_name: &str,
+    kubernetes_endpoint: &str,
+    output_dir: &str,
+    additional_sans: Option<&[&str]>,
+    force: bool,
+) -> Result<GenConfigResult, TalosError> {
+    let mut args = vec!["gen", "config", cluster_name, kubernetes_endpoint];
+
+    args.push("--output-dir");
+    args.push(output_dir);
+
+    // Add additional SANs if provided
+    let sans_joined: String;
+    if let Some(sans) = additional_sans
+        && !sans.is_empty()
+    {
+        sans_joined = sans.join(",");
+        args.push("--additional-sans");
+        args.push(&sans_joined);
+    }
+
+    if force {
+        args.push("--force");
+    }
+
+    exec_talosctl_async(&args).await?;
+
+    Ok(GenConfigResult {
+        controlplane_path: format!("{}/controlplane.yaml", output_dir),
+        worker_path: format!("{}/worker.yaml", output_dir),
+        talosconfig_path: format!("{}/talosconfig", output_dir),
+        output_dir: output_dir.to_string(),
+    })
+}
+
+/// Result of applying configuration in insecure mode
+#[derive(Debug, Clone)]
+pub struct InsecureApplyResult {
+    /// Whether the apply was successful
+    pub success: bool,
+    /// Output message
+    pub message: String,
+}
+
+/// Apply configuration to a node in insecure mode
+///
+/// Executes: talosctl apply-config --insecure -n <endpoint> -f <config_path>
+///
+/// This applies a machine configuration to a node in maintenance mode.
+/// The node will install Talos and reboot.
+pub async fn apply_config_insecure(
+    endpoint: &str,
+    config_path: &str,
+) -> Result<InsecureApplyResult, TalosError> {
+    let output = exec_talosctl_async(&[
+        "apply-config",
+        "--insecure",
+        "-n",
+        endpoint,
+        "-f",
+        config_path,
+    ])
+    .await;
+
+    match output {
+        Ok(msg) => Ok(InsecureApplyResult {
+            success: true,
+            message: if msg.trim().is_empty() {
+                "Configuration applied successfully. Node will install and reboot.".to_string()
+            } else {
+                msg
+            },
+        }),
+        Err(e) => Ok(InsecureApplyResult {
+            success: false,
+            message: format!("Failed to apply config: {}", e),
+        }),
+    }
+}
+
+/// Reboot a node in insecure mode
+///
+/// Executes: talosctl reboot --insecure -n <endpoint>
+pub async fn reboot_insecure(endpoint: &str) -> Result<String, TalosError> {
+    exec_talosctl_async(&["reboot", "--insecure", "-n", endpoint]).await
+}
+
+/// Shutdown a node in insecure mode
+///
+/// Executes: talosctl shutdown --insecure -n <endpoint>
+pub async fn shutdown_insecure(endpoint: &str) -> Result<String, TalosError> {
+    exec_talosctl_async(&["shutdown", "--insecure", "-n", endpoint]).await
 }
 
 /// Get machine config info for a node
