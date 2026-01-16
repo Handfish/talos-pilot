@@ -157,15 +157,43 @@ pub fn get_discovery_members(node: &str) -> Result<Vec<DiscoveryMember>, TalosEr
 
 /// Get discovery members for a context (async, non-blocking)
 ///
-/// Executes: talosctl --context <context> get members -o yaml
+/// Executes: talosctl --context <context> -n <node> get members -o yaml
 ///
 /// This version uses the context name to get the correct certificates and endpoint,
 /// and uses tokio async process to avoid blocking the runtime.
+/// It extracts a node IP from the context's endpoints to target the query.
 pub async fn get_discovery_members_for_context(
     context: &str,
 ) -> Result<Vec<DiscoveryMember>, TalosError> {
-    let output =
-        exec_talosctl_async(&["--context", context, "get", "members", "-o", "yaml"]).await?;
+    // Load config to get an endpoint IP to use as the node target
+    // talosctl requires -n flag if nodes: is not set in the config
+    let config = crate::TalosConfig::load_default()?;
+    let ctx = config
+        .contexts
+        .get(context)
+        .ok_or_else(|| TalosError::ContextNotFound(context.to_string()))?;
+
+    // Get the first endpoint and extract the IP (remove port if present)
+    let node_ip = ctx
+        .endpoints
+        .first()
+        .ok_or_else(|| TalosError::NoEndpoints(context.to_string()))?
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    if node_ip.is_empty() {
+        return Err(TalosError::NoEndpoints(context.to_string()));
+    }
+
+    let output = exec_talosctl_async(&[
+        "--context", context,
+        "-n", &node_ip,
+        "get", "members",
+        "-o", "yaml",
+    ])
+    .await?;
     parse_discovery_members_yaml(&output)
 }
 
