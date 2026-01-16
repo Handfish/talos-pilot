@@ -31,6 +31,14 @@ struct Cli {
     /// Number of log lines to fetch (default: 500)
     #[arg(short, long, default_value = "500")]
     tail: i32,
+
+    /// Connect without TLS client certificates (for maintenance mode nodes)
+    #[arg(short, long)]
+    insecure: bool,
+
+    /// Endpoint to connect to in insecure mode (e.g., 192.168.1.100 or 192.168.1.100:50000)
+    #[arg(short, long, requires = "insecure")]
+    endpoint: Option<String>,
 }
 
 #[tokio::main]
@@ -57,12 +65,35 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting talos-pilot");
 
-    if let Some(ctx) = &cli.context {
-        tracing::info!("Using context: {}", ctx);
+    // Validate insecure mode requires endpoint
+    if cli.insecure && cli.endpoint.is_none() {
+        eprintln!("Error: --insecure requires --endpoint <ip>");
+        eprintln!("Usage: talos-pilot --insecure --endpoint 192.168.1.100");
+        std::process::exit(1);
     }
 
-    // Run the TUI with the specified context and tail limit
-    let mut app = App::new(cli.context, cli.tail);
+    if cli.insecure {
+        tracing::info!("Insecure mode enabled");
+        if let Some(ep) = &cli.endpoint {
+            tracing::info!("Endpoint: {}", ep);
+        }
+    } else {
+        if let Some(ctx) = &cli.context {
+            tracing::info!("Using context: {}", ctx);
+        }
+        if let Some(cfg) = &cli.config {
+            tracing::info!("Using config: {}", cfg);
+        }
+    }
+
+    // Run the TUI
+    let mut app = App::new(
+        cli.config,
+        cli.context,
+        cli.tail,
+        cli.insecure,
+        cli.endpoint,
+    );
     app.run().await?;
 
     tracing::info!("Goodbye!");

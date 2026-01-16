@@ -269,11 +269,19 @@ pub async fn check_cni_health(client: &TalosClient) -> (bool, Option<String>) {
 pub async fn run_certificate_checks(
     client: &TalosClient,
     _ctx: &DiagnosticContext,
+    config_path: Option<&str>,
 ) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
-    // Load talosconfig and check certificates
-    match talos_rs::TalosConfig::load_default() {
+    // Load talosconfig - use custom path if provided
+    let config_result = match config_path {
+        Some(path) => {
+            let path_buf = std::path::PathBuf::from(path);
+            talos_rs::TalosConfig::load_from(&path_buf)
+        }
+        None => talos_rs::TalosConfig::load_default(),
+    };
+    match config_result {
         Ok(config) => {
             if let Some(context) = config.current_context() {
                 // Check client certificate

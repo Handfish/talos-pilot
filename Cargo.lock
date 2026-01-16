@@ -2778,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "talos-pilot"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "talos-pilot-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "serde",
@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "talos-pilot-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arboard",
  "base64",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "talos-rs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "dirs-next",

@@ -273,8 +273,20 @@ jobs:
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          # Generate GitHub's auto release notes (What's Changed, New Contributors)
+          gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="${{ needs.plan.outputs.tag }}" \
+            -f target_commitish="$RELEASE_COMMIT" \
+            --jq '.body' > $RUNNER_TEMP/auto_notes.txt
+
+          # Combine: auto-generated notes first, then cargo-dist announcement
+          {
+            cat $RUNNER_TEMP/auto_notes.txt
+            echo ""
+            echo "---"
+            echo ""
+            echo "$ANNOUNCEMENT_BODY"
+          } > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 

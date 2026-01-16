@@ -43,6 +43,7 @@ pub enum NavMenuItem {
     Logs,
     Etcd,
     Network,
+    Storage,
     Processes,
     Diagnostics,
     Certs,
@@ -51,10 +52,11 @@ pub enum NavMenuItem {
 }
 
 impl NavMenuItem {
-    const ALL: [NavMenuItem; 8] = [
+    const ALL: [NavMenuItem; 9] = [
         NavMenuItem::Logs,
         NavMenuItem::Etcd,
         NavMenuItem::Network,
+        NavMenuItem::Storage,
         NavMenuItem::Processes,
         NavMenuItem::Diagnostics,
         NavMenuItem::Certs,
@@ -67,6 +69,7 @@ impl NavMenuItem {
             NavMenuItem::Logs => "Logs",
             NavMenuItem::Etcd => "etcd",
             NavMenuItem::Network => "Net",
+            NavMenuItem::Storage => "Stor",
             NavMenuItem::Processes => "Proc",
             NavMenuItem::Diagnostics => "Diag",
             NavMenuItem::Certs => "Certs",
@@ -80,6 +83,7 @@ impl NavMenuItem {
             NavMenuItem::Logs => "L",
             NavMenuItem::Etcd => "e",
             NavMenuItem::Network => "n",
+            NavMenuItem::Storage => "s",
             NavMenuItem::Processes => "p",
             NavMenuItem::Diagnostics => "d",
             NavMenuItem::Certs => "c",
@@ -161,16 +165,20 @@ pub struct ClusterComponent {
     last_auto_refresh: Option<std::time::Instant>,
     /// Currently selected item in the node list
     selected_item: NodeListItem,
+    /// Custom config file path (from --config flag)
+    config_path: Option<String>,
+    /// Specific context to use (from --context flag)
+    context_filter: Option<String>,
 }
 
 impl Default for ClusterComponent {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, None)
     }
 }
 
 impl ClusterComponent {
-    pub fn new(_context: Option<String>) -> Self {
+    pub fn new(config_path: Option<String>, context_filter: Option<String>) -> Self {
         Self {
             clusters: Vec::new(),
             active_cluster: 0,
@@ -181,6 +189,8 @@ impl ClusterComponent {
             auto_refresh: true,
             last_auto_refresh: None,
             selected_item: NodeListItem::ClusterHeader(0),
+            config_path,
+            context_filter,
         }
     }
 
@@ -329,17 +339,44 @@ impl ClusterComponent {
         // Install crypto provider (needed for rustls)
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        // Load talosconfig to get all contexts
-        let config = match TalosConfig::load_default() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to load talosconfig: {}", e);
-                return Ok(());
+        // Load talosconfig - use custom path if provided via --config flag
+        let config = match &self.config_path {
+            Some(path) => {
+                let path_buf = std::path::PathBuf::from(path);
+                match TalosConfig::load_from(&path_buf) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Failed to load talosconfig from {}: {}", path, e);
+                        return Ok(());
+                    }
+                }
             }
+            None => match TalosConfig::load_default() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to load talosconfig: {}", e);
+                    return Ok(());
+                }
+            },
         };
 
-        // Get all context names
-        let context_names: Vec<String> = config.contexts.keys().cloned().collect();
+        // Determine which contexts to load based on --context flag
+        let context_names: Vec<String> = match &self.context_filter {
+            Some(ctx_name) => {
+                // Verify the context exists
+                if config.contexts.contains_key(ctx_name) {
+                    vec![ctx_name.clone()]
+                } else {
+                    tracing::error!(
+                        "Context '{}' not found in talosconfig. Available contexts: {:?}",
+                        ctx_name,
+                        config.contexts.keys().collect::<Vec<_>>()
+                    );
+                    return Ok(());
+                }
+            }
+            None => config.contexts.keys().cloned().collect(),
+        };
 
         // Create ClusterData for each context
         self.clusters.clear();
@@ -352,12 +389,18 @@ impl ClusterComponent {
                 ..Default::default()
             };
 
-            // Try to connect to each cluster
-            match TalosClient::from_named_context(name).await {
-                Ok(client) => {
-                    cluster.client = Some(client);
-                    cluster.connected = true;
-                }
+            // Try to connect to each cluster using the loaded config
+            match config.get_context(name) {
+                Ok(ctx) => match TalosClient::from_context(ctx).await {
+                    Ok(client) => {
+                        cluster.client = Some(client);
+                        cluster.connected = true;
+                    }
+                    Err(e) => {
+                        cluster.error = Some(e.to_string());
+                        cluster.connected = false;
+                    }
+                },
                 Err(e) => {
                     cluster.error = Some(e.to_string());
                     cluster.connected = false;
@@ -422,7 +465,7 @@ impl ClusterComponent {
         // Try to get discovery members (ALL nodes including workers)
         // Use context-aware async function to avoid blocking and to use correct certificates
         let context_name = cluster.name.clone();
-        match get_discovery_members_for_context(&context_name).await {
+        match get_discovery_members_for_context(&context_name, self.config_path.as_deref()).await {
             Ok(members) => {
                 cluster.node_ips.clear();
                 for member in &members {
@@ -692,6 +735,18 @@ impl ClusterComponent {
         self.clusters.get(self.active_cluster)?.client.as_ref()
     }
 
+    /// Get context name for active cluster
+    pub fn current_context_name(&self) -> Option<&str> {
+        self.clusters
+            .get(self.active_cluster)
+            .map(|c| c.name.as_str())
+    }
+
+    /// Get config path
+    pub fn config_path(&self) -> Option<&str> {
+        self.config_path.as_deref()
+    }
+
     /// Get node_ips for active cluster
     fn node_ips(&self) -> &HashMap<String, String> {
         static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
@@ -792,6 +847,18 @@ impl ClusterComponent {
                         .cloned()
                         .unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowNetwork(node_name, node_ip)))
+                } else {
+                    Ok(None)
+                }
+            }
+            NavMenuItem::Storage => {
+                if let Some(node_name) = self.current_node_name() {
+                    let node_ip = self
+                        .node_ips()
+                        .get(&node_name)
+                        .cloned()
+                        .unwrap_or(node_name.clone());
+                    Ok(Some(Action::ShowStorage(node_name, node_ip)))
                 } else {
                     Ok(None)
                 }
@@ -1020,6 +1087,18 @@ impl Component for ClusterComponent {
                         .cloned()
                         .unwrap_or(node_name.clone());
                     Ok(Some(Action::ShowNetwork(node_name, node_ip)))
+                } else {
+                    Ok(None)
+                }
+            }
+            KeyCode::Char('s') => {
+                if let Some(node_name) = self.current_node_name() {
+                    let node_ip = self
+                        .node_ips()
+                        .get(&node_name)
+                        .cloned()
+                        .unwrap_or(node_name.clone());
+                    Ok(Some(Action::ShowStorage(node_name, node_ip)))
                 } else {
                     Ok(None)
                 }
@@ -1673,7 +1752,14 @@ impl ClusterComponent {
                 .border_style(Style::default().fg(border_color));
 
             // Get control plane IP from talosconfig endpoints
-            let cp_ip = talos_rs::TalosConfig::load_default()
+            let config_result = match &self.config_path {
+                Some(path) => {
+                    let path_buf = std::path::PathBuf::from(path);
+                    TalosConfig::load_from(&path_buf)
+                }
+                None => TalosConfig::load_default(),
+            };
+            let cp_ip = config_result
                 .ok()
                 .and_then(|config| {
                     config

@@ -157,16 +157,19 @@ pub struct LifecycleComponent {
 
     /// K8s client for pod/PDB checks (reusable, not part of loaded data)
     k8s_client: Option<Client>,
+
+    /// Custom config file path (from --config flag)
+    config_path: Option<String>,
 }
 
 impl Default for LifecycleComponent {
     fn default() -> Self {
-        Self::new("".to_string())
+        Self::new("".to_string(), None)
     }
 }
 
 impl LifecycleComponent {
-    pub fn new(context_name: String) -> Self {
+    pub fn new(context_name: String, config_path: Option<String>) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
 
@@ -184,6 +187,7 @@ impl LifecycleComponent {
             auto_refresh: true,
             client: None,
             k8s_client: None,
+            config_path,
         }
     }
 
@@ -225,7 +229,14 @@ impl LifecycleComponent {
                 // Get context name from first node
                 if !versions.is_empty() && data.context_name.is_empty() {
                     // Try to get from talosconfig
-                    if let Ok(config) = talos_rs::TalosConfig::load_default() {
+                    let config_result = match &self.config_path {
+                        Some(path) => {
+                            let path_buf = std::path::PathBuf::from(path);
+                            TalosConfig::load_from(&path_buf)
+                        }
+                        None => TalosConfig::load_default(),
+                    };
+                    if let Ok(config) = config_result {
                         data.context_name = config.context;
                     }
                 }
@@ -256,14 +267,23 @@ impl LifecycleComponent {
         // Fetch discovery members using context-aware async version
         let context_name = if !data.context_name.is_empty() {
             data.context_name.clone()
-        } else if let Ok(config) = TalosConfig::load_default() {
-            config.context
         } else {
-            String::new()
+            let config_result = match &self.config_path {
+                Some(path) => {
+                    let path_buf = std::path::PathBuf::from(path);
+                    TalosConfig::load_from(&path_buf)
+                }
+                None => TalosConfig::load_default(),
+            };
+            config_result
+                .map(|config| config.context)
+                .unwrap_or_default()
         };
 
         if !context_name.is_empty() {
-            match get_discovery_members_for_context(&context_name).await {
+            match get_discovery_members_for_context(&context_name, self.config_path.as_deref())
+                .await
+            {
                 Ok(members) => {
                     data.discovery_members = members;
                 }

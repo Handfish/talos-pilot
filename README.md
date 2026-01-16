@@ -49,6 +49,7 @@ Use **talos-pilot** for "why won't my node join the cluster?"
 | **Multi-Service Logs** | Stern-style interleaved logs from multiple services |
 | **Processes View** | htop-like process list with tree view, CPU/MEM sorting |
 | **Network Stats** | Interface traffic, connections, KubeSpan peers, packet capture |
+| **Storage/Disks** | Disk list with size, transport, serial, system disk indicators |
 | **etcd Status** | Quorum health, member list, alarms, leader tracking |
 | **Workload Health** | K8s deployments, statefulsets, pod issues by namespace |
 | **Lifecycle View** | Version status, config drift detection, cluster alerts |
@@ -122,6 +123,22 @@ talos-pilot --tail 1000
 talos-pilot --debug --log-file ~/talos-pilot.log
 ```
 
+### Bootstrap Wizard (Insecure Mode)
+
+For bootstrapping new clusters on bare metal or VMs in maintenance mode, talos-pilot provides an interactive wizard:
+
+```bash
+# Connect to a node in maintenance mode
+talos-pilot --insecure --endpoint <node-ip>
+```
+
+The wizard guides you through:
+1. **Generate Config** - Creates talosconfig, controlplane.yaml, and worker.yaml
+2. **Apply Config** - Applies configuration to the node, triggering installation
+3. **Bootstrap** - Initializes etcd and starts the Kubernetes cluster
+
+Once complete, you can manage the cluster using standard talos-pilot commands.
+
 ### Keyboard Navigation
 
 | Key | Action |
@@ -141,8 +158,8 @@ talos-pilot --debug --log-file ~/talos-pilot.log
 
 | Key | View | Description |
 |-----|------|-------------|
-| `c` | Cluster | Node overview |
-| `s` | Services | Service list for selected node |
+| `c` | Security | PKI and encryption audit |
+| `s` | Storage | Disk list with system disk indicators |
 | `l` | Logs | Single service logs |
 | `L` | Multi-Logs | Interleaved multi-service logs |
 | `p` | Processes | Process tree view |
@@ -151,7 +168,6 @@ talos-pilot --debug --log-file ~/talos-pilot.log
 | `w` | Workloads | K8s deployment health |
 | `y` | Lifecycle | Version status, alerts |
 | `d` | Diagnostics | System health checks |
-| `S` | Security | PKI and encryption audit |
 | `o` | Operations | Single node operations |
 | `O` | Rolling | Multi-node rolling operations |
 

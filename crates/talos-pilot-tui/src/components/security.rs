@@ -50,6 +50,9 @@ pub struct SecurityComponent {
 
     /// Client for API calls
     client: Option<TalosClient>,
+
+    /// Custom config file path (from --config flag)
+    config_path: Option<String>,
 }
 
 /// A selectable item in the security view
@@ -98,12 +101,12 @@ impl ItemStatus {
 
 impl Default for SecurityComponent {
     fn default() -> Self {
-        Self::new("".to_string())
+        Self::new("".to_string(), None)
     }
 }
 
 impl SecurityComponent {
-    pub fn new(context_name: String) -> Self {
+    pub fn new(context_name: String, config_path: Option<String>) -> Self {
         // Initialize with context name in the data
         let initial_data = SecurityData {
             context_name,
@@ -117,6 +120,7 @@ impl SecurityComponent {
             selected: 0,
             auto_refresh: true,
             client: None,
+            config_path,
         }
     }
 
@@ -143,12 +147,12 @@ impl SecurityComponent {
         let mut data = self.state.take_data().unwrap_or_default();
 
         // Load PKI status from talosconfig
-        Self::load_pki_status_into(&mut data).await;
+        Self::load_pki_status_into(&mut data, self.config_path.as_deref()).await;
 
         // Load kubeconfig certs and encryption status (if client available)
         if let Some(client) = &self.client {
             Self::load_kubeconfig_certs(&mut data, client).await;
-            Self::load_encryption_status_into(&mut data, client).await;
+            Self::load_encryption_status_into(&mut data, self.config_path.as_deref(), client).await;
         }
 
         // Build display items from loaded data
@@ -169,11 +173,18 @@ impl SecurityComponent {
     }
 
     /// Load PKI status from talosconfig (static method)
-    async fn load_pki_status_into(data: &mut SecurityData) {
+    async fn load_pki_status_into(data: &mut SecurityData, config_path: Option<&str>) {
         let mut pki = PkiStatus::default();
 
-        // Load talosconfig
-        match talos_rs::TalosConfig::load_default() {
+        // Load talosconfig - use custom path if provided
+        let config_result = match config_path {
+            Some(path) => {
+                let path_buf = std::path::PathBuf::from(path);
+                talos_rs::TalosConfig::load_from(&path_buf)
+            }
+            None => talos_rs::TalosConfig::load_default(),
+        };
+        match config_result {
             Ok(config) => {
                 // Get context name
                 data.context_name = config.context.clone();
@@ -253,9 +264,20 @@ impl SecurityComponent {
     }
 
     /// Load encryption status from node via talosctl (static method)
-    async fn load_encryption_status_into(data: &mut SecurityData, _client: &TalosClient) {
+    async fn load_encryption_status_into(
+        data: &mut SecurityData,
+        config_path: Option<&str>,
+        _client: &TalosClient,
+    ) {
         // Get the first node from talosconfig to query
-        let node = match talos_rs::TalosConfig::load_default() {
+        let config_result = match config_path {
+            Some(path) => {
+                let path_buf = std::path::PathBuf::from(path);
+                talos_rs::TalosConfig::load_from(&path_buf)
+            }
+            None => talos_rs::TalosConfig::load_default(),
+        };
+        let node = match config_result {
             Ok(config) => {
                 config.current_context().and_then(|ctx| {
                     // Prefer nodes if set, otherwise use first endpoint

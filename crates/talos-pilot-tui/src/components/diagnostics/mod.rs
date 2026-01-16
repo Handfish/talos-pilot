@@ -102,16 +102,23 @@ pub struct DiagnosticsComponent {
     client: Option<TalosClient>,
     /// Control plane endpoint for fetching kubeconfig (used for worker nodes)
     controlplane_endpoint: Option<String>,
+    /// Custom config file path (from --config flag)
+    config_path: Option<String>,
 }
 
 impl Default for DiagnosticsComponent {
     fn default() -> Self {
-        Self::new("".to_string(), "".to_string(), "".to_string())
+        Self::new("".to_string(), "".to_string(), "".to_string(), None)
     }
 }
 
 impl DiagnosticsComponent {
-    pub fn new(hostname: String, address: String, node_role: String) -> Self {
+    pub fn new(
+        hostname: String,
+        address: String,
+        node_role: String,
+        config_path: Option<String>,
+    ) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
 
@@ -144,6 +151,7 @@ impl DiagnosticsComponent {
             auto_refresh: true,
             client: None,
             controlplane_endpoint: None,
+            config_path,
         }
     }
 
@@ -531,7 +539,8 @@ impl DiagnosticsComponent {
             let service_checks = core::run_service_checks(&client, &context).await;
 
             // Run certificate checks and add to system checks
-            let cert_checks = core::run_certificate_checks(&client, &context).await;
+            let cert_checks =
+                core::run_certificate_checks(&client, &context, self.config_path.as_deref()).await;
             system_checks.extend(cert_checks);
 
             // Run CNI-specific checks

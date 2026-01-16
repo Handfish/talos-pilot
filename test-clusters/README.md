@@ -1,6 +1,73 @@
 # Test Clusters
 
-Docker-based Talos clusters for testing talos-pilot features.
+Test Talos clusters for developing and testing talos-pilot features.
+
+## Cluster Types
+
+| Type | Use Case | Physical Disks | Setup Time |
+|------|----------|----------------|------------|
+| Docker | Most development | No | ~30 seconds |
+| QEMU | Storage/Disks view testing | Yes | ~2 minutes |
+
+---
+
+## QEMU Clusters (Physical Disks)
+
+QEMU-based clusters run real VMs with virtual disks that appear as physical devices (`/dev/sda`, etc.). **Required for testing the Storage/Disks view.**
+
+### Quick Start
+
+```bash
+# 1. Stop Docker clusters (they use ports 50000/6443)
+sudo systemctl stop docker
+
+# 2. Create the QEMU cluster (runs in foreground)
+./test-clusters/scripts/test-cluster-qemu.sh create
+
+# 3. In another terminal, wait for "maintenance mode" then:
+./test-clusters/scripts/test-cluster-qemu.sh apply
+
+# 4. Wait for install to complete (watch QEMU window), then:
+./test-clusters/scripts/test-cluster-qemu.sh bootstrap
+
+# 5. Test in talos-pilot
+cargo run
+# Switch to 'talos-qemu' context, select node, press 's' for Storage
+
+# 6. Destroy when done
+./test-clusters/scripts/test-cluster-qemu.sh destroy
+
+# 7. Restart Docker
+sudo systemctl start docker
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `create` | Create VM, download ISO, generate config, start in foreground |
+| `create-bg` | Same as create but runs VM in background |
+| `apply` | Apply config to VM in maintenance mode |
+| `bootstrap` | Bootstrap the cluster after config is applied |
+| `status` | Show cluster status and connection info |
+| `destroy` | Stop VM, delete files, remove talosconfig context |
+| `connect` | Show connection info and useful commands |
+
+### Prerequisites
+
+- `qemu-system-x86_64` installed (`sudo apt install qemu-system-x86`)
+- KVM enabled (`/dev/kvm` accessible, user in `kvm` group)
+- Ports 50000 and 6443 available (stop Docker clusters first)
+
+### Why Not `talosctl cluster create qemu`?
+
+The official command has TLS issues in maintenance mode. Our script works around this by running QEMU directly with user-mode networking.
+
+---
+
+## Docker Clusters (Quick Setup)
+
+Docker-based Talos clusters for testing most features.
 
 ## Quick Start
 

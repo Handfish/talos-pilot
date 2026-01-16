@@ -345,51 +345,38 @@ contexts:
         assert_eq!(ctx.endpoint_url(), None);
     }
 
+    // Note: These tests manipulate environment variables and must run sequentially.
+    // They are combined into a single test to avoid race conditions in parallel execution.
     #[test]
-    fn test_default_path_with_env_var() {
-        // Set TALOSCONFIG environment variable
+    fn test_default_path_env_handling() {
+        use std::sync::Mutex;
+        static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        // Test 1: With env var set
         unsafe {
             std::env::set_var("TALOSCONFIG", "/custom/path/to/talosconfig");
         }
-
         let path = TalosConfig::default_path().unwrap();
         assert_eq!(path, PathBuf::from("/custom/path/to/talosconfig"));
 
-        // Clean up
-        unsafe {
-            std::env::remove_var("TALOSCONFIG");
-        }
-    }
-
-    #[test]
-    fn test_default_path_without_env_var() {
-        // Ensure TALOSCONFIG is not set
-        unsafe {
-            std::env::remove_var("TALOSCONFIG");
-        }
-
-        let path = TalosConfig::default_path().unwrap();
-        let home = dirs_next::home_dir().unwrap();
-        let expected = home.join(".talos").join("config");
-
-        assert_eq!(path, expected);
-    }
-
-    #[test]
-    fn test_default_path_env_var_takes_precedence() {
-        // Set TALOSCONFIG to a custom path
+        // Test 2: Env var takes precedence (different path)
         let custom_path = "/tmp/my-talos-config.yaml";
         unsafe {
             std::env::set_var("TALOSCONFIG", custom_path);
         }
-
         let path = TalosConfig::default_path().unwrap();
         assert_eq!(path, PathBuf::from(custom_path));
         assert!(!path.to_string_lossy().contains(".talos"));
 
-        // Clean up
+        // Test 3: Without env var - falls back to default
         unsafe {
             std::env::remove_var("TALOSCONFIG");
         }
+        let path = TalosConfig::default_path().unwrap();
+        let home = dirs_next::home_dir().unwrap();
+        let expected = home.join(".talos").join("config");
+        assert_eq!(path, expected);
     }
 }

@@ -2,10 +2,11 @@
 
 use crate::action::Action;
 use crate::components::rolling_operations::RollingNodeInfo;
+use crate::components::wizard::{WizardComponent, WizardState};
 use crate::components::{
     ClusterComponent, Component, DiagnosticsComponent, EtcdComponent, LifecycleComponent,
     MultiLogsComponent, NetworkStatsComponent, NodeOperationsComponent, ProcessesComponent,
-    RollingOperationsComponent, SecurityComponent, WorkloadHealthComponent,
+    RollingOperationsComponent, SecurityComponent, StorageComponent, WorkloadHealthComponent,
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
@@ -25,6 +26,7 @@ enum View {
     Security,
     Lifecycle,
     Workloads,
+    Storage,
     NodeOperations,
     RollingOperations,
 }
@@ -53,6 +55,8 @@ pub struct App {
     lifecycle: Option<LifecycleComponent>,
     /// Workload health component (created when viewing workloads)
     workloads: Option<WorkloadHealthComponent>,
+    /// Storage component (created when viewing disks/volumes)
+    storage: Option<StorageComponent>,
     /// Node operations component (overlay for node operations)
     node_operations: Option<NodeOperationsComponent>,
     /// Rolling operations component (overlay for multi-node operations)
@@ -65,6 +69,12 @@ pub struct App {
     action_rx: mpsc::UnboundedReceiver<AsyncResult>,
     #[allow(dead_code)] // Will be used for background log streaming
     action_tx: mpsc::UnboundedSender<AsyncResult>,
+    /// Custom config file path (from --config flag)
+    config_path: Option<String>,
+    /// Whether running in insecure mode (no TLS)
+    insecure: bool,
+    /// Endpoint for insecure mode
+    insecure_endpoint: Option<String>,
 }
 
 /// Results from async operations
@@ -79,17 +89,23 @@ enum AsyncResult {
 
 impl Default for App {
     fn default() -> Self {
-        Self::new(None, 500)
+        Self::new(None, None, 500, false, None)
     }
 }
 
 impl App {
-    pub fn new(context: Option<String>, tail_lines: i32) -> Self {
+    pub fn new(
+        config_path: Option<String>,
+        context: Option<String>,
+        tail_lines: i32,
+        insecure: bool,
+        insecure_endpoint: Option<String>,
+    ) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         Self {
             should_quit: false,
             view: View::Cluster,
-            cluster: ClusterComponent::new(context),
+            cluster: ClusterComponent::new(config_path.clone(), context),
             multi_logs: None,
             etcd: None,
             processes: None,
@@ -98,12 +114,16 @@ impl App {
             security: None,
             lifecycle: None,
             workloads: None,
+            storage: None,
             node_operations: None,
             rolling_operations: None,
             tail_lines,
             tick_rate: Duration::from_millis(100),
             action_rx,
             action_tx,
+            config_path,
+            insecure,
+            insecure_endpoint,
         }
     }
 
@@ -115,13 +135,349 @@ impl App {
         // Initialize terminal
         let mut terminal = tui::init()?;
 
-        // Main loop
-        let result = self.main_loop(&mut terminal).await;
+        // Main loop - choose based on mode
+        let result = if self.insecure {
+            self.insecure_loop(&mut terminal).await
+        } else {
+            self.main_loop(&mut terminal).await
+        };
 
         // Restore terminal
         tui::restore()?;
 
         result
+    }
+
+    /// Insecure mode event loop - Bootstrap Wizard
+    async fn insecure_loop(&mut self, terminal: &mut Tui) -> Result<()> {
+        let endpoint = self
+            .insecure_endpoint
+            .clone()
+            .expect("Insecure mode requires endpoint");
+
+        let mut wizard = WizardComponent::new(endpoint);
+
+        // Connect on startup
+        wizard.connect().await?;
+
+        // Polling interval for wait states
+        let poll_interval = Duration::from_secs(5);
+        let mut last_poll = std::time::Instant::now();
+
+        // Spinner animation interval
+        let spinner_interval = Duration::from_millis(100);
+        let mut last_spinner = std::time::Instant::now();
+
+        loop {
+            // Advance spinner for animations
+            if last_spinner.elapsed() >= spinner_interval {
+                last_spinner = std::time::Instant::now();
+                wizard.data_mut().advance_spinner();
+            }
+
+            // Draw
+            terminal.draw(|frame| {
+                let _ = wizard.draw(frame, frame.area());
+            })?;
+
+            // Handle events with timeout
+            if event::poll(self.tick_rate)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if let Some(action) = wizard.handle_key_event(key)? {
+                            match action {
+                                Action::Quit => {
+                                    self.should_quit = true;
+                                }
+                                Action::WizardGenConfig => {
+                                    self.wizard_generate_config(&mut wizard).await;
+                                }
+                                Action::WizardApplyConfig => {
+                                    self.wizard_apply_config(&mut wizard).await;
+                                }
+                                Action::WizardBootstrap => {
+                                    self.wizard_bootstrap(&mut wizard).await;
+                                }
+                                Action::WizardRetry => {
+                                    wizard.connect().await?;
+                                }
+                                Action::WizardComplete(context) => {
+                                    // Exit wizard - print instructions
+                                    self.should_quit = true;
+                                    if let Some(ctx) = context {
+                                        tracing::info!("Wizard complete. Context: {}", ctx);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Event::Resize(_, _) => {
+                        // Terminal will automatically resize on next draw
+                    }
+                    _ => {}
+                }
+            }
+
+            // Polling for wait states
+            if last_poll.elapsed() >= poll_interval {
+                last_poll = std::time::Instant::now();
+                self.wizard_poll(&mut wizard).await;
+            }
+
+            if self.should_quit {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Generate config in wizard
+    async fn wizard_generate_config(&self, wizard: &mut WizardComponent) {
+        use talos_rs::gen_config;
+
+        // Extract data we need before any mutations
+        let cluster_name = wizard.data().cluster_name.clone();
+        let k8s_endpoint = wizard.data().k8s_endpoint.clone();
+        let output_dir = wizard.data().output_dir.clone();
+        let endpoint = wizard.data().endpoint.clone();
+        // TODO: Use disk with gen_config_with_disk when --install-disk flag support is added
+        let _disk = wizard
+            .data()
+            .selected_disk
+            .as_ref()
+            .map(|d| d.dev_path.clone());
+
+        // Build additional SANs
+        let sans: Vec<&str> = vec![&endpoint, "127.0.0.1"];
+
+        // Generate config
+        // Note: For now we use gen_config without disk selection
+        // TODO: Add gen_config_with_disk that uses --install-disk flag
+        match gen_config(&cluster_name, &k8s_endpoint, &output_dir, Some(&sans), true).await {
+            Ok(result) => {
+                // Merge talosconfig and set endpoint/node
+                let merge_success = self
+                    .wizard_merge_config(&result.talosconfig_path, &cluster_name, &endpoint)
+                    .await;
+
+                if merge_success {
+                    wizard.data_mut().config_result = Some(result);
+                    wizard.data_mut().context_name = Some(cluster_name);
+                    wizard.transition(WizardState::ConfigReady);
+                } else {
+                    wizard.set_error("Failed to merge talosconfig".to_string());
+                }
+            }
+            Err(e) => {
+                wizard.set_error(format!("Failed to generate config: {}", e));
+            }
+        }
+    }
+
+    /// Merge talosconfig into user's config
+    async fn wizard_merge_config(
+        &self,
+        config_path: &str,
+        context_name: &str,
+        endpoint: &str,
+    ) -> bool {
+        use tokio::process::Command;
+
+        // Run: talosctl config merge <path>
+        let merge_output = Command::new("talosctl")
+            .args(["config", "merge", config_path])
+            .output()
+            .await;
+
+        if let Err(e) = &merge_output {
+            tracing::warn!("Failed to run talosctl config merge: {}", e);
+            return false;
+        }
+
+        if let Ok(out) = &merge_output
+            && !out.status.success()
+        {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            tracing::warn!("Failed to merge config: {}", stderr);
+            return false;
+        }
+
+        // Set the endpoint on the context
+        let endpoint_output = Command::new("talosctl")
+            .args(["--context", context_name, "config", "endpoint", endpoint])
+            .output()
+            .await;
+
+        if let Err(e) = &endpoint_output {
+            tracing::warn!("Failed to set endpoint: {}", e);
+            return false;
+        }
+
+        // Set the node on the context
+        let node_output = Command::new("talosctl")
+            .args(["--context", context_name, "config", "node", endpoint])
+            .output()
+            .await;
+
+        if let Err(e) = &node_output {
+            tracing::warn!("Failed to set node: {}", e);
+            return false;
+        }
+
+        true
+    }
+
+    /// Apply config in wizard
+    async fn wizard_apply_config(&self, wizard: &mut WizardComponent) {
+        use std::time::Instant;
+        use talos_rs::apply_config_insecure;
+
+        wizard.transition(WizardState::Applying);
+
+        // Extract values we need before mutating
+        let endpoint = wizard.data().endpoint.clone();
+        let cluster_name = wizard.data().cluster_name.clone();
+        let config_path = {
+            let data = wizard.data();
+            data.config_result.as_ref().map(|r| match data.node_type {
+                crate::components::wizard::NodeType::Controlplane => r.controlplane_path.clone(),
+                crate::components::wizard::NodeType::Worker => r.worker_path.clone(),
+            })
+        };
+
+        if let Some(path) = config_path {
+            match apply_config_insecure(&endpoint, &path).await {
+                Ok(result) => {
+                    if result.success {
+                        // Start waiting for reboot
+                        wizard.data_mut().wait_started = Some(Instant::now());
+                        wizard.data_mut().context_name = Some(cluster_name);
+                        wizard.transition(WizardState::WaitingReboot);
+                    } else {
+                        wizard.set_error(result.message);
+                    }
+                }
+                Err(e) => {
+                    wizard.set_error(format!("Failed to apply config: {}", e));
+                }
+            }
+        } else {
+            wizard.set_error("No config generated".to_string());
+        }
+    }
+
+    /// Bootstrap cluster in wizard
+    async fn wizard_bootstrap(&self, wizard: &mut WizardComponent) {
+        use std::time::Instant;
+        use tokio::process::Command;
+
+        wizard.transition(WizardState::Bootstrapping);
+
+        let context = wizard.data().context_name.clone();
+
+        if let Some(ctx) = context {
+            let output = Command::new("talosctl")
+                .args(["--context", &ctx, "bootstrap"])
+                .output()
+                .await;
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    wizard.data_mut().wait_started = Some(Instant::now());
+                    wizard.transition(WizardState::WaitingHealthy);
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    wizard.set_error(format!("Bootstrap failed: {}", stderr));
+                }
+                Err(e) => {
+                    wizard.set_error(format!("Failed to run bootstrap: {}", e));
+                }
+            }
+        } else {
+            wizard.set_error("No context available for bootstrap".to_string());
+        }
+    }
+
+    /// Poll for state changes in wait states
+    async fn wizard_poll(&self, wizard: &mut WizardComponent) {
+        use tokio::process::Command;
+
+        match wizard.state() {
+            WizardState::WaitingReboot => {
+                // Increment poll attempts
+                wizard.data_mut().poll_attempts += 1;
+
+                // Check if node is back online (with TLS)
+                if let Some(ctx) = wizard.data().context_name.clone() {
+                    let output = Command::new("talosctl")
+                        .args(["--context", &ctx, "version"])
+                        .output()
+                        .await;
+
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            wizard.data_mut().last_poll_error = None;
+                            wizard.transition(WizardState::ReadyToBootstrap);
+                        }
+                        Ok(out) => {
+                            // Command ran but failed - capture error
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            wizard.data_mut().last_poll_error =
+                                Some(stderr.lines().next().unwrap_or("Unknown error").to_string());
+                        }
+                        Err(e) => {
+                            wizard.data_mut().last_poll_error = Some(e.to_string());
+                        }
+                    }
+                }
+
+                // Check for timeout (5 minutes)
+                if let Some(started) = wizard.data().wait_started
+                    && started.elapsed().as_secs() > 300
+                {
+                    wizard.set_error("Timeout waiting for node to reboot".to_string());
+                }
+            }
+            WizardState::WaitingHealthy => {
+                // Increment poll attempts
+                wizard.data_mut().poll_attempts += 1;
+
+                // Check if cluster is healthy
+                if let Some(ctx) = wizard.data().context_name.clone() {
+                    // Check etcd health
+                    let output = Command::new("talosctl")
+                        .args(["--context", &ctx, "etcd", "status"])
+                        .output()
+                        .await;
+
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            wizard.data_mut().last_poll_error = None;
+                            wizard.transition(WizardState::Complete);
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            wizard.data_mut().last_poll_error =
+                                Some(stderr.lines().next().unwrap_or("Unknown error").to_string());
+                        }
+                        Err(e) => {
+                            wizard.data_mut().last_poll_error = Some(e.to_string());
+                        }
+                    }
+                }
+
+                // Check for timeout (5 minutes)
+                if let Some(started) = wizard.data().wait_started
+                    && started.elapsed().as_secs() > 300
+                {
+                    wizard.set_error("Timeout waiting for cluster to become healthy".to_string());
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Main event loop
@@ -175,6 +531,11 @@ impl App {
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads {
                             let _ = workloads.draw(frame, area);
+                        }
+                    }
+                    View::Storage => {
+                        if let Some(storage) = &mut self.storage {
+                            let _ = storage.draw(frame, area);
                         }
                     }
                     View::NodeOperations => {
@@ -252,6 +613,13 @@ impl App {
                             View::Workloads => {
                                 if let Some(workloads) = &mut self.workloads {
                                     workloads.handle_key_event(key)?
+                                } else {
+                                    None
+                                }
+                            }
+                            View::Storage => {
+                                if let Some(storage) = &mut self.storage {
+                                    storage.handle_key_event(key)?
                                 } else {
                                     None
                                 }
@@ -351,6 +719,9 @@ impl App {
                     View::Workloads => {
                         self.workloads = None;
                     }
+                    View::Storage => {
+                        self.storage = None;
+                    }
                     View::NodeOperations => {
                         self.node_operations = None;
                     }
@@ -426,6 +797,13 @@ impl App {
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads
                             && let Some(next_action) = workloads.update(Action::Tick)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Storage => {
+                        if let Some(storage) = &mut self.storage
+                            && let Some(next_action) = storage.update(Action::Tick)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
@@ -519,6 +897,13 @@ impl App {
                             workloads.set_error(e.to_string());
                         }
                     }
+                    View::Storage => {
+                        if let Some(storage) = &mut self.storage
+                            && let Err(e) = storage.refresh().await
+                        {
+                            storage.set_error(e.to_string());
+                        }
+                    }
                     View::NodeOperations => {
                         if let Some(node_ops) = &mut self.node_operations
                             && let Err(e) = node_ops.refresh().await
@@ -579,7 +964,12 @@ impl App {
                 );
 
                 // Create diagnostics component
-                let mut diagnostics = DiagnosticsComponent::new(hostname, address.clone(), role);
+                let mut diagnostics = DiagnosticsComponent::new(
+                    hostname,
+                    address.clone(),
+                    role,
+                    self.config_path.clone(),
+                );
 
                 // Set the control plane endpoint for worker nodes to fetch kubeconfig
                 diagnostics.set_controlplane_endpoint(cp_endpoint);
@@ -685,7 +1075,7 @@ impl App {
                 tracing::info!("Viewing security/certificates");
 
                 // Create security component
-                let mut security = SecurityComponent::new(String::new());
+                let mut security = SecurityComponent::new(String::new(), self.config_path.clone());
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {
@@ -705,7 +1095,8 @@ impl App {
                 tracing::info!("Viewing lifecycle/versions");
 
                 // Create lifecycle component
-                let mut lifecycle = LifecycleComponent::new(String::new());
+                let mut lifecycle =
+                    LifecycleComponent::new(String::new(), self.config_path.clone());
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {
@@ -748,6 +1139,36 @@ impl App {
 
                 self.workloads = Some(workloads);
                 self.view = View::Workloads;
+            }
+            Action::ShowStorage(hostname, address) => {
+                // Switch to storage view for a node
+                tracing::info!(
+                    "ShowStorage: hostname='{}', address='{}'",
+                    hostname,
+                    address
+                );
+
+                // Get context and config from cluster component
+                let context = self.cluster.current_context_name().map(|s| s.to_string());
+                let config_path = self.cluster.config_path().map(|s| s.to_string());
+
+                // Create storage component with context for authentication
+                let mut storage =
+                    StorageComponent::new(hostname, address.clone(), context, config_path);
+
+                // Set the client and refresh data
+                if let Some(client) = self.cluster.client() {
+                    // Create a client configured for this specific node
+                    let node_client = client.with_node(&address);
+                    storage.set_client(node_client);
+                    if let Err(e) = storage.refresh().await {
+                        tracing::error!("Storage refresh error: {:?}", e);
+                        storage.set_error(e.to_string());
+                    }
+                }
+
+                self.storage = Some(storage);
+                self.view = View::Storage;
             }
             Action::ShowNodeOperations(hostname, address, is_controlplane) => {
                 // Show node operations overlay
@@ -865,6 +1286,13 @@ impl App {
                     View::Workloads => {
                         if let Some(workloads) = &mut self.workloads
                             && let Some(next_action) = workloads.update(action)?
+                        {
+                            Box::pin(self.handle_action(next_action)).await?;
+                        }
+                    }
+                    View::Storage => {
+                        if let Some(storage) = &mut self.storage
+                            && let Some(next_action) = storage.update(action)?
                         {
                             Box::pin(self.handle_action(next_action)).await?;
                         }

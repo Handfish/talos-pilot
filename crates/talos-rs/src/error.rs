@@ -21,6 +21,10 @@ pub enum TalosError {
     #[error("Context not found: {0}")]
     ContextNotFound(String),
 
+    /// No endpoints configured for context
+    #[error("No endpoints configured for context: {0}")]
+    NoEndpoints(String),
+
     /// Base64 decoding error
     #[error("Base64 decode error: {0}")]
     Base64Decode(#[from] base64::DecodeError),
