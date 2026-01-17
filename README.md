@@ -227,7 +227,7 @@ See [docs/local-talos-setup.md](docs/local-talos-setup.md) for setting up a loca
 ### Current Stats
 
 - **Core library**: ~1,760 lines across 8 modules
-- **Tests**: 88 total (47 core + 8 TUI + 22 talos-rs + 11 doc)
+- **Tests**: 98 total (47 core + 8 TUI + 32 talos-rs + 11 doc)
 - **Components**: 12 TUI components
 - **Build warnings**: 0
 

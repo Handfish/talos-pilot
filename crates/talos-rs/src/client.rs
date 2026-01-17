@@ -33,12 +33,6 @@ pub struct TalosClient {
     nodes: Vec<String>,
     /// Endpoints from configuration (used to filter out vIPs from node targeting)
     endpoints: Vec<String>,
-    /// Decoded CA certificate PEM for creating additional connections
-    ca_pem: Vec<u8>,
-    /// Decoded client certificate PEM for creating additional connections
-    client_cert_pem: Vec<u8>,
-    /// Decoded client key PEM for creating additional connections
-    client_key_pem: Vec<u8>,
 }
 
 impl TalosClient {
@@ -48,18 +42,10 @@ impl TalosClient {
         let nodes = ctx.target_nodes().to_vec();
         let endpoints = ctx.endpoints.clone();
 
-        // Store certificates for creating additional connections
-        let ca_pem = ctx.ca_pem()?;
-        let client_cert_pem = ctx.client_cert_pem()?;
-        let client_key_pem = ctx.client_key_pem()?;
-
         Ok(Self {
             channel,
             nodes,
             endpoints,
-            ca_pem,
-            client_cert_pem,
-            client_key_pem,
         })
     }
 
@@ -82,41 +68,13 @@ impl TalosClient {
     /// Create a new client targeting a specific node
     ///
     /// This returns a clone of the client with requests directed to the specified node.
-    /// Note: This still uses the original channel (VIP), just with node targeting.
-    /// For direct connections, use `direct_to_node()` instead.
+    /// Uses gRPC metadata to target the node through the VIP/endpoint.
     pub fn with_node(&self, node: &str) -> Self {
         Self {
             channel: self.channel.clone(),
             nodes: vec![node.to_string()],
             endpoints: self.endpoints.clone(),
-            ca_pem: self.ca_pem.clone(),
-            client_cert_pem: self.client_cert_pem.clone(),
-            client_key_pem: self.client_key_pem.clone(),
         }
-    }
-
-    /// Create a new client with a direct connection to a specific node IP
-    ///
-    /// This creates a new gRPC channel directly to the specified node,
-    /// bypassing any VIP or load balancer. Use this when node targeting
-    /// through VIP is unreliable.
-    pub fn direct_to_node(&self, node_ip: &str) -> Result<Self, TalosError> {
-        let endpoint_url = format!("https://{}:50000", node_ip);
-        let channel = crate::auth::create_channel_to_endpoint(
-            &endpoint_url,
-            &self.ca_pem,
-            &self.client_cert_pem,
-            &self.client_key_pem,
-        )?;
-
-        Ok(Self {
-            channel,
-            nodes: vec![node_ip.to_string()],
-            endpoints: vec![endpoint_url],
-            ca_pem: self.ca_pem.clone(),
-            client_cert_pem: self.client_cert_pem.clone(),
-            client_key_pem: self.client_key_pem.clone(),
-        })
     }
 
     /// Get a MachineService client
@@ -157,6 +115,10 @@ impl TalosClient {
     /// Add node targeting metadata to a request
     /// If no explicit nodes are configured, don't add the header
     /// (Talos will respond from the endpoint node itself)
+    ///
+    /// Uses the correct Talos API metadata format:
+    /// - "node" (singular) for single-node targeting (direct proxy)
+    /// - "nodes" (plural) with multiple values for multi-node targeting (aggregated response)
     fn with_nodes<T>(&self, mut request: Request<T>) -> Request<T> {
         // Only add nodes metadata if explicitly configured (not just endpoints)
         // When nodes is empty or same as endpoints, skip the header
@@ -196,10 +158,19 @@ impl TalosClient {
                 .map(|n| n.split(':').next().unwrap_or(n).to_string())
                 .collect();
 
-            if !valid_nodes.is_empty() {
-                let nodes_str = valid_nodes.join(",");
-                if let Ok(value) = nodes_str.parse() {
+            if valid_nodes.len() == 1 {
+                // Single node: use "node" header (direct proxy, no aggregation)
+                if let Ok(value) = valid_nodes[0].parse() {
                     request.metadata_mut().insert("node", value);
+                }
+            } else if !valid_nodes.is_empty() {
+                // Multiple nodes: use "nodes" header with multiple values
+                // Each node must be appended as a separate metadata value (not comma-separated)
+                // This matches the Go client's behavior: md.Set("nodes", nodes...)
+                for node in &valid_nodes {
+                    if let Ok(value) = node.parse() {
+                        request.metadata_mut().append("nodes", value);
+                    }
                 }
             }
         }
@@ -353,165 +324,6 @@ impl TalosClient {
             .collect();
 
         Ok(times)
-    }
-
-    /// Get version information from specific nodes using direct connections
-    ///
-    /// This bypasses VIP/node targeting and connects directly to each node.
-    /// Pass node IPs to query specific nodes.
-    pub async fn version_for_nodes(&self, nodes: &[String]) -> Result<Vec<VersionInfo>, TalosError> {
-        if nodes.is_empty() {
-            // No specific nodes, use standard method
-            return self.version().await;
-        }
-
-        let mut all_versions = Vec::new();
-
-        for node_ip in nodes {
-            let endpoint_url = format!("https://{}:50000", node_ip);
-
-            match crate::auth::create_channel_to_endpoint(
-                &endpoint_url,
-                &self.ca_pem,
-                &self.client_cert_pem,
-                &self.client_key_pem,
-            ) {
-                Ok(channel) => {
-                    let mut client = MachineServiceClient::new(channel);
-                    let request = Request::new(());
-
-                    match client.version(request).await {
-                        Ok(response) => {
-                            let inner = response.into_inner();
-                            for msg in inner.messages {
-                                all_versions.push(VersionInfo {
-                                    node: node_ip.clone(),
-                                    version: msg
-                                        .version
-                                        .as_ref()
-                                        .map(|v| v.tag.clone())
-                                        .unwrap_or_default(),
-                                    sha: msg
-                                        .version
-                                        .as_ref()
-                                        .map(|v| v.sha.clone())
-                                        .unwrap_or_default(),
-                                    built: msg
-                                        .version
-                                        .as_ref()
-                                        .map(|v| v.built.clone())
-                                        .unwrap_or_default(),
-                                    go_version: msg
-                                        .version
-                                        .as_ref()
-                                        .map(|v| v.go_version.clone())
-                                        .unwrap_or_default(),
-                                    os: msg
-                                        .version
-                                        .as_ref()
-                                        .map(|v| v.os.clone())
-                                        .unwrap_or_default(),
-                                    arch: msg
-                                        .version
-                                        .as_ref()
-                                        .map(|v| v.arch.clone())
-                                        .unwrap_or_default(),
-                                    platform: msg
-                                        .platform
-                                        .as_ref()
-                                        .map(|p| p.name.clone())
-                                        .unwrap_or_default(),
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("Failed to get version from {}: {}", node_ip, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to connect to {}: {}", node_ip, e);
-                }
-            }
-        }
-
-        Ok(all_versions)
-    }
-
-    /// Get time synchronization status from specific nodes using direct connections
-    ///
-    /// This bypasses VIP/node targeting and connects directly to each node.
-    pub async fn time_for_nodes(&self, nodes: &[String]) -> Result<Vec<NodeTimeInfo>, TalosError> {
-        use crate::proto::time::time_service_client::TimeServiceClient;
-
-        if nodes.is_empty() {
-            return self.time().await;
-        }
-
-        const SYNC_TOLERANCE_SECS: f64 = 1.0;
-        let mut all_times = Vec::new();
-
-        for node_ip in nodes {
-            let endpoint_url = format!("https://{}:50000", node_ip);
-
-            match crate::auth::create_channel_to_endpoint(
-                &endpoint_url,
-                &self.ca_pem,
-                &self.client_cert_pem,
-                &self.client_key_pem,
-            ) {
-                Ok(channel) => {
-                    let mut client = TimeServiceClient::new(channel);
-                    let request = Request::new(());
-
-                    match client.time(request).await {
-                        Ok(response) => {
-                            let inner = response.into_inner();
-                            for msg in inner.messages {
-                                let local_time = msg.localtime.map(|t| {
-                                    std::time::UNIX_EPOCH
-                                        + std::time::Duration::new(t.seconds as u64, t.nanos as u32)
-                                });
-                                let remote_time = msg.remotetime.map(|t| {
-                                    std::time::UNIX_EPOCH
-                                        + std::time::Duration::new(t.seconds as u64, t.nanos as u32)
-                                });
-
-                                let offset_seconds = match (msg.localtime, msg.remotetime) {
-                                    (Some(local), Some(remote)) => {
-                                        let local_nanos = local.seconds as f64 * 1_000_000_000.0
-                                            + local.nanos as f64;
-                                        let remote_nanos = remote.seconds as f64 * 1_000_000_000.0
-                                            + remote.nanos as f64;
-                                        (local_nanos - remote_nanos) / 1_000_000_000.0
-                                    }
-                                    _ => 0.0,
-                                };
-
-                                let synced = offset_seconds.abs() < SYNC_TOLERANCE_SECS;
-
-                                all_times.push(NodeTimeInfo {
-                                    node: node_ip.clone(),
-                                    server: msg.server,
-                                    local_time,
-                                    remote_time,
-                                    offset_seconds,
-                                    synced,
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("Failed to get time from {}: {}", node_ip, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to connect to {}: {}", node_ip, e);
-                }
-            }
-        }
-
-        Ok(all_times)
     }
 
     /// Get list of services from all configured nodes
@@ -882,92 +694,33 @@ impl TalosClient {
     ///
     /// Pass the IPs from `etcd_members()` to get status from all control planes.
     /// If nodes is empty, queries only the endpoint node.
-    ///
-    /// Note: This makes individual calls to each node rather than using node targeting,
-    /// as node targeting through VIPs can be unreliable.
     pub async fn etcd_status_for_nodes(
         &self,
         nodes: &[String],
     ) -> Result<Vec<EtcdMemberStatus>, TalosError> {
-        if nodes.is_empty() {
-            // No specific nodes, query via current endpoint
-            let mut client = self.machine_client();
-            let request = Request::new(());
-            let response = client.etcd_status(request).await?;
-            return self.parse_etcd_status_response(response.into_inner());
-        }
+        let mut client = self.machine_client();
 
-        tracing::debug!(
-            "etcd_status_for_nodes querying {} nodes individually",
-            nodes.len()
-        );
-
-        // Query each node individually and collect results
-        let mut all_statuses = Vec::new();
-
-        for node_ip in nodes {
-            // Create endpoint URL for this specific node
-            let endpoint_url = format!("https://{}:50000", node_ip);
-            tracing::debug!("Querying etcd status from: {}", endpoint_url);
-
-            // Try to create a direct connection to this node using stored certificates
-            match crate::auth::create_channel_to_endpoint(
-                &endpoint_url,
-                &self.ca_pem,
-                &self.client_cert_pem,
-                &self.client_key_pem,
-            ) {
-                Ok(channel) => {
-                    let mut client = MachineServiceClient::new(channel);
-                    let request = Request::new(());
-
-                    match client.etcd_status(request).await {
-                        Ok(response) => {
-                            if let Ok(statuses) =
-                                self.parse_etcd_status_response(response.into_inner())
-                            {
-                                all_statuses.extend(statuses);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("Failed to get etcd status from {}: {}", node_ip, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to connect to {}: {}", node_ip, e);
+        // Build request with node targeting if specific nodes provided
+        let request = if !nodes.is_empty() {
+            let mut req = Request::new(());
+            // Use proper multi-node targeting via "nodes" header
+            for node in nodes {
+                if let Ok(value) = node.parse() {
+                    req.metadata_mut().append("nodes", value);
                 }
             }
-        }
+            req
+        } else {
+            Request::new(())
+        };
 
-        Ok(all_statuses)
-    }
+        let response = client.etcd_status(request).await?;
+        let inner = response.into_inner();
 
-    /// Parse etcd status response into EtcdMemberStatus structs
-    fn parse_etcd_status_response(
-        &self,
-        response: crate::proto::machine::EtcdStatusResponse,
-    ) -> Result<Vec<EtcdMemberStatus>, TalosError> {
-        tracing::debug!(
-            "etcd_status response: {} messages received",
-            response.messages.len()
-        );
-
-        let statuses: Vec<EtcdMemberStatus> = response
+        let statuses: Vec<EtcdMemberStatus> = inner
             .messages
             .into_iter()
             .filter_map(|msg| {
-                let has_status = msg.member_status.is_some();
-                let node_info = msg
-                    .metadata
-                    .as_ref()
-                    .map(|m| m.hostname.as_str())
-                    .unwrap_or("unknown");
-                tracing::debug!(
-                    "etcd_status message from {}: has_status={}",
-                    node_info,
-                    has_status
-                );
                 msg.member_status.map(|status| EtcdMemberStatus {
                     node: self.node_from_metadata(msg.metadata.as_ref(), 0),
                     member_id: status.member_id,
@@ -984,10 +737,6 @@ impl TalosClient {
             })
             .collect();
 
-        tracing::debug!(
-            "parse_etcd_status_response returning {} statuses",
-            statuses.len()
-        );
         Ok(statuses)
     }
 
@@ -2830,10 +2579,6 @@ mod tests {
             channel,
             nodes,
             endpoints,
-            // Empty certificates - not needed for filtering tests
-            ca_pem: Vec::new(),
-            client_cert_pem: Vec::new(),
-            client_key_pem: Vec::new(),
         }
     }
 
@@ -3094,5 +2839,185 @@ mod tests {
         // If it were accidentally added to nodes, it would be filtered
         // But here, nodes only contains node1, node2 - both should remain
         assert_eq!(filtered, vec!["node1", "node2"]);
+    }
+
+    // =========================================================================
+    // gRPC Metadata Format Tests
+    //
+    // These tests verify the correct gRPC metadata format for node targeting.
+    // This was the root cause of VIP + node targeting failures:
+    //   - WRONG:   insert("node", "node1,node2,node3") - single comma-separated value
+    //   - CORRECT: append("nodes", "node1"), append("nodes", "node2") - multiple values
+    //
+    // Talos Go client behavior:
+    //   - Single node:   md.Set("node", node)        -> one value
+    //   - Multiple nodes: md.Set("nodes", nodes...)  -> multiple values for same key
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_metadata_single_node_uses_node_header() {
+        // Single node should use "node" (singular) header
+        let client = create_test_client(
+            vec!["node1".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        // Should have "node" header (singular), not "nodes"
+        let metadata = request.metadata();
+        assert!(
+            metadata.get("node").is_some(),
+            "Single node should use 'node' header"
+        );
+        assert!(
+            metadata.get("nodes").is_none(),
+            "Single node should NOT use 'nodes' header"
+        );
+        assert_eq!(metadata.get("node").unwrap(), "node1");
+    }
+
+    #[tokio::test]
+    async fn test_metadata_multiple_nodes_uses_nodes_header() {
+        // Multiple nodes should use "nodes" (plural) header
+        let client = create_test_client(
+            vec!["node1".to_string(), "node2".to_string(), "node3".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        // Should have "nodes" header (plural), not "node"
+        let metadata = request.metadata();
+        assert!(
+            metadata.get("node").is_none(),
+            "Multiple nodes should NOT use 'node' header"
+        );
+        assert!(
+            metadata.get("nodes").is_some(),
+            "Multiple nodes should use 'nodes' header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_multiple_nodes_are_separate_values_not_comma_separated() {
+        // CRITICAL: This is the root cause test
+        // Multiple nodes must be separate metadata values, NOT comma-separated
+        // tonic's append() creates multiple values for the same key
+        // This matches Talos Go client's md.Set("nodes", nodes...) behavior
+        let client = create_test_client(
+            vec!["node1".to_string(), "node2".to_string(), "node3".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        let metadata = request.metadata();
+
+        // Get all values for "nodes" header
+        let nodes_values: Vec<&str> = metadata
+            .get_all("nodes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+
+        // Should have 3 separate values, not 1 comma-separated value
+        assert_eq!(
+            nodes_values.len(),
+            3,
+            "Expected 3 separate metadata values, got {}: {:?}",
+            nodes_values.len(),
+            nodes_values
+        );
+
+        // Each value should be a single node, not comma-separated
+        for value in &nodes_values {
+            assert!(
+                !value.contains(','),
+                "Node metadata values should NOT be comma-separated: {}",
+                value
+            );
+        }
+
+        // Verify the actual values
+        assert!(nodes_values.contains(&"node1"));
+        assert!(nodes_values.contains(&"node2"));
+        assert!(nodes_values.contains(&"node3"));
+    }
+
+    #[tokio::test]
+    async fn test_metadata_empty_nodes_no_header() {
+        // Empty nodes should not add any header
+        let client = create_test_client(vec![], vec!["vip.example.com:50000".to_string()]);
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        let metadata = request.metadata();
+        assert!(
+            metadata.get("node").is_none(),
+            "Empty nodes should not add 'node' header"
+        );
+        assert!(
+            metadata.get("nodes").is_none(),
+            "Empty nodes should not add 'nodes' header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_two_nodes_uses_nodes_header() {
+        // Two nodes should use "nodes" (plural) header, not "node"
+        // This is a boundary condition - even 2 nodes should use the plural form
+        let client = create_test_client(
+            vec!["node1".to_string(), "node2".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        let metadata = request.metadata();
+        assert!(
+            metadata.get("node").is_none(),
+            "Two nodes should NOT use 'node' header"
+        );
+        assert!(
+            metadata.get("nodes").is_some(),
+            "Two nodes should use 'nodes' header"
+        );
+
+        let nodes_values: Vec<&str> = metadata
+            .get_all("nodes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(nodes_values.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_preserves_node_names_without_ports() {
+        // Port stripping happens before metadata is set
+        let client = create_test_client(
+            vec!["node1:50000".to_string(), "node2:50000".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        let metadata = request.metadata();
+        let nodes_values: Vec<&str> = metadata
+            .get_all("nodes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+
+        // Ports should be stripped
+        assert!(nodes_values.contains(&"node1"));
+        assert!(nodes_values.contains(&"node2"));
+        assert!(!nodes_values.iter().any(|v| v.contains(':')));
     }
 }

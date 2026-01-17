@@ -34,38 +34,29 @@ pub async fn create_channel(ctx: &Context) -> Result<Channel, TalosError> {
         .endpoint_url()
         .ok_or_else(|| TalosError::ConfigInvalid("No endpoints configured".to_string()))?;
 
+    tracing::debug!("Connecting to endpoint: {}", endpoint_url);
+
     // Decode certificates from base64
     let ca_pem = ctx.ca_pem()?;
     let client_cert_pem = ctx.client_cert_pem()?;
     let client_key_pem = ctx.client_key_pem()?;
 
-    create_channel_to_endpoint(&endpoint_url, &ca_pem, &client_cert_pem, &client_key_pem)
-}
-
-/// Create a TLS-enabled gRPC channel to a specific endpoint using provided certificates
-pub fn create_channel_to_endpoint(
-    endpoint_url: &str,
-    ca_pem: &[u8],
-    client_cert_pem: &[u8],
-    client_key_pem: &[u8],
-) -> Result<Channel, TalosError> {
-    tracing::debug!("Connecting to endpoint: {}", endpoint_url);
     tracing::debug!("CA cert size: {} bytes", ca_pem.len());
     tracing::debug!("Client cert size: {} bytes", client_cert_pem.len());
     tracing::debug!("Client key size: {} bytes", client_key_pem.len());
 
     // Convert Ed25519 key header to standard PKCS8 format if needed
     // Tonic expects "PRIVATE KEY" not "ED25519 PRIVATE KEY"
-    let client_key_pem = convert_ed25519_key_to_pkcs8(client_key_pem);
+    let client_key_pem = convert_ed25519_key_to_pkcs8(&client_key_pem);
 
     // Create TLS config
-    let ca = Certificate::from_pem(ca_pem);
-    let identity = Identity::from_pem(client_cert_pem, &client_key_pem);
+    let ca = Certificate::from_pem(&ca_pem);
+    let identity = Identity::from_pem(&client_cert_pem, &client_key_pem);
 
     let tls_config = ClientTlsConfig::new().ca_certificate(ca).identity(identity);
 
     // Build the channel (use connect_lazy to defer TLS handshake)
-    let endpoint = Channel::from_shared(endpoint_url.to_string())
+    let endpoint = Channel::from_shared(endpoint_url.clone())
         .map_err(|e| {
             TalosError::Connection(format!("Invalid endpoint URL '{}': {}", endpoint_url, e))
         })?
@@ -75,7 +66,7 @@ pub fn create_channel_to_endpoint(
     // Use connect_lazy - connection happens on first request
     let channel = endpoint.connect_lazy();
 
-    tracing::debug!("Successfully created channel to {}", endpoint_url);
+    tracing::debug!("Successfully connected to {}", endpoint_url);
     Ok(channel)
 }
 

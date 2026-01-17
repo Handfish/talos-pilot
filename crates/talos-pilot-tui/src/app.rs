@@ -930,27 +930,22 @@ impl App {
 
                 // Fetch logs from active services and set up client for streaming
                 if let Some(client) = self.cluster.client() {
-                    // Create a direct connection to the node (bypasses VIP issues)
-                    match client.direct_to_node(&node_ip) {
-                        Ok(node_client) => {
-                            // Set the client for streaming capability
-                            multi_logs.set_client(node_client.clone(), self.tail_lines);
+                    // Use node targeting through VIP
+                    let node_client = client.with_node(&node_ip);
 
-                            let service_refs: Vec<&str> =
-                                active_services.iter().map(|s| s.as_str()).collect();
-                            match node_client.logs_multi(&service_refs, self.tail_lines).await {
-                                Ok(logs) => {
-                                    multi_logs.set_logs(logs);
-                                    // Auto-start streaming for live updates
-                                    multi_logs.start_streaming();
-                                }
-                                Err(e) => {
-                                    multi_logs.set_error(e.to_string());
-                                }
-                            }
+                    // Set the client for streaming capability
+                    multi_logs.set_client(node_client.clone(), self.tail_lines);
+
+                    let service_refs: Vec<&str> =
+                        active_services.iter().map(|s| s.as_str()).collect();
+                    match node_client.logs_multi(&service_refs, self.tail_lines).await {
+                        Ok(logs) => {
+                            multi_logs.set_logs(logs);
+                            // Auto-start streaming for live updates
+                            multi_logs.start_streaming();
                         }
                         Err(e) => {
-                            multi_logs.set_error(format!("Failed to connect to node: {}", e));
+                            multi_logs.set_error(e.to_string());
                         }
                     }
                 }
