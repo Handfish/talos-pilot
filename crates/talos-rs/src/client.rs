@@ -671,11 +671,30 @@ impl TalosClient {
     /// Get etcd status from control plane nodes
     /// Returns status for each etcd member that responds
     ///
-    /// Note: We don't use node targeting because etcd only runs on control plane nodes.
+    /// Use `etcd_status_for_nodes()` if you need to target specific control plane nodes.
     pub async fn etcd_status(&self) -> Result<Vec<EtcdMemberStatus>, TalosError> {
+        self.etcd_status_for_nodes(&[]).await
+    }
+
+    /// Get etcd status from specific control plane nodes
+    ///
+    /// Pass the hostnames from `etcd_members()` to get status from all control planes.
+    /// If nodes is empty, queries only the endpoint node.
+    pub async fn etcd_status_for_nodes(
+        &self,
+        nodes: &[String],
+    ) -> Result<Vec<EtcdMemberStatus>, TalosError> {
         let mut client = self.machine_client();
-        // Don't use with_nodes() - etcd only runs on control plane
-        let request = Request::new(());
+
+        let mut request = Request::new(());
+
+        // Add node targeting if specific nodes provided
+        if !nodes.is_empty() {
+            let nodes_str = nodes.join(",");
+            request
+                .metadata_mut()
+                .insert("nodes", nodes_str.parse().unwrap());
+        }
 
         let response = client.etcd_status(request).await?;
         let inner = response.into_inner();
