@@ -24,42 +24,99 @@ pub enum K8sError {
     ApiError(String),
 }
 
+/// Source of the kubeconfig used to create the K8s client
+#[derive(Debug, Clone)]
+pub enum KubeconfigSource {
+    /// From KUBECONFIG environment variable or default path (~/.kube/config)
+    Environment,
+    /// Fetched from a specific Talos control plane node
+    TalosNode(String),
+    /// Source unknown or unavailable
+    Unavailable(String),
+}
+
 /// Create a Kubernetes client from Talos-provided kubeconfig
 ///
 /// If `kubeconfig_client` is provided, it will be used to fetch the kubeconfig.
 /// This is useful when diagnosing worker nodes that don't have the kubeconfig endpoint.
 pub async fn create_k8s_client(talos_client: &TalosClient) -> Result<Client, K8sError> {
-    create_k8s_client_with_kubeconfig_source(talos_client, None).await
+    let (client, _source) = create_k8s_client_with_source(talos_client, None, None).await?;
+    Ok(client)
 }
 
-/// Create a Kubernetes client, optionally using a different client to fetch kubeconfig
+/// Create a Kubernetes client and return the source of the kubeconfig
 ///
-/// This allows fetching kubeconfig from a control plane node while diagnosing a worker node.
-///
-/// The function tries sources in this order:
+/// This function tries sources in this order:
 /// 1. KUBECONFIG environment variable (via Config::infer())
-/// 2. Fetching kubeconfig from Talos API (fallback)
-pub async fn create_k8s_client_with_kubeconfig_source(
-    _talos_client: &TalosClient,
+/// 2. Fetching kubeconfig from a specific control plane node (if cp_node_ip provided)
+/// 3. Fetching kubeconfig from Talos API via VIP (fallback, may fail with multiple nodes)
+///
+/// # Arguments
+/// * `talos_client` - The main Talos client (connected to VIP or endpoint)
+/// * `cp_node_ip` - Optional control plane node IP to target for kubeconfig fetch
+/// * `kubeconfig_client` - Optional pre-configured client targeting a control plane node
+///
+/// # Returns
+/// A tuple of (Client, KubeconfigSource) on success
+pub async fn create_k8s_client_with_source(
+    talos_client: &TalosClient,
+    cp_node_ip: Option<&str>,
     kubeconfig_client: Option<&TalosClient>,
-) -> Result<Client, K8sError> {
+) -> Result<(Client, KubeconfigSource), K8sError> {
     // Try KUBECONFIG environment variable first (via Config::infer())
     // This respects standard K8s tooling conventions
     if let Ok(config) = Config::infer().await
         && let Ok(client) = Client::try_from(config)
     {
         tracing::debug!("Using kubeconfig from environment (KUBECONFIG or default path)");
-        return Ok(client);
+        return Ok((client, KubeconfigSource::Environment));
     }
 
-    // Fall back to fetching kubeconfig from Talos API
-    tracing::debug!("Falling back to fetching kubeconfig from Talos API");
+    tracing::debug!("KUBECONFIG not available, falling back to Talos API");
 
-    // Use the provided kubeconfig_client if available, otherwise use the main client
-    let client_for_kubeconfig = kubeconfig_client.unwrap_or(_talos_client);
+    // If a specific control plane node IP is provided, target that node
+    if let Some(node_ip) = cp_node_ip {
+        tracing::debug!("Targeting control plane node {} for kubeconfig", node_ip);
+        let node_client = talos_client.with_node(node_ip);
+        match fetch_kubeconfig_from_client(&node_client).await {
+            Ok(client) => {
+                return Ok((client, KubeconfigSource::TalosNode(node_ip.to_string())));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch kubeconfig from node {}: {}", node_ip, e);
+                // Fall through to try other methods
+            }
+        }
+    }
 
+    // Try the provided kubeconfig_client if available
+    if let Some(kc_client) = kubeconfig_client {
+        tracing::debug!("Trying provided kubeconfig client");
+        match fetch_kubeconfig_from_client(kc_client).await {
+            Ok(client) => {
+                return Ok((
+                    client,
+                    KubeconfigSource::TalosNode("control-plane".to_string()),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch kubeconfig from provided client: {}", e);
+            }
+        }
+    }
+
+    // Last resort: try the main client (may fail with multiple nodes configured)
+    tracing::debug!("Trying main Talos client for kubeconfig (may fail with multiple nodes)");
+    match fetch_kubeconfig_from_client(talos_client).await {
+        Ok(client) => Ok((client, KubeconfigSource::TalosNode("vip".to_string()))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Fetch kubeconfig from a specific Talos client and create a K8s client
+async fn fetch_kubeconfig_from_client(client: &TalosClient) -> Result<Client, K8sError> {
     // Get kubeconfig from Talos
-    let kubeconfig_yaml = client_for_kubeconfig
+    let kubeconfig_yaml = client
         .kubeconfig()
         .await
         .map_err(|e| K8sError::KubeconfigFetch(e.to_string()))?;
@@ -75,6 +132,19 @@ pub async fn create_k8s_client_with_kubeconfig_source(
 
     // Create client
     Client::try_from(config).map_err(|e| K8sError::ClientCreate(e.to_string()))
+}
+
+/// Create a Kubernetes client, optionally using a different client to fetch kubeconfig
+///
+/// This allows fetching kubeconfig from a control plane node while diagnosing a worker node.
+/// Legacy function - prefer create_k8s_client_with_source for new code.
+pub async fn create_k8s_client_with_kubeconfig_source(
+    talos_client: &TalosClient,
+    kubeconfig_client: Option<&TalosClient>,
+) -> Result<Client, K8sError> {
+    let (client, _source) =
+        create_k8s_client_with_source(talos_client, None, kubeconfig_client).await?;
+    Ok(client)
 }
 
 /// Detected CNI information from K8s

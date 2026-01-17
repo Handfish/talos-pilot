@@ -68,6 +68,7 @@ impl TalosClient {
     /// Create a new client targeting a specific node
     ///
     /// This returns a clone of the client with requests directed to the specified node.
+    /// Uses gRPC metadata to target the node through the VIP/endpoint.
     pub fn with_node(&self, node: &str) -> Self {
         Self {
             channel: self.channel.clone(),
@@ -114,6 +115,10 @@ impl TalosClient {
     /// Add node targeting metadata to a request
     /// If no explicit nodes are configured, don't add the header
     /// (Talos will respond from the endpoint node itself)
+    ///
+    /// Uses the correct Talos API metadata format:
+    /// - "node" (singular) for single-node targeting (direct proxy)
+    /// - "nodes" (plural) with multiple values for multi-node targeting (aggregated response)
     fn with_nodes<T>(&self, mut request: Request<T>) -> Request<T> {
         // Only add nodes metadata if explicitly configured (not just endpoints)
         // When nodes is empty or same as endpoints, skip the header
@@ -153,10 +158,19 @@ impl TalosClient {
                 .map(|n| n.split(':').next().unwrap_or(n).to_string())
                 .collect();
 
-            if !valid_nodes.is_empty() {
-                let nodes_str = valid_nodes.join(",");
-                if let Ok(value) = nodes_str.parse() {
-                    request.metadata_mut().insert("nodes", value);
+            if valid_nodes.len() == 1 {
+                // Single node: use "node" header (direct proxy, no aggregation)
+                if let Ok(value) = valid_nodes[0].parse() {
+                    request.metadata_mut().insert("node", value);
+                }
+            } else if !valid_nodes.is_empty() {
+                // Multiple nodes: use "nodes" header with multiple values
+                // Each node must be appended as a separate metadata value (not comma-separated)
+                // This matches the Go client's behavior: md.Set("nodes", nodes...)
+                for node in &valid_nodes {
+                    if let Ok(value) = node.parse() {
+                        request.metadata_mut().append("nodes", value);
+                    }
                 }
             }
         }
@@ -678,7 +692,7 @@ impl TalosClient {
 
     /// Get etcd status from specific control plane nodes
     ///
-    /// Pass the hostnames from `etcd_members()` to get status from all control planes.
+    /// Pass the IPs from `etcd_members()` to get status from all control planes.
     /// If nodes is empty, queries only the endpoint node.
     pub async fn etcd_status_for_nodes(
         &self,
@@ -686,15 +700,19 @@ impl TalosClient {
     ) -> Result<Vec<EtcdMemberStatus>, TalosError> {
         let mut client = self.machine_client();
 
-        let mut request = Request::new(());
-
-        // Add node targeting if specific nodes provided
-        if !nodes.is_empty() {
-            let nodes_str = nodes.join(",");
-            request
-                .metadata_mut()
-                .insert("nodes", nodes_str.parse().unwrap());
-        }
+        // Build request with node targeting if specific nodes provided
+        let request = if !nodes.is_empty() {
+            let mut req = Request::new(());
+            // Use proper multi-node targeting via "nodes" header
+            for node in nodes {
+                if let Ok(value) = node.parse() {
+                    req.metadata_mut().append("nodes", value);
+                }
+            }
+            req
+        } else {
+            Request::new(())
+        };
 
         let response = client.etcd_status(request).await?;
         let inner = response.into_inner();
@@ -2821,5 +2839,193 @@ mod tests {
         // If it were accidentally added to nodes, it would be filtered
         // But here, nodes only contains node1, node2 - both should remain
         assert_eq!(filtered, vec!["node1", "node2"]);
+    }
+
+    // =========================================================================
+    // gRPC Metadata Format Tests
+    //
+    // These tests verify the correct gRPC metadata format for node targeting.
+    // This was the root cause of VIP + node targeting failures:
+    //   - WRONG:   insert("node", "node1,node2,node3") - single comma-separated value
+    //   - CORRECT: append("nodes", "node1"), append("nodes", "node2") - multiple values
+    //
+    // Talos Go client behavior:
+    //   - Single node:   md.Set("node", node)        -> one value
+    //   - Multiple nodes: md.Set("nodes", nodes...)  -> multiple values for same key
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_metadata_single_node_uses_node_header() {
+        // Single node should use "node" (singular) header
+        let client = create_test_client(
+            vec!["node1".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        // Should have "node" header (singular), not "nodes"
+        let metadata = request.metadata();
+        assert!(
+            metadata.get("node").is_some(),
+            "Single node should use 'node' header"
+        );
+        assert!(
+            metadata.get("nodes").is_none(),
+            "Single node should NOT use 'nodes' header"
+        );
+        assert_eq!(metadata.get("node").unwrap(), "node1");
+    }
+
+    #[tokio::test]
+    async fn test_metadata_multiple_nodes_uses_nodes_header() {
+        // Multiple nodes should use "nodes" (plural) header
+        let client = create_test_client(
+            vec![
+                "node1".to_string(),
+                "node2".to_string(),
+                "node3".to_string(),
+            ],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        // Should have "nodes" header (plural), not "node"
+        let metadata = request.metadata();
+        assert!(
+            metadata.get("node").is_none(),
+            "Multiple nodes should NOT use 'node' header"
+        );
+        assert!(
+            metadata.get("nodes").is_some(),
+            "Multiple nodes should use 'nodes' header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_multiple_nodes_are_separate_values_not_comma_separated() {
+        // CRITICAL: This is the root cause test
+        // Multiple nodes must be separate metadata values, NOT comma-separated
+        // tonic's append() creates multiple values for the same key
+        // This matches Talos Go client's md.Set("nodes", nodes...) behavior
+        let client = create_test_client(
+            vec![
+                "node1".to_string(),
+                "node2".to_string(),
+                "node3".to_string(),
+            ],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        let metadata = request.metadata();
+
+        // Get all values for "nodes" header
+        let nodes_values: Vec<&str> = metadata
+            .get_all("nodes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+
+        // Should have 3 separate values, not 1 comma-separated value
+        assert_eq!(
+            nodes_values.len(),
+            3,
+            "Expected 3 separate metadata values, got {}: {:?}",
+            nodes_values.len(),
+            nodes_values
+        );
+
+        // Each value should be a single node, not comma-separated
+        for value in &nodes_values {
+            assert!(
+                !value.contains(','),
+                "Node metadata values should NOT be comma-separated: {}",
+                value
+            );
+        }
+
+        // Verify the actual values
+        assert!(nodes_values.contains(&"node1"));
+        assert!(nodes_values.contains(&"node2"));
+        assert!(nodes_values.contains(&"node3"));
+    }
+
+    #[tokio::test]
+    async fn test_metadata_empty_nodes_no_header() {
+        // Empty nodes should not add any header
+        let client = create_test_client(vec![], vec!["vip.example.com:50000".to_string()]);
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        let metadata = request.metadata();
+        assert!(
+            metadata.get("node").is_none(),
+            "Empty nodes should not add 'node' header"
+        );
+        assert!(
+            metadata.get("nodes").is_none(),
+            "Empty nodes should not add 'nodes' header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_two_nodes_uses_nodes_header() {
+        // Two nodes should use "nodes" (plural) header, not "node"
+        // This is a boundary condition - even 2 nodes should use the plural form
+        let client = create_test_client(
+            vec!["node1".to_string(), "node2".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        let metadata = request.metadata();
+        assert!(
+            metadata.get("node").is_none(),
+            "Two nodes should NOT use 'node' header"
+        );
+        assert!(
+            metadata.get("nodes").is_some(),
+            "Two nodes should use 'nodes' header"
+        );
+
+        let nodes_values: Vec<&str> = metadata
+            .get_all("nodes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(nodes_values.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_preserves_node_names_without_ports() {
+        // Port stripping happens before metadata is set
+        let client = create_test_client(
+            vec!["node1:50000".to_string(), "node2:50000".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let request: Request<()> = Request::new(());
+        let request = client.with_nodes(request);
+
+        let metadata = request.metadata();
+        let nodes_values: Vec<&str> = metadata
+            .get_all("nodes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+
+        // Ports should be stripped
+        assert!(nodes_values.contains(&"node1"));
+        assert!(nodes_values.contains(&"node2"));
+        assert!(!nodes_values.iter().any(|v| v.contains(':')));
     }
 }

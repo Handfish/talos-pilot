@@ -686,13 +686,12 @@ impl NodeOperationsComponent {
                     .iter()
                     .any(|m| m.peer_urls.iter().any(|url| url.contains(node_addr)));
 
-                // Extract control plane hostnames to target status calls
-                let cp_hostnames: Vec<String> =
-                    members.iter().map(|m| m.hostname.clone()).collect();
+                // Extract control plane IPs to target status calls (hostnames may not be resolvable)
+                let cp_ips: Vec<String> = members.iter().filter_map(|m| m.ip_address()).collect();
 
                 // Get status from all control planes (single call for both is_leader and healthy)
                 let statuses = client
-                    .etcd_status_for_nodes(&cp_hostnames)
+                    .etcd_status_for_nodes(&cp_ips)
                     .await
                     .unwrap_or_default();
 

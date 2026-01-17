@@ -922,7 +922,7 @@ impl App {
 
                 // Create multi-logs component with all services, marking active ones
                 let mut multi_logs = MultiLogsComponent::new(
-                    node_ip,
+                    node_ip.clone(),
                     node_role,
                     active_services.clone(),
                     all_services,
@@ -930,12 +930,15 @@ impl App {
 
                 // Fetch logs from active services and set up client for streaming
                 if let Some(client) = self.cluster.client() {
+                    // Use node targeting through VIP
+                    let node_client = client.with_node(&node_ip);
+
                     // Set the client for streaming capability
-                    multi_logs.set_client(client.clone(), self.tail_lines);
+                    multi_logs.set_client(node_client.clone(), self.tail_lines);
 
                     let service_refs: Vec<&str> =
                         active_services.iter().map(|s| s.as_str()).collect();
-                    match client.logs_multi(&service_refs, self.tail_lines).await {
+                    match node_client.logs_multi(&service_refs, self.tail_lines).await {
                         Ok(logs) => {
                             multi_logs.set_logs(logs);
                             // Auto-start streaming for live updates

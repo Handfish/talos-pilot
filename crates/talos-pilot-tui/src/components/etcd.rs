@@ -127,20 +127,14 @@ impl EtcdComponent {
             }
         };
 
-        // Step 2: Extract control plane hostnames from members
-        let cp_hostnames: Vec<String> = member_infos.iter().map(|m| m.hostname.clone()).collect();
+        // Step 2: Extract control plane IPs from members (hostnames may not be resolvable)
+        let cp_ips: Vec<String> = member_infos.iter().filter_map(|m| m.ip_address()).collect();
 
-        tracing::debug!(
-            "Fetching etcd status from control planes: {:?}",
-            cp_hostnames
-        );
+        tracing::debug!("Fetching etcd status from control planes: {:?}", cp_ips);
 
-        // Step 3: Fetch status (targeting all CPs) and alarms in parallel
+        // Step 3: Fetch status (targeting all CPs by IP) and alarms in parallel
         let fetch_result = tokio::time::timeout(timeout, async {
-            tokio::join!(
-                client.etcd_status_for_nodes(&cp_hostnames),
-                client.etcd_alarms()
-            )
+            tokio::join!(client.etcd_status_for_nodes(&cp_ips), client.etcd_alarms())
         })
         .await;
 
@@ -599,13 +593,13 @@ impl Component for EtcdComponent {
                 if data.members.is_empty() {
                     return Ok(None);
                 }
-                // Use first member's hostname as the "node" but show all etcd services
+                // Use first member's IP as the "node" (hostnames may not be resolvable)
                 // In practice, with the current API this shows etcd logs from all connected nodes
                 let node = data
                     .members
                     .items()
                     .first()
-                    .map(|m| m.info.hostname.clone())
+                    .and_then(|m| m.info.ip_address())
                     .unwrap_or_else(|| "controlplane".to_string());
                 let etcd_vec = vec!["etcd".to_string()];
                 Ok(Some(Action::ShowMultiLogs(
@@ -617,10 +611,14 @@ impl Component for EtcdComponent {
             }
             KeyCode::Enter => {
                 // View etcd logs for selected member
+                // Use IP address since hostnames may not be resolvable
                 if let Some(data) = self.data()
                     && let Some(member) = data.members.selected()
                 {
-                    let node = member.info.hostname.clone();
+                    let node = member
+                        .info
+                        .ip_address()
+                        .unwrap_or_else(|| member.info.hostname.clone());
                     let etcd_vec = vec!["etcd".to_string()];
                     return Ok(Some(Action::ShowMultiLogs(
                         node,

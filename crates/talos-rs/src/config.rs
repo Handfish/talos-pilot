@@ -36,16 +36,23 @@ impl TalosConfig {
     /// Load configuration from the default location (~/.talos/config)
     pub fn load_default() -> Result<Self, TalosError> {
         let path = Self::default_path()?;
+        tracing::debug!("Loading talosconfig from: {:?}", path);
         Self::load_from(&path)
     }
 
     /// Load configuration from a specific path
     pub fn load_from(path: &PathBuf) -> Result<Self, TalosError> {
+        tracing::debug!("load_from called with path: {:?}", path);
         if !path.exists() {
             return Err(TalosError::ConfigNotFound(path.display().to_string()));
         }
         let content = std::fs::read_to_string(path)?;
         let config: TalosConfig = serde_yaml::from_str(&content)?;
+        tracing::debug!(
+            "Loaded config with {} contexts: {:?}",
+            config.contexts.len(),
+            config.contexts.keys().collect::<Vec<_>>()
+        );
         Ok(config)
     }
 
@@ -53,9 +60,11 @@ impl TalosConfig {
     pub fn default_path() -> Result<PathBuf, TalosError> {
         // Check if TALOSCONFIG environment variable is set
         if let Ok(talosconfig) = std::env::var("TALOSCONFIG") {
+            tracing::debug!("TALOSCONFIG env var found: {}", talosconfig);
             return Ok(PathBuf::from(talosconfig));
         }
 
+        tracing::debug!("TALOSCONFIG env var not set, using default path");
         // Fallback to default location
         let home = dirs_next::home_dir().ok_or(TalosError::NoHomeDirectory)?;
         Ok(home.join(".talos").join("config"))

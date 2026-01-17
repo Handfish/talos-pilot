@@ -573,12 +573,13 @@ impl ClusterComponent {
 
                 // Fetch etcd status for header summary (target all control planes)
                 if let Some(client) = &cluster.client {
-                    let cp_hostnames: Vec<String> = cluster
+                    // Use IPs instead of hostnames (hostnames may not be resolvable)
+                    let cp_ips: Vec<String> = cluster
                         .etcd_members
                         .iter()
-                        .map(|m| m.hostname.clone())
+                        .filter_map(|m| m.ip_address())
                         .collect();
-                    if let Ok(statuses) = client.etcd_status_for_nodes(&cp_hostnames).await {
+                    if let Ok(statuses) = client.etcd_status_for_nodes(&cp_ips).await {
                         let total = cluster.etcd_members.len();
                         let healthy = statuses.len();
                         let quorum_needed = total / 2 + 1;
@@ -830,8 +831,13 @@ impl ClusterComponent {
                     let service_ids = self.current_service_ids();
                     if !service_ids.is_empty() {
                         let node_role = self.current_node_role();
+                        let node_ip = self
+                            .node_ips()
+                            .get(&node_name)
+                            .cloned()
+                            .unwrap_or(node_name.clone());
                         Ok(Some(Action::ShowMultiLogs(
-                            node_name,
+                            node_ip,
                             node_role,
                             service_ids.clone(),
                             service_ids,
@@ -1009,8 +1015,13 @@ impl Component for ClusterComponent {
                                     let service_ids = self.current_service_ids();
                                     if !service_ids.is_empty() {
                                         let node_role = self.current_node_role();
+                                        let node_ip = self
+                                            .node_ips()
+                                            .get(&node_name)
+                                            .cloned()
+                                            .unwrap_or(node_name.clone());
                                         Ok(Some(Action::ShowMultiLogs(
-                                            node_name,
+                                            node_ip,
                                             node_role,
                                             service_ids.clone(),
                                             service_ids,
@@ -1034,8 +1045,13 @@ impl Component for ClusterComponent {
                             if let Some(service_id) = self.selected_service_id() {
                                 let node_role = self.current_node_role();
                                 let all_services = self.current_service_ids();
+                                let node_ip = self
+                                    .node_ips()
+                                    .get(&node_name)
+                                    .cloned()
+                                    .unwrap_or(node_name.clone());
                                 Ok(Some(Action::ShowMultiLogs(
-                                    node_name,
+                                    node_ip,
                                     node_role,
                                     vec![service_id],
                                     all_services,
@@ -1056,8 +1072,13 @@ impl Component for ClusterComponent {
                     let service_ids = self.current_service_ids();
                     if !service_ids.is_empty() {
                         let node_role = self.current_node_role();
+                        let node_ip = self
+                            .node_ips()
+                            .get(&node_name)
+                            .cloned()
+                            .unwrap_or(node_name.clone());
                         Ok(Some(Action::ShowMultiLogs(
-                            node_name,
+                            node_ip,
                             node_role,
                             service_ids.clone(),
                             service_ids,
