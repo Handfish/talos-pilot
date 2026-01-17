@@ -127,6 +127,8 @@ talos-pilot --debug --log-file ~/talos-pilot.log
 
 For bootstrapping new clusters on bare metal or VMs in maintenance mode, talos-pilot provides an interactive wizard:
 
+https://github.com/user-attachments/assets/0955b5a9-e35d-4fc6-a53d-db16e4558fc9
+
 ```bash
 # Connect to a node in maintenance mode
 talos-pilot --insecure --endpoint <node-ip>
