@@ -571,18 +571,23 @@ impl ClusterComponent {
                 cluster.load_avg = load_avg;
                 cluster.cpu_info = cpu_info;
 
-                // Fetch etcd status for header summary
-                if let Some(client) = &cluster.client
-                    && let Ok(statuses) = client.etcd_status().await
-                {
-                    let total = cluster.etcd_members.len();
-                    let healthy = statuses.len();
-                    let quorum_needed = total / 2 + 1;
-                    cluster.etcd_summary = Some(EtcdSummary {
-                        healthy,
-                        total,
-                        has_quorum: healthy >= quorum_needed,
-                    });
+                // Fetch etcd status for header summary (target all control planes)
+                if let Some(client) = &cluster.client {
+                    let cp_hostnames: Vec<String> = cluster
+                        .etcd_members
+                        .iter()
+                        .map(|m| m.hostname.clone())
+                        .collect();
+                    if let Ok(statuses) = client.etcd_status_for_nodes(&cp_hostnames).await {
+                        let total = cluster.etcd_members.len();
+                        let healthy = statuses.len();
+                        let quorum_needed = total / 2 + 1;
+                        cluster.etcd_summary = Some(EtcdSummary {
+                            healthy,
+                            total,
+                            has_quorum: healthy >= quorum_needed,
+                        });
+                    }
                 }
             }
         }

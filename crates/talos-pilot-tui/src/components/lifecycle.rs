@@ -359,8 +359,11 @@ impl LifecycleComponent {
         let etcd_quorum = match client.etcd_members().await {
             Ok(members) => {
                 let total = members.len();
-                // Try to get status to determine healthy members
-                let healthy = match client.etcd_status().await {
+                // Extract control plane hostnames to target status calls
+                let cp_hostnames: Vec<String> =
+                    members.iter().map(|m| m.hostname.clone()).collect();
+                // Try to get status from all control planes
+                let healthy = match client.etcd_status_for_nodes(&cp_hostnames).await {
                     Ok(statuses) => {
                         // Count members with status
                         members

@@ -105,19 +105,19 @@ impl EtcdComponent {
 
         self.state.start_loading();
 
-        // Fetch member list, status, and alarms in parallel with timeout
         let timeout = Duration::from_secs(10);
-        let fetch_result = tokio::time::timeout(timeout, async {
-            tokio::join!(
-                client.etcd_members(),
-                client.etcd_status(),
-                client.etcd_alarms()
-            )
-        })
-        .await;
 
-        let (members_result, status_result, alarms_result) = match fetch_result {
-            Ok(results) => results,
+        // Step 1: Fetch member list first (we need hostnames to target status calls)
+        let members_result = tokio::time::timeout(timeout, client.etcd_members()).await;
+
+        let member_infos = match members_result {
+            Ok(Ok(members)) => members,
+            Ok(Err(e)) => {
+                let msg = format_talos_error(&e);
+                self.state
+                    .set_error_with_retry(format!("Failed to fetch members: {}", msg));
+                return Ok(());
+            }
             Err(_) => {
                 self.state.set_error_with_retry(format!(
                     "Request timed out after {}s",
@@ -127,13 +127,30 @@ impl EtcdComponent {
             }
         };
 
-        // Process member list - this is critical, fail if we can't get it
-        let member_infos = match members_result {
-            Ok(members) => members,
-            Err(e) => {
-                let msg = format_talos_error(&e);
-                self.state
-                    .set_error_with_retry(format!("Failed to fetch members: {}", msg));
+        // Step 2: Extract control plane hostnames from members
+        let cp_hostnames: Vec<String> = member_infos.iter().map(|m| m.hostname.clone()).collect();
+
+        tracing::debug!(
+            "Fetching etcd status from control planes: {:?}",
+            cp_hostnames
+        );
+
+        // Step 3: Fetch status (targeting all CPs) and alarms in parallel
+        let fetch_result = tokio::time::timeout(timeout, async {
+            tokio::join!(
+                client.etcd_status_for_nodes(&cp_hostnames),
+                client.etcd_alarms()
+            )
+        })
+        .await;
+
+        let (status_result, alarms_result) = match fetch_result {
+            Ok(results) => results,
+            Err(_) => {
+                self.state.set_error_with_retry(format!(
+                    "Request timed out after {}s",
+                    timeout.as_secs()
+                ));
                 return Ok(());
             }
         };

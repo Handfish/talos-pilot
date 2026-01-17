@@ -132,7 +132,12 @@ pub async fn run_kubernetes_checks(
 
     // Etcd check (for control plane nodes)
     if ctx.node_role.contains("controlplane") || ctx.node_role.contains("control") {
-        match client.etcd_status().await {
+        // Target this specific node for etcd status
+        let target_node = ctx
+            .node_endpoint
+            .clone()
+            .unwrap_or_else(|| ctx.hostname.clone());
+        match client.etcd_status_for_nodes(&[target_node]).await {
             Ok(status_list) => {
                 if let Some(status) = status_list.first() {
                     let is_leader = status.is_leader();
@@ -142,6 +147,8 @@ pub async fn run_kubernetes_checks(
                         format!("Follower (leader: {:x})", status.leader_id)
                     };
                     checks.push(DiagnosticCheck::pass("etcd", "Etcd", &msg));
+                } else {
+                    checks.push(DiagnosticCheck::warn("etcd", "Etcd", "No status returned"));
                 }
             }
             Err(e) => {

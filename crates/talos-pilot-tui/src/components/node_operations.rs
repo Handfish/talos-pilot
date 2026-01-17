@@ -686,34 +686,39 @@ impl NodeOperationsComponent {
                     .iter()
                     .any(|m| m.peer_urls.iter().any(|url| url.contains(node_addr)));
 
-                // Try to get leader info
-                let is_leader = match client.etcd_status().await {
-                    Ok(statuses) => {
-                        // Find the status for this node
-                        statuses.iter().any(|s| {
-                            let member = members.iter().find(|m| m.id == s.member_id);
-                            if let Some(m) = member {
-                                m.peer_urls.iter().any(|url| url.contains(node_addr))
-                                    && s.is_leader()
-                            } else {
-                                false
-                            }
-                        })
+                // Extract control plane hostnames to target status calls
+                let cp_hostnames: Vec<String> =
+                    members.iter().map(|m| m.hostname.clone()).collect();
+
+                // Get status from all control planes (single call for both is_leader and healthy)
+                let statuses = client
+                    .etcd_status_for_nodes(&cp_hostnames)
+                    .await
+                    .unwrap_or_default();
+
+                // Check if this node is the leader
+                let is_leader = statuses.iter().any(|s| {
+                    let member = members.iter().find(|m| m.id == s.member_id);
+                    if let Some(m) = member {
+                        m.peer_urls.iter().any(|url| url.contains(node_addr)) && s.is_leader()
+                    } else {
+                        false
                     }
-                    Err(_) => false,
-                };
+                });
 
                 // Calculate members after this node goes down
                 let members_after = if is_member { total - 1 } else { total };
                 let quorum_maintained = members_after >= quorum_needed;
 
-                // Get healthy member count
-                let healthy = match client.etcd_status().await {
-                    Ok(statuses) => members
+                // Count healthy members (those with status)
+                // If no statuses returned, assume all healthy
+                let healthy = if statuses.is_empty() {
+                    total
+                } else {
+                    members
                         .iter()
                         .filter(|m| statuses.iter().any(|s| s.member_id == m.id))
-                        .count(),
-                    Err(_) => total, // Assume all healthy if can't get status
+                        .count()
                 };
 
                 if let Some(data) = self.data_mut() {
