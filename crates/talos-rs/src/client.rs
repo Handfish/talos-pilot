@@ -31,6 +31,8 @@ pub struct TalosClient {
     channel: Channel,
     /// Target nodes for API requests
     nodes: Vec<String>,
+    /// Endpoints from configuration (used to filter out vIPs from node targeting)
+    endpoints: Vec<String>,
 }
 
 impl TalosClient {
@@ -38,8 +40,13 @@ impl TalosClient {
     pub async fn from_context(ctx: &Context) -> Result<Self, TalosError> {
         let channel = create_channel(ctx).await?;
         let nodes = ctx.target_nodes().to_vec();
+        let endpoints = ctx.endpoints.clone();
 
-        Ok(Self { channel, nodes })
+        Ok(Self {
+            channel,
+            nodes,
+            endpoints,
+        })
     }
 
     /// Create a new client from the default talosconfig
@@ -65,6 +72,7 @@ impl TalosClient {
         Self {
             channel: self.channel.clone(),
             nodes: vec![node.to_string()],
+            endpoints: self.endpoints.clone(),
         }
     }
 
@@ -111,10 +119,24 @@ impl TalosClient {
         // When nodes is empty or same as endpoints, skip the header
         if !self.nodes.is_empty() {
             // Filter out localhost/127.0.0.1 entries as these are endpoint proxies
+            // Also filter out entries that match endpoints (likely vIPs)
             let valid_nodes: Vec<String> = self
                 .nodes
                 .iter()
-                .filter(|n| !n.starts_with("127.0.0.1") && !n.starts_with("localhost"))
+                .filter(|n| {
+                    let is_localhost = n.starts_with("127.0.0.1") || n.starts_with("localhost");
+
+                    // Extract hostname (without port) for comparison
+                    let node_host = n.split(':').next().unwrap_or(n);
+
+                    // Check if this node matches any endpoint (which could be a vIP)
+                    let is_endpoint = self.endpoints.iter().any(|e| {
+                        let endpoint_host = e.split(':').next().unwrap_or(e);
+                        endpoint_host == node_host
+                    });
+
+                    !is_localhost && !is_endpoint
+                })
                 .map(|n| n.split(':').next().unwrap_or(n).to_string())
                 .collect();
 
@@ -126,6 +148,35 @@ impl TalosClient {
             }
         }
         request
+    }
+
+    /// Get the filtered target nodes that would be sent in API requests
+    ///
+    /// This filters out:
+    /// - localhost/127.0.0.1 entries (proxy endpoints)
+    /// - Entries that match configured endpoints (likely vIPs)
+    ///
+    /// Returns the list of actual node hostnames (without ports).
+    #[doc(hidden)]
+    pub fn filtered_target_nodes(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|n| {
+                let is_localhost = n.starts_with("127.0.0.1") || n.starts_with("localhost");
+
+                // Extract hostname (without port) for comparison
+                let node_host = n.split(':').next().unwrap_or(n);
+
+                // Check if this node matches any endpoint (which could be a vIP)
+                let is_endpoint = self.endpoints.iter().any(|e| {
+                    let endpoint_host = e.split(':').next().unwrap_or(e);
+                    endpoint_host == node_host
+                });
+
+                !is_localhost && !is_endpoint
+            })
+            .map(|n| n.split(':').next().unwrap_or(n).to_string())
+            .collect()
     }
 
     /// Get version information from all configured nodes
@@ -2437,5 +2488,175 @@ impl NodeTimeInfo {
     /// Get sync status as a string
     pub fn sync_status(&self) -> &'static str {
         if self.synced { "synced" } else { "not synced" }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a TalosClient for testing without a real connection
+    fn create_test_client(nodes: Vec<String>, endpoints: Vec<String>) -> TalosClient {
+        // Create a dummy channel - we won't actually use it for these tests
+        // This is a bit of a hack, but it allows us to test the filtering logic
+        let channel = tonic::transport::Channel::from_static("http://[::1]:50000").connect_lazy();
+
+        TalosClient {
+            channel,
+            nodes,
+            endpoints,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_removes_vip_endpoint() {
+        // Scenario: talosconfig has a vIP endpoint and actual node hostnames
+        // The vIP should be filtered out when targeting nodes
+        let client = create_test_client(
+            vec![
+                "cluster.example.com".to_string(), // vIP (matches endpoint)
+                "kubec01".to_string(),
+                "kubec02".to_string(),
+                "kubec03".to_string(),
+            ],
+            vec!["cluster.example.com:50000".to_string()], // endpoint is the vIP
+        );
+
+        let filtered = client.filtered_target_nodes();
+
+        // vIP should be filtered out, only actual nodes remain
+        assert_eq!(filtered, vec!["kubec01", "kubec02", "kubec03"]);
+        assert!(!filtered.contains(&"cluster.example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_removes_localhost() {
+        // Scenario: local proxy endpoint
+        let client = create_test_client(
+            vec![
+                "127.0.0.1:50000".to_string(),
+                "node1".to_string(),
+                "node2".to_string(),
+            ],
+            vec!["127.0.0.1:50000".to_string()],
+        );
+
+        let filtered = client.filtered_target_nodes();
+
+        assert_eq!(filtered, vec!["node1", "node2"]);
+        assert!(!filtered.iter().any(|n| n.starts_with("127.0.0.1")));
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_removes_localhost_variant() {
+        // Scenario: localhost hostname
+        let client = create_test_client(
+            vec!["localhost:50000".to_string(), "node1".to_string()],
+            vec!["localhost:50000".to_string()],
+        );
+
+        let filtered = client.filtered_target_nodes();
+
+        assert_eq!(filtered, vec!["node1"]);
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_strips_ports() {
+        // Ports should be stripped from node names
+        let client = create_test_client(
+            vec!["node1:50000".to_string(), "node2:50000".to_string()],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let filtered = client.filtered_target_nodes();
+
+        assert_eq!(filtered, vec!["node1", "node2"]);
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_empty_when_only_endpoints() {
+        // Scenario: nodes fallback to endpoints (empty nodes list means endpoints are used)
+        // When target_nodes() returns endpoints, they should all be filtered out
+        let client = create_test_client(
+            vec!["cluster.example.com:50000".to_string()], // same as endpoint
+            vec!["cluster.example.com:50000".to_string()],
+        );
+
+        let filtered = client.filtered_target_nodes();
+
+        // All nodes match the endpoint, so result should be empty
+        assert!(filtered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_preserves_non_endpoint_nodes() {
+        // Scenario: mix of endpoint and non-endpoint nodes
+        let client = create_test_client(
+            vec![
+                "vip.cluster.local".to_string(),
+                "actual-node-1.cluster.local".to_string(),
+                "actual-node-2.cluster.local".to_string(),
+            ],
+            vec!["vip.cluster.local:50000".to_string()],
+        );
+
+        let filtered = client.filtered_target_nodes();
+
+        assert_eq!(
+            filtered,
+            vec!["actual-node-1.cluster.local", "actual-node-2.cluster.local"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_multiple_endpoints() {
+        // Scenario: multiple endpoints (e.g., multiple vIPs or proxies)
+        let client = create_test_client(
+            vec![
+                "vip1.example.com".to_string(),
+                "vip2.example.com".to_string(),
+                "node1".to_string(),
+                "node2".to_string(),
+            ],
+            vec![
+                "vip1.example.com:50000".to_string(),
+                "vip2.example.com:50000".to_string(),
+            ],
+        );
+
+        let filtered = client.filtered_target_nodes();
+
+        assert_eq!(filtered, vec!["node1", "node2"]);
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_no_endpoints() {
+        // Scenario: no endpoints configured (edge case)
+        let client = create_test_client(vec!["node1".to_string(), "node2".to_string()], vec![]);
+
+        let filtered = client.filtered_target_nodes();
+
+        // With no endpoints to filter, all non-localhost nodes remain
+        assert_eq!(filtered, vec!["node1", "node2"]);
+    }
+
+    #[tokio::test]
+    async fn test_filtered_nodes_with_port_in_endpoint_only() {
+        // Scenario: endpoint has port, nodes don't
+        // This tests the host extraction logic
+        let client = create_test_client(
+            vec![
+                "vip.example.com".to_string(),
+                "node1".to_string(),
+                "node2".to_string(),
+            ],
+            vec!["vip.example.com:50000".to_string()],
+        );
+
+        let filtered = client.filtered_target_nodes();
+
+        // vip.example.com should be filtered out even though it doesn't have a port
+        // because the endpoint vip.example.com:50000 matches after stripping port
+        assert_eq!(filtered, vec!["node1", "node2"]);
     }
 }

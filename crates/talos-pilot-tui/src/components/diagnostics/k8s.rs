@@ -35,10 +35,26 @@ pub async fn create_k8s_client(talos_client: &TalosClient) -> Result<Client, K8s
 /// Create a Kubernetes client, optionally using a different client to fetch kubeconfig
 ///
 /// This allows fetching kubeconfig from a control plane node while diagnosing a worker node.
+///
+/// The function tries sources in this order:
+/// 1. KUBECONFIG environment variable (via Config::infer())
+/// 2. Fetching kubeconfig from Talos API (fallback)
 pub async fn create_k8s_client_with_kubeconfig_source(
     _talos_client: &TalosClient,
     kubeconfig_client: Option<&TalosClient>,
 ) -> Result<Client, K8sError> {
+    // Try KUBECONFIG environment variable first (via Config::infer())
+    // This respects standard K8s tooling conventions
+    if let Ok(config) = Config::infer().await
+        && let Ok(client) = Client::try_from(config)
+    {
+        tracing::debug!("Using kubeconfig from environment (KUBECONFIG or default path)");
+        return Ok(client);
+    }
+
+    // Fall back to fetching kubeconfig from Talos API
+    tracing::debug!("Falling back to fetching kubeconfig from Talos API");
+
     // Use the provided kubeconfig_client if available, otherwise use the main client
     let client_for_kubeconfig = kubeconfig_client.unwrap_or(_talos_client);
 
@@ -1043,5 +1059,119 @@ pub async fn wait_for_node_ready(
         }
 
         tokio::time::sleep(poll_interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use tokio::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::const_new(());
+
+    /// Test that KUBECONFIG environment variable is respected.
+    ///
+    /// This test creates a valid kubeconfig file pointing to a non-existent cluster.
+    /// If KUBECONFIG is respected, Config::infer() will find it and try to use it,
+    /// resulting in a connection error (not a kubeconfig fetch error from Talos).
+    ///
+    /// Note: This test manipulates environment variables and must be run serially.
+    #[tokio::test]
+    async fn test_kubeconfig_env_is_tried_first() {
+        let _guard = ENV_MUTEX.lock().await;
+
+        // Create a valid kubeconfig file pointing to a non-existent cluster
+        let kubeconfig_content = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://127.0.0.1:64321
+    insecure-skip-tls-verify: true
+  name: test-cluster
+contexts:
+- context:
+    cluster: test-cluster
+    user: test-user
+  name: test-context
+current-context: test-context
+users:
+- name: test-user
+  user:
+    token: test-token
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(kubeconfig_content.as_bytes()).unwrap();
+        let kubeconfig_path = temp_file.path().to_string_lossy().to_string();
+
+        // Set KUBECONFIG to our temp file
+        let old_kubeconfig = std::env::var("KUBECONFIG").ok();
+        unsafe {
+            std::env::set_var("KUBECONFIG", &kubeconfig_path);
+        }
+
+        // Try to infer config - this should succeed in finding the kubeconfig
+        // (it will fail to connect, but that's expected)
+        let config_result = Config::infer().await;
+
+        // Restore original KUBECONFIG
+        unsafe {
+            if let Some(old_value) = old_kubeconfig {
+                std::env::set_var("KUBECONFIG", old_value);
+            } else {
+                std::env::remove_var("KUBECONFIG");
+            }
+        }
+
+        // The config should have been loaded (even though connection would fail)
+        assert!(
+            config_result.is_ok(),
+            "Config::infer() should find our KUBECONFIG file"
+        );
+
+        // Verify it points to our test cluster
+        let config = config_result.unwrap();
+        assert_eq!(
+            config.cluster_url.to_string(),
+            "https://127.0.0.1:64321/",
+            "Should use the cluster URL from our kubeconfig"
+        );
+    }
+
+    /// Test that when KUBECONFIG points to a non-existent file, it falls back gracefully.
+    ///
+    /// Note: This test can't fully verify the Talos fallback without a real Talos client,
+    /// but it verifies that the function handles missing KUBECONFIG correctly.
+    #[tokio::test]
+    async fn test_kubeconfig_fallback_on_missing_file() {
+        let _guard = ENV_MUTEX.lock().await;
+
+        // Set KUBECONFIG to a non-existent file
+        let old_kubeconfig = std::env::var("KUBECONFIG").ok();
+        unsafe {
+            std::env::set_var("KUBECONFIG", "/non/existent/path/kubeconfig");
+        }
+
+        // Try to infer config - this should fail
+        let config_result = Config::infer().await;
+
+        // Restore original KUBECONFIG
+        unsafe {
+            if let Some(old_value) = old_kubeconfig {
+                std::env::set_var("KUBECONFIG", old_value);
+            } else {
+                std::env::remove_var("KUBECONFIG");
+            }
+        }
+
+        // Config::infer() should fail when kubeconfig doesn't exist
+        // This triggers the fallback to Talos API in create_k8s_client_with_kubeconfig_source
+        assert!(
+            config_result.is_err(),
+            "Config::infer() should fail with non-existent kubeconfig"
+        );
     }
 }

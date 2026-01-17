@@ -49,3 +49,6 @@ chrono.workspace = true
 
 # Home directory
 dirs-next.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
