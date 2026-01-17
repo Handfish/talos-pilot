@@ -50,8 +50,20 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
 
     // Initialize logging to file (not stdout, which would corrupt TUI)
-    let log_level = if cli.debug { Level::DEBUG } else { Level::INFO };
     let log_file = File::create(&cli.log_file)?;
+
+    // Build filter: set base level, but quiet down noisy HTTP/gRPC libraries
+    let filter = if cli.debug {
+        EnvFilter::from_default_env()
+            .add_directive(Level::DEBUG.into())
+            .add_directive("h2=info".parse().unwrap())
+            .add_directive("hyper=info".parse().unwrap())
+            .add_directive("tower=info".parse().unwrap())
+            .add_directive("tonic=info".parse().unwrap())
+            .add_directive("rustls=info".parse().unwrap())
+    } else {
+        EnvFilter::from_default_env().add_directive(Level::INFO.into())
+    };
 
     tracing_subscriber::registry()
         .with(
@@ -60,7 +72,7 @@ async fn main() -> Result<()> {
                 .with_ansi(true)
                 .with_target(false),
         )
-        .with(EnvFilter::from_default_env().add_directive(log_level.into()))
+        .with(filter)
         .init();
 
     tracing::info!("Starting talos-pilot");
