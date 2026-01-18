@@ -263,6 +263,12 @@ impl StorageComponent {
         self.client = Some(client);
     }
 
+    /// Set context and config path for talosctl commands (used for group view refresh)
+    pub fn set_context(&mut self, context: Option<String>, config_path: Option<String>) {
+        self.context = context;
+        self.config_path = config_path;
+    }
+
     /// Set error message
     pub fn set_error(&mut self, error: String) {
         self.state.set_error(error);
@@ -275,6 +281,11 @@ impl StorageComponent {
 
     /// Refresh storage data
     pub async fn refresh(&mut self) -> Result<()> {
+        // Handle group view refresh
+        if self.is_group_view {
+            return self.refresh_group().await;
+        }
+
         self.state.start_loading();
 
         let Some(node) = &self.node_address else {
@@ -314,6 +325,55 @@ impl StorageComponent {
 
         // Store the data
         self.state.set_data(data);
+        Ok(())
+    }
+
+    /// Refresh storage data for group view (multiple nodes)
+    async fn refresh_group(&mut self) -> Result<()> {
+        let Some(context) = self.context.clone() else {
+            self.state.set_error("No context configured");
+            return Ok(());
+        };
+
+        self.state.start_loading();
+
+        // Clear existing node data
+        self.node_data.clear();
+
+        // Clone nodes to avoid borrow issues
+        let nodes = self.nodes.clone();
+        let config_path = self.config_path.clone();
+
+        // Fetch storage info from all nodes using talosctl
+        for (hostname, ip) in &nodes {
+            // Extract IP without port
+            let node_ip = ip.split(':').next().unwrap_or(ip);
+
+            // Fetch disks
+            match get_disks_for_node(&context, node_ip, config_path.as_deref()).await {
+                Ok(disks) => {
+                    // Fetch volumes
+                    match get_volume_status_for_node(&context, node_ip, config_path.as_deref()).await {
+                        Ok(volumes) => {
+                            self.add_node_storage(hostname.clone(), disks, volumes);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch volumes from {}: {}", hostname, e);
+                            self.add_node_storage(hostname.clone(), disks, Vec::new());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch disks from {}: {}", hostname, e);
+                }
+            }
+        }
+
+        // Reset selection if needed
+        self.disk_table_state.select(Some(0));
+        self.volume_table_state.select(Some(0));
+
+        self.state.mark_loaded();
         Ok(())
     }
 

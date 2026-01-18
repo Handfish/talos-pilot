@@ -497,6 +497,11 @@ impl NetworkStatsComponent {
             return Ok(());
         };
 
+        // Handle group view refresh
+        if self.is_group_view {
+            return self.refresh_group(client).await;
+        }
+
         self.state.start_loading();
 
         // Ensure we have data to update
@@ -604,6 +609,43 @@ impl NetworkStatsComponent {
 
         self.state.mark_loaded();
 
+        Ok(())
+    }
+
+    /// Refresh network data for group view (multiple nodes)
+    async fn refresh_group(&mut self, client: TalosClient) -> Result<()> {
+        self.state.start_loading();
+
+        // Clear existing node data
+        self.node_data.clear();
+
+        // Clone nodes to avoid borrow issues
+        let nodes = self.nodes.clone();
+
+        // Fetch network stats from all nodes
+        for (hostname, ip) in &nodes {
+            let node_client = client.with_node(ip);
+            match node_client.network_device_stats().await {
+                Ok(node_stats_list) => {
+                    // The API returns Vec<NodeNetworkStats>, extract devices from each
+                    for ns in node_stats_list {
+                        self.add_node_network(hostname.clone(), ns.devices);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch network stats from {}: {}", hostname, e);
+                }
+            }
+        }
+
+        // Reset selection if needed
+        let device_count = self.data().map(|d| d.devices.len()).unwrap_or(0);
+        if device_count > 0 && self.selected >= device_count {
+            self.selected = 0;
+        }
+        self.table_state.select(Some(self.selected));
+
+        self.state.mark_loaded();
         Ok(())
     }
 

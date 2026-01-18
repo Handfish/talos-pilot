@@ -594,6 +594,11 @@ impl DiagnosticsComponent {
             }
         };
 
+        // Handle group view refresh
+        if self.is_group_view {
+            return self.refresh_group(client).await;
+        }
+
         self.state.start_loading();
 
         let timeout = std::time::Duration::from_secs(15);
@@ -762,6 +767,58 @@ impl DiagnosticsComponent {
         }
 
         Ok(())
+    }
+
+    /// Refresh diagnostics data for group view (multiple nodes)
+    fn refresh_group(
+        &mut self,
+        client: TalosClient,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.state.start_loading();
+
+            // Clear existing node data
+            self.node_data.clear();
+
+            // Clone fields to avoid borrow issues
+            let nodes = self.nodes.clone();
+            let node_role = self.node_role.clone();
+            let config_path = self.config_path.clone();
+            let controlplane_endpoint = self.controlplane_endpoint.clone();
+
+            // Fetch diagnostics from all nodes
+            for (hostname, ip) in &nodes {
+                let node_client = client.with_node(ip);
+
+                // Create a temporary single-node diagnostics component to run checks
+                let mut temp_diag = DiagnosticsComponent::new(
+                    hostname.clone(),
+                    ip.clone(),
+                    node_role.clone(),
+                    config_path.clone(),
+                );
+                temp_diag.set_client(node_client);
+                temp_diag.set_controlplane_endpoint(controlplane_endpoint.clone());
+
+                // Run the diagnostics checks
+                match temp_diag.refresh().await {
+                    Ok(_) => {
+                        // Extract the data and add it to the group component
+                        if let Some(data) = temp_diag.take_data() {
+                            self.add_node_diagnostics(hostname.clone(), data);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch diagnostics from {}: {}", hostname, e);
+                    }
+                }
+            }
+
+            // Reset selection
+            self.ensure_valid_selection();
+            self.state.mark_loaded();
+            Ok(())
+        })
     }
 
     /// Get category title

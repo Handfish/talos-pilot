@@ -583,6 +583,11 @@ impl ProcessesComponent {
             return Ok(());
         };
 
+        // Handle group view refresh
+        if self.is_group_view {
+            return self.refresh_group(client).await;
+        }
+
         self.state.start_loading();
 
         // Get or create data, preserving previous CPU state for delta calculations
@@ -675,6 +680,44 @@ impl ProcessesComponent {
 
         // Store the data
         self.state.set_data(data);
+        Ok(())
+    }
+
+    /// Refresh process data for group view (multiple nodes)
+    async fn refresh_group(&mut self, client: TalosClient) -> Result<()> {
+        self.state.start_loading();
+
+        // Clear existing node data
+        self.node_data.clear();
+
+        // Clone nodes to avoid borrow issues
+        let nodes = self.nodes.clone();
+
+        // Fetch processes from all nodes
+        for (hostname, ip) in &nodes {
+            let node_client = client.with_node(ip);
+            match node_client.processes().await {
+                Ok(node_processes_list) => {
+                    // The API returns Vec<NodeProcesses>, extract processes from first (should only be one)
+                    for np in node_processes_list {
+                        self.add_node_processes(hostname.clone(), np.processes);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch processes from {}: {}", hostname, e);
+                }
+            }
+        }
+
+        // Reset selection if needed
+        if let Some(data) = self.data() {
+            if !data.display_entries.is_empty() && self.selected >= data.display_entries.len() {
+                self.selected = 0;
+            }
+        }
+        self.table_state.select(Some(self.selected));
+
+        self.state.mark_loaded();
         Ok(())
     }
 

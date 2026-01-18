@@ -1273,6 +1273,9 @@ impl App {
 
                 // Fetch processes from all nodes
                 if let Some(client) = self.cluster.client() {
+                    // Set the base cluster client for group refresh capability
+                    processes.set_client(client.clone());
+
                     for (hostname, ip) in &nodes {
                         let node_client = client.with_node(ip);
                         match node_client.processes().await {
@@ -1305,6 +1308,9 @@ impl App {
 
                 // Fetch network stats from all nodes
                 if let Some(client) = self.cluster.client() {
+                    // Set the base cluster client for group refresh capability
+                    network.set_client(client.clone());
+
                     for (hostname, ip) in &nodes {
                         let node_client = client.with_node(ip);
                         match node_client.network_device_stats().await {
@@ -1338,6 +1344,9 @@ impl App {
                 // Get context and config from cluster component
                 let context = self.cluster.current_context_name().map(|s| s.to_string());
                 let config_path = self.cluster.config_path().map(|s| s.to_string());
+
+                // Set context and config for group refresh capability
+                storage.set_context(context.clone(), config_path.clone());
 
                 // Fetch storage info from all nodes using talosctl
                 for (hostname, ip) in &nodes {
@@ -1388,6 +1397,9 @@ impl App {
 
                 // Fetch diagnostics from all nodes
                 if let Some(client) = self.cluster.client() {
+                    // Set the base cluster client for group refresh capability
+                    diagnostics.set_client(client.clone());
+
                     for (hostname, ip) in &nodes {
                         let node_client = client.with_node(ip);
 
