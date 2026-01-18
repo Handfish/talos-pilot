@@ -48,9 +48,19 @@ pub enum Mode {
     Filtering,
 }
 
+/// View mode for group processes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupViewMode {
+    /// Interleaved processes from all nodes (default)
+    #[default]
+    Interleaved,
+    /// Processes organized by node (tabbed view)
+    ByNode,
+}
+
 /// State counts for summary bar
 #[derive(Debug, Clone, Default)]
-struct StateCounts {
+pub struct StateCounts {
     running: usize,
     sleeping: usize,
     disk_wait: usize,
@@ -68,6 +78,31 @@ struct DisplayEntry {
     is_last: bool,
     /// Ancestry flags for drawing connectors (true = has more siblings below)
     ancestors_have_siblings: Vec<bool>,
+}
+
+/// Per-node process data for group view
+#[derive(Debug, Clone, Default)]
+pub struct NodeProcessData {
+    /// Node hostname
+    pub hostname: String,
+    /// Processes from this node
+    pub processes: Vec<ProcessInfo>,
+    /// State counts for this node
+    pub state_counts: StateCounts,
+    /// CPU percentages per process (pid -> percentage)
+    pub cpu_percentages: HashMap<i32, f32>,
+    /// Previous CPU times (for calculating per-process CPU %)
+    pub prev_cpu_times: HashMap<i32, f64>,
+    /// Time of last CPU measurement
+    pub last_cpu_sample: Option<Instant>,
+    /// CPU count on this node
+    pub cpu_count: usize,
+    /// Total memory on this node
+    pub total_memory: u64,
+    /// Memory usage percentage
+    pub memory_usage_percent: f32,
+    /// Load average
+    pub load_avg: (f64, f64, f64),
 }
 
 /// Loaded process data (wrapped by AsyncState)
@@ -142,6 +177,20 @@ pub struct ProcessesComponent {
 
     /// Client for API calls
     client: Option<TalosClient>,
+
+    // Group view fields
+    /// Whether this is a group view (multiple nodes)
+    is_group_view: bool,
+    /// Group name (e.g., "Control Plane", "Workers")
+    group_name: String,
+    /// Nodes in the group: Vec<(hostname, ip)>
+    nodes: Vec<(String, String)>,
+    /// Current view mode for group processes
+    view_mode: GroupViewMode,
+    /// Per-node process data
+    node_data: HashMap<String, NodeProcessData>,
+    /// Selected node tab index (for ByNode view mode)
+    selected_node_tab: usize,
 }
 
 impl Default for ProcessesComponent {
@@ -177,7 +226,128 @@ impl ProcessesComponent {
             filter: None,
             auto_refresh: true,
             client: None,
+            // Group view fields (not used in single node mode)
+            is_group_view: false,
+            group_name: String::new(),
+            nodes: Vec::new(),
+            view_mode: GroupViewMode::default(),
+            node_data: HashMap::new(),
+            selected_node_tab: 0,
         }
+    }
+
+    /// Create a new processes component for group view (multiple nodes)
+    /// - group_name: Name of the group (e.g., "Control Plane", "Workers")
+    /// - nodes: Vec of (hostname, ip) for each node
+    pub fn new_group(group_name: String, nodes: Vec<(String, String)>) -> Self {
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+
+        // Initialize with empty data
+        let initial_data = ProcessesData {
+            hostname: group_name.clone(),
+            address: String::new(),
+            ..Default::default()
+        };
+        let mut state = AsyncState::new();
+        state.set_data(initial_data);
+
+        Self {
+            state,
+            selected: 0,
+            table_state,
+            sort_by: SortBy::CpuPercent,
+            tree_view: false,
+            tree_root: None,
+            state_filter: None,
+            mode: Mode::Normal,
+            filter_input: String::new(),
+            filter: None,
+            auto_refresh: true,
+            client: None,
+            // Group view fields
+            is_group_view: true,
+            group_name,
+            nodes,
+            view_mode: GroupViewMode::default(),
+            node_data: HashMap::new(),
+            selected_node_tab: 0,
+        }
+    }
+
+    /// Add processes from a node (for group view)
+    pub fn add_node_processes(&mut self, hostname: String, processes: Vec<ProcessInfo>) {
+        if !self.is_group_view {
+            return;
+        }
+
+        // Calculate state counts
+        let mut state_counts = StateCounts::default();
+        for proc in &processes {
+            match proc.state {
+                ProcessState::Running => state_counts.running += 1,
+                ProcessState::Sleeping => state_counts.sleeping += 1,
+                ProcessState::DiskSleep => state_counts.disk_wait += 1,
+                ProcessState::Zombie => state_counts.zombie += 1,
+                _ => {}
+            }
+        }
+
+        // Store node data
+        let node_data = NodeProcessData {
+            hostname: hostname.clone(),
+            processes,
+            state_counts,
+            cpu_percentages: HashMap::new(),
+            prev_cpu_times: HashMap::new(),
+            last_cpu_sample: None,
+            cpu_count: 0,
+            total_memory: 0,
+            memory_usage_percent: 0.0,
+            load_avg: (0.0, 0.0, 0.0),
+        };
+        self.node_data.insert(hostname, node_data);
+
+        // Rebuild merged view
+        self.rebuild_group_data();
+    }
+
+    /// Rebuild merged process data for group view
+    fn rebuild_group_data(&mut self) {
+        if !self.is_group_view {
+            return;
+        }
+
+        // Collect merged data first (to avoid borrow conflicts)
+        let mut merged_processes = Vec::new();
+        let mut merged_cpu_percentages = HashMap::new();
+        let mut merged_state_counts = StateCounts::default();
+
+        for node_data in self.node_data.values() {
+            for proc in &node_data.processes {
+                merged_processes.push(proc.clone());
+            }
+            // Merge CPU percentages
+            for (pid, pct) in &node_data.cpu_percentages {
+                merged_cpu_percentages.insert(*pid, *pct);
+            }
+            // Merge state counts
+            merged_state_counts.running += node_data.state_counts.running;
+            merged_state_counts.sleeping += node_data.state_counts.sleeping;
+            merged_state_counts.disk_wait += node_data.state_counts.disk_wait;
+            merged_state_counts.zombie += node_data.state_counts.zombie;
+        }
+
+        // Now apply to data
+        if let Some(data) = self.data_mut() {
+            data.processes = merged_processes;
+            data.cpu_percentages = merged_cpu_percentages;
+            data.state_counts = merged_state_counts;
+        }
+
+        // Sort and filter
+        self.sort_processes();
+        self.apply_filter();
     }
 
     /// Set the client for API calls
@@ -816,7 +986,7 @@ impl ProcessesComponent {
             None => return,
         };
 
-        let sort_indicator = format!("[{}▼]", self.sort_by.label());
+        let sort_indicator = format!("[{}]", self.sort_by.label());
         let tree_indicator = if self.tree_view {
             if let Some(root_pid) = self.tree_root {
                 // Find root process name
@@ -835,40 +1005,81 @@ impl ProcessesComponent {
         };
         let proc_count = format!("{} procs", data.display_entries.len());
 
-        // System resources info
-        let cpu_info = if data.cpu_count > 0 {
-            format!("{} CPU", data.cpu_count)
-        } else {
-            String::new()
-        };
-        let mem_info = if data.total_memory > 0 {
-            format!("{} RAM", format_bytes_compact(data.total_memory))
-        } else {
-            String::new()
-        };
-
+        // Build header based on single node vs group view
         let mut spans = vec![
             Span::styled("Processes: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&data.hostname),
-            Span::styled(" (", Style::default().fg(Color::DarkGray)),
-            Span::raw(&data.address),
-            Span::styled(")", Style::default().fg(Color::DarkGray)),
         ];
 
-        // Add system info
-        if !cpu_info.is_empty() || !mem_info.is_empty() {
+        if self.is_group_view {
+            // Group view header
+            spans.push(Span::styled(&self.group_name, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(
+                format!(" ({} nodes)", self.nodes.len()),
+                Style::default().fg(Color::DarkGray),
+            ));
+
+            // View mode indicator
+            let view_mode_label = match self.view_mode {
+                GroupViewMode::Interleaved => "[MERGED]",
+                GroupViewMode::ByNode => "[BY NODE]",
+            };
             spans.push(Span::raw("  "));
-            spans.push(Span::styled("[", Style::default().fg(Color::DarkGray)));
-            if !cpu_info.is_empty() {
-                spans.push(Span::styled(&cpu_info, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(
+                view_mode_label,
+                Style::default().fg(Color::Green),
+            ));
+
+            // Node tabs for ByNode mode
+            if self.view_mode == GroupViewMode::ByNode && !self.nodes.is_empty() {
+                spans.push(Span::raw("  "));
+                for (i, (hostname, _)) in self.nodes.iter().enumerate() {
+                    if i == self.selected_node_tab {
+                        spans.push(Span::styled(
+                            format!("[{}]", hostname),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            format!(" {} ", hostname),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                }
             }
-            if !cpu_info.is_empty() && !mem_info.is_empty() {
-                spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        } else {
+            // Single node header
+            spans.push(Span::raw(data.hostname.clone()));
+            spans.push(Span::styled(" (", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::raw(data.address.clone()));
+            spans.push(Span::styled(")", Style::default().fg(Color::DarkGray)));
+
+            // System resources info
+            let cpu_info = if data.cpu_count > 0 {
+                format!("{} CPU", data.cpu_count)
+            } else {
+                String::new()
+            };
+            let mem_info = if data.total_memory > 0 {
+                format!("{} RAM", format_bytes_compact(data.total_memory))
+            } else {
+                String::new()
+            };
+
+            // Add system info
+            if !cpu_info.is_empty() || !mem_info.is_empty() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("[", Style::default().fg(Color::DarkGray)));
+                if !cpu_info.is_empty() {
+                    spans.push(Span::styled(cpu_info.clone(), Style::default().fg(Color::Cyan)));
+                }
+                if !cpu_info.is_empty() && !mem_info.is_empty() {
+                    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+                }
+                if !mem_info.is_empty() {
+                    spans.push(Span::styled(mem_info, Style::default().fg(Color::Magenta)));
+                }
+                spans.push(Span::styled("]", Style::default().fg(Color::DarkGray)));
             }
-            if !mem_info.is_empty() {
-                spans.push(Span::styled(&mem_info, Style::default().fg(Color::Magenta)));
-            }
-            spans.push(Span::styled("]", Style::default().fg(Color::DarkGray)));
         }
 
         spans.push(Span::raw("  "));
@@ -1105,20 +1316,99 @@ impl ProcessesComponent {
         let data = self.data()?;
         let tree_view = self.tree_view;
         let max_cmd_len = area.width.saturating_sub(45) as usize;
-        let max_mem = data
-            .processes
+
+        // Get effective processes based on view mode
+        let (processes, cpu_percentages) = if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+            // ByNode mode: show processes from selected node only
+            if let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) {
+                if let Some(node_data) = self.node_data.get(hostname) {
+                    (&node_data.processes, &node_data.cpu_percentages)
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            // Interleaved mode or single node: use merged data
+            (&data.processes, &data.cpu_percentages)
+        };
+
+        let max_mem = processes
             .iter()
             .map(|p| p.resident_memory)
             .max()
             .unwrap_or(0);
 
+        // For ByNode mode, iterate over processes directly since display_entries refers to merged data
+        if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+            return Some(
+                processes
+                    .iter()
+                    .map(|proc| {
+                        let cpu_pct = cpu_percentages.get(&proc.pid).copied().unwrap_or(0.0);
+                        let cpu_color = if cpu_pct > 50.0 {
+                            Color::Red
+                        } else if cpu_pct > 10.0 {
+                            Color::Yellow
+                        } else if cpu_pct > 0.1 {
+                            Color::Green
+                        } else {
+                            Color::default()
+                        };
+
+                        let mem_color = if max_mem == 0 {
+                            Color::default()
+                        } else {
+                            let ratio = proc.resident_memory as f64 / max_mem as f64;
+                            if ratio > 0.7 {
+                                Color::Red
+                            } else if ratio > 0.3 {
+                                Color::Yellow
+                            } else {
+                                Color::default()
+                            }
+                        };
+
+                        let state_color = Self::state_color(&proc.state);
+                        let cpu_str = format!("{:>5.1}%  {}", cpu_pct, proc.cpu_time_human());
+                        let mem_str = proc.resident_memory_human();
+                        let command = proc.display_command();
+
+                        let cmd_display = if command.len() > max_cmd_len {
+                            format!("{}...", &command[..max_cmd_len.saturating_sub(3)])
+                        } else {
+                            command.to_string()
+                        };
+
+                        let is_interesting = matches!(
+                            proc.state,
+                            ProcessState::Running | ProcessState::Zombie | ProcessState::DiskSleep
+                        );
+                        (
+                            proc.pid,
+                            cpu_str,
+                            mem_str,
+                            proc.state.short().to_string(),
+                            cmd_display,
+                            cpu_color,
+                            mem_color,
+                            state_color,
+                            is_interesting,
+                        )
+                    })
+                    .collect(),
+            );
+        }
+
+        // For merged view or single node, use display_entries
         Some(
             data.display_entries
                 .iter()
                 .filter_map(|entry| {
-                    let proc = data.processes.get(entry.process_idx)?;
+                    let proc = processes.get(entry.process_idx)?;
 
-                    let cpu_pct = data.cpu_percentages.get(&proc.pid).copied().unwrap_or(0.0);
+                    let cpu_pct = cpu_percentages.get(&proc.pid).copied().unwrap_or(0.0);
                     let cpu_color = if cpu_pct > 50.0 {
                         Color::Red
                     } else if cpu_pct > 10.0 {
@@ -1375,11 +1665,28 @@ impl ProcessesComponent {
             _ => Span::raw(""),
         };
 
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled("[1]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" cpu "),
             Span::styled("[2]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" mem "),
+        ];
+
+        // Add view mode toggle hint if in group view
+        if self.is_group_view {
+            spans.push(Span::styled("[v]", Style::default().add_modifier(Modifier::BOLD)));
+            spans.push(Span::raw(" view "));
+
+            // Add tab navigation hint if in ByNode mode
+            if self.view_mode == GroupViewMode::ByNode {
+                spans.push(Span::styled("[", Style::default().add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled("]", Style::default().add_modifier(Modifier::BOLD)));
+                spans.push(Span::raw(" tabs "));
+            }
+        }
+
+        spans.extend(vec![
             Span::styled("[t]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" subtree "),
             Span::styled("[T]", Style::default().add_modifier(Modifier::BOLD)),
@@ -1400,6 +1707,8 @@ impl ProcessesComponent {
             Span::styled("[q]", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" back"),
         ]);
+
+        let line = Line::from(spans);
 
         let para = Paragraph::new(line);
         frame.render_widget(para, area);
@@ -1611,6 +1920,43 @@ impl ProcessesComponent {
                     let preview = full_cmd[..preview_len].to_string();
                     if crate::clipboard::copy_to_clipboard(full_cmd).is_ok() {
                         tracing::info!("Copied to clipboard: {}...", preview);
+                    }
+                }
+                Ok(None)
+            }
+            KeyCode::Char('v') => {
+                // Toggle view mode (only in group view)
+                if self.is_group_view {
+                    self.view_mode = match self.view_mode {
+                        GroupViewMode::Interleaved => GroupViewMode::ByNode,
+                        GroupViewMode::ByNode => GroupViewMode::Interleaved,
+                    };
+                    // Reset selection when changing view mode
+                    self.selected = 0;
+                    self.table_state.select(Some(0));
+                }
+                Ok(None)
+            }
+            KeyCode::Char('[') => {
+                // Previous node tab (only in group view with ByNode mode)
+                if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+                    if self.selected_node_tab > 0 {
+                        self.selected_node_tab -= 1;
+                        // Reset selection when changing tabs
+                        self.selected = 0;
+                        self.table_state.select(Some(0));
+                    }
+                }
+                Ok(None)
+            }
+            KeyCode::Char(']') => {
+                // Next node tab (only in group view with ByNode mode)
+                if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+                    if self.selected_node_tab + 1 < self.nodes.len() {
+                        self.selected_node_tab += 1;
+                        // Reset selection when changing tabs
+                        self.selected = 0;
+                        self.table_state.select(Some(0));
                     }
                 }
                 Ok(None)

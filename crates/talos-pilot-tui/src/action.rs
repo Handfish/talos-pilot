@@ -27,6 +27,8 @@ pub enum Action {
     ShowNodeDetails(String, String), // cluster, node
     /// Show multi-service logs: (node_ip, node_role, active_service_ids, all_service_ids)
     ShowMultiLogs(String, String, Vec<String>, Vec<String>),
+    /// Show multi-node logs: (group_name, node_role, Vec<(hostname, ip)>, services)
+    ShowGroupLogs(String, String, Vec<(String, String)>, Vec<String>),
     /// Show etcd cluster status
     ShowEtcd,
     /// Show processes for a node: (hostname, address)
@@ -46,6 +48,16 @@ pub enum Action {
     ShowWorkloads,
     /// Show storage/disks view for a node: (hostname, address)
     ShowStorage(String, String),
+
+    /// Show group processes: (group_name, Vec<(hostname, ip)>)
+    ShowGroupProcesses(String, Vec<(String, String)>),
+    /// Show group network: (group_name, Vec<(hostname, ip)>)
+    ShowGroupNetwork(String, Vec<(String, String)>),
+    /// Show group storage: (group_name, Vec<(hostname, ip)>)
+    ShowGroupStorage(String, Vec<(String, String)>),
+    /// Show group diagnostics: (group_name, node_role, Vec<(hostname, ip)>, cp_endpoint)
+    ShowGroupDiagnostics(String, String, Vec<(String, String)>, Option<String>),
+
     /// Show node operations overlay: (hostname, address, is_controlplane)
     ShowNodeOperations(String, String, bool),
     /// Show rolling operations overlay with node list: Vec<(hostname, address, is_controlplane)>

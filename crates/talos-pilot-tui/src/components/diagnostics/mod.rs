@@ -37,6 +37,25 @@ pub use types::*;
 /// Default auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 10;
 
+/// View mode for group diagnostics
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupViewMode {
+    /// Interleaved diagnostics from all nodes (default)
+    #[default]
+    Interleaved,
+    /// Diagnostics organized by node (tabbed view)
+    ByNode,
+}
+
+/// Per-node diagnostics data for group view
+#[derive(Debug, Clone, Default)]
+pub struct NodeDiagnosticsData {
+    /// Node hostname
+    pub hostname: String,
+    /// Diagnostics data for this node
+    pub data: DiagnosticsData,
+}
+
 /// Data loaded asynchronously for the diagnostics component
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticsData {
@@ -104,6 +123,23 @@ pub struct DiagnosticsComponent {
     controlplane_endpoint: Option<String>,
     /// Custom config file path (from --config flag)
     config_path: Option<String>,
+
+    // Group view fields
+    /// Whether this is a group view (multiple nodes)
+    is_group_view: bool,
+    /// Group name (e.g., "Control Plane", "Workers")
+    group_name: String,
+    /// Nodes in the group: Vec<(hostname, ip)>
+    nodes: Vec<(String, String)>,
+    /// Current view mode for group diagnostics
+    group_view_mode: GroupViewMode,
+    /// Per-node diagnostics data
+    node_data: std::collections::HashMap<String, NodeDiagnosticsData>,
+    /// Selected node tab index (for ByNode view mode)
+    selected_node_tab: usize,
+    /// Node role (for creating proper diagnostic context in group view)
+    #[allow(dead_code)]
+    node_role: String,
 }
 
 impl Default for DiagnosticsComponent {
@@ -152,7 +188,136 @@ impl DiagnosticsComponent {
             client: None,
             controlplane_endpoint: None,
             config_path,
+            // Group view fields (not used in single node mode)
+            is_group_view: false,
+            group_name: String::new(),
+            nodes: Vec::new(),
+            group_view_mode: GroupViewMode::default(),
+            node_data: std::collections::HashMap::new(),
+            selected_node_tab: 0,
+            node_role: node_role,
         }
+    }
+
+    /// Create a new diagnostics component for group view (multiple nodes)
+    /// - group_name: Name of the group (e.g., "Control Plane", "Workers")
+    /// - node_role: Role of nodes in the group (e.g., "controlplane", "worker")
+    /// - nodes: Vec of (hostname, ip) for each node
+    /// - cp_endpoint: Control plane endpoint for worker nodes
+    pub fn new_group(
+        group_name: String,
+        node_role: String,
+        nodes: Vec<(String, String)>,
+        cp_endpoint: Option<String>,
+        config_path: Option<String>,
+    ) -> Self {
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+
+        let mut context = DiagnosticContext::new();
+        context.node_role = node_role.clone();
+        context.hostname = group_name.clone();
+
+        let initial_data = DiagnosticsData {
+            hostname: group_name.clone(),
+            address: String::new(),
+            context,
+            ..Default::default()
+        };
+
+        Self {
+            state: AsyncState::with_data(initial_data),
+            selected_category: 0,
+            selected_check: 0,
+            table_state,
+            pending_action: None,
+            show_confirmation: false,
+            confirmation_selection: 1,
+            copy_feedback_until: None,
+            show_details: false,
+            details_title: String::new(),
+            details_content: String::new(),
+            applying_fix: false,
+            apply_result: None,
+            auto_refresh: true,
+            client: None,
+            controlplane_endpoint: cp_endpoint,
+            config_path,
+            // Group view fields
+            is_group_view: true,
+            group_name,
+            nodes,
+            group_view_mode: GroupViewMode::default(),
+            node_data: std::collections::HashMap::new(),
+            selected_node_tab: 0,
+            node_role,
+        }
+    }
+
+    /// Add diagnostics data from a node (for group view)
+    pub fn add_node_diagnostics(&mut self, hostname: String, data: DiagnosticsData) {
+        if !self.is_group_view {
+            return;
+        }
+
+        // Store node data
+        let node_diag = NodeDiagnosticsData {
+            hostname: hostname.clone(),
+            data,
+        };
+        self.node_data.insert(hostname, node_diag);
+
+        // Rebuild merged view
+        self.rebuild_group_data();
+    }
+
+    /// Rebuild merged diagnostics data for group view
+    fn rebuild_group_data(&mut self) {
+        if !self.is_group_view {
+            return;
+        }
+
+        // Get or create data
+        let mut data = self.state.take_data().unwrap_or_default();
+
+        // Clear existing checks
+        data.system_checks.clear();
+        data.kubernetes_checks.clear();
+        data.cni_checks.clear();
+        data.service_checks.clear();
+        data.addon_checks.clear();
+
+        // Merge checks from all nodes (prefix check names with hostname)
+        for node_data in self.node_data.values() {
+            let prefix = format!("[{}] ", node_data.hostname);
+            for check in &node_data.data.system_checks {
+                let mut prefixed_check = check.clone();
+                prefixed_check.name = format!("{}{}", prefix, check.name);
+                data.system_checks.push(prefixed_check);
+            }
+            for check in &node_data.data.kubernetes_checks {
+                let mut prefixed_check = check.clone();
+                prefixed_check.name = format!("{}{}", prefix, check.name);
+                data.kubernetes_checks.push(prefixed_check);
+            }
+            for check in &node_data.data.cni_checks {
+                let mut prefixed_check = check.clone();
+                prefixed_check.name = format!("{}{}", prefix, check.name);
+                data.cni_checks.push(prefixed_check);
+            }
+            for check in &node_data.data.service_checks {
+                let mut prefixed_check = check.clone();
+                prefixed_check.name = format!("{}{}", prefix, check.name);
+                data.service_checks.push(prefixed_check);
+            }
+            for check in &node_data.data.addon_checks {
+                let mut prefixed_check = check.clone();
+                prefixed_check.name = format!("{}{}", prefix, check.name);
+                data.addon_checks.push(prefixed_check);
+            }
+        }
+
+        self.state.set_data(data);
     }
 
     /// Access loaded data immutably
@@ -163,6 +328,11 @@ impl DiagnosticsComponent {
     /// Access loaded data mutably
     fn data_mut(&mut self) -> Option<&mut DiagnosticsData> {
         self.state.data_mut()
+    }
+
+    /// Take the loaded data out of the component (for transferring to group view)
+    pub fn take_data(&mut self) -> Option<DiagnosticsData> {
+        self.state.take_data()
     }
 
     /// Set the client for making API calls
@@ -180,9 +350,22 @@ impl DiagnosticsComponent {
         self.state.set_error(error);
     }
 
+    /// Get the DiagnosticsData to display based on view mode (ByNode or Interleaved)
+    fn get_display_data(&self) -> Option<&DiagnosticsData> {
+        if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
+            // ByNode mode: show data from selected node only
+            let (hostname, _) = self.nodes.get(self.selected_node_tab)?;
+            let node_data = self.node_data.get(hostname)?;
+            Some(&node_data.data)
+        } else {
+            // Interleaved mode: use merged data
+            self.data()
+        }
+    }
+
     /// Get all checks in the current category
     fn current_checks(&self) -> &[DiagnosticCheck] {
-        let Some(data) = self.data() else {
+        let Some(data) = self.get_display_data() else {
             return &[];
         };
         match self.selected_category {
@@ -970,6 +1153,40 @@ impl Component for DiagnosticsComponent {
             KeyCode::Enter => {
                 self.initiate_fix();
             }
+            KeyCode::Char('v') => {
+                // Toggle view mode (only in group view)
+                if self.is_group_view {
+                    self.group_view_mode = match self.group_view_mode {
+                        GroupViewMode::Interleaved => GroupViewMode::ByNode,
+                        GroupViewMode::ByNode => GroupViewMode::Interleaved,
+                    };
+                    // Reset selection when changing view mode
+                    self.selected_check = 0;
+                    self.table_state.select(Some(0));
+                }
+            }
+            KeyCode::Char('[') => {
+                // Previous node tab (only in group view with ByNode mode)
+                if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
+                    if self.selected_node_tab > 0 {
+                        self.selected_node_tab -= 1;
+                        // Reset selection when changing tabs
+                        self.selected_check = 0;
+                        self.table_state.select(Some(0));
+                    }
+                }
+            }
+            KeyCode::Char(']') => {
+                // Next node tab (only in group view with ByNode mode)
+                if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
+                    if self.selected_node_tab + 1 < self.nodes.len() {
+                        self.selected_node_tab += 1;
+                        // Reset selection when changing tabs
+                        self.selected_check = 0;
+                        self.table_state.select(Some(0));
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -1006,10 +1223,59 @@ impl Component for DiagnosticsComponent {
             })
             .unwrap_or_else(|| (String::new(), String::new(), "Unknown"));
 
+        // Build header spans based on single node vs group view
+        let header_spans = if self.is_group_view {
+            let mut spans = vec![
+                Span::styled(" Diagnostics: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(&self.group_name, Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" ({} nodes)", self.nodes.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+
+            // View mode indicator
+            let view_mode_label = match self.group_view_mode {
+                GroupViewMode::Interleaved => "[MERGED]",
+                GroupViewMode::ByNode => "[BY NODE]",
+            };
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                view_mode_label,
+                Style::default().fg(Color::Green),
+            ));
+
+            // Node tabs for ByNode mode
+            if self.group_view_mode == GroupViewMode::ByNode && !self.nodes.is_empty() {
+                spans.push(Span::raw("  "));
+                for (i, (node_hostname, _)) in self.nodes.iter().enumerate() {
+                    if i == self.selected_node_tab {
+                        spans.push(Span::styled(
+                            format!("[{}]", node_hostname),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            format!(" {} ", node_hostname),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                }
+            }
+
+            spans
+        } else {
+            // Single node header
+            vec![
+                Span::styled(
+                    format!(" Diagnostics: {} ({}) [{}] ", hostname, address, cni_label),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]
+        };
+
         // Header
-        let header_text = format!(" Diagnostics: {} ({}) [{}] ", hostname, address, cni_label);
-        let header = Paragraph::new(header_text)
-            .style(Style::default().add_modifier(Modifier::BOLD))
+        let header = Paragraph::new(Line::from(header_spans))
             .block(Block::default().borders(Borders::BOTTOM));
         frame.render_widget(header, chunks[0]);
 
@@ -1017,7 +1283,7 @@ impl Component for DiagnosticsComponent {
             let error_msg =
                 Paragraph::new(format!("Error: {}", error)).style(Style::default().fg(Color::Red));
             frame.render_widget(error_msg, chunks[1]);
-        } else if let Some(data) = self.data() {
+        } else if let Some(data) = self.get_display_data() {
             // Dynamically size Addons section based on whether addons are detected
             let addons_height = if data.detected_addons.any_detected() {
                 Constraint::Length(5)
@@ -1084,7 +1350,23 @@ impl Component for DiagnosticsComponent {
         }
 
         // Footer
-        let footer = Paragraph::new(Line::from(vec![
+        let mut footer_spans = vec![];
+
+        // Add view mode toggle hint if in group view
+        if self.is_group_view {
+            footer_spans.push(Span::styled("[v]", Style::default().fg(Color::Cyan)));
+            footer_spans.push(Span::raw(" View  "));
+
+            // Add tab navigation hint if in ByNode mode
+            if self.group_view_mode == GroupViewMode::ByNode {
+                footer_spans.push(Span::styled("[", Style::default().fg(Color::Cyan)));
+                footer_spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
+                footer_spans.push(Span::styled("]", Style::default().fg(Color::Cyan)));
+                footer_spans.push(Span::raw(" Tabs  "));
+            }
+        }
+
+        footer_spans.extend(vec![
             Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
             Span::raw(" Navigate  "),
             Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
@@ -1095,7 +1377,9 @@ impl Component for DiagnosticsComponent {
             Span::raw(" Refresh  "),
             Span::styled("[q]", Style::default().fg(Color::Cyan)),
             Span::raw(" Back"),
-        ]));
+        ]);
+
+        let footer = Paragraph::new(Line::from(footer_spans));
         frame.render_widget(footer, chunks[2]);
 
         if self.show_confirmation {
@@ -1107,5 +1391,187 @@ impl Component for DiagnosticsComponent {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a test DiagnosticCheck
+    fn make_check(name: &str) -> DiagnosticCheck {
+        DiagnosticCheck::pass(name, name, "OK")
+    }
+
+    /// Create a test DiagnosticsData with some checks
+    fn make_diagnostics_data(hostname: &str) -> DiagnosticsData {
+        DiagnosticsData {
+            hostname: hostname.to_string(),
+            address: format!("10.0.0.{}", hostname.chars().last().unwrap_or('1')),
+            context: DiagnosticContext::new(),
+            system_checks: vec![make_check("cpu"), make_check("memory")],
+            kubernetes_checks: vec![make_check("etcd")],
+            cni_checks: vec![make_check("cni_health")],
+            service_checks: vec![make_check("kubelet")],
+            addon_checks: vec![],
+            detected_addons: addons::DetectedAddons::default(),
+        }
+    }
+
+    /// Create a DiagnosticsComponent for single node view
+    fn create_single_node_component() -> DiagnosticsComponent {
+        let mut component = DiagnosticsComponent::new(
+            "test-node".to_string(),
+            "10.0.0.1".to_string(),
+            "controlplane".to_string(),
+            None,
+        );
+
+        // Set up data
+        let data = make_diagnostics_data("test-node");
+        component.state.set_data(data);
+        component
+    }
+
+    /// Create a DiagnosticsComponent for group view
+    fn create_group_component() -> DiagnosticsComponent {
+        let nodes = vec![
+            ("node-1".to_string(), "10.0.0.1".to_string()),
+            ("node-2".to_string(), "10.0.0.2".to_string()),
+        ];
+        let mut component = DiagnosticsComponent::new_group(
+            "Control Plane".to_string(),
+            "controlplane".to_string(),
+            nodes,
+            None,
+            None,
+        );
+
+        // Add node data
+        component.add_node_diagnostics("node-1".to_string(), make_diagnostics_data("node-1"));
+        component.add_node_diagnostics("node-2".to_string(), make_diagnostics_data("node-2"));
+
+        component
+    }
+
+    // ==========================================================================
+    // Tests for get_display_data()
+    // ==========================================================================
+
+    #[test]
+    fn test_get_display_data_single_node_returns_merged_data() {
+        let component = create_single_node_component();
+
+        let result = component.get_display_data();
+        assert!(result.is_some());
+
+        let data = result.unwrap();
+        assert_eq!(data.system_checks.len(), 2);
+        assert_eq!(data.kubernetes_checks.len(), 1);
+        assert!(data.system_checks.iter().any(|c| c.name == "cpu"));
+        assert!(data.system_checks.iter().any(|c| c.name == "memory"));
+    }
+
+    #[test]
+    fn test_get_display_data_group_interleaved_returns_merged_data() {
+        let mut component = create_group_component();
+        component.group_view_mode = GroupViewMode::Interleaved;
+
+        let result = component.get_display_data();
+        assert!(result.is_some());
+
+        let data = result.unwrap();
+        // Should have merged checks from both nodes (4 system checks total: 2 per node)
+        assert_eq!(data.system_checks.len(), 4);
+        // Check names should be prefixed with hostname
+        assert!(data
+            .system_checks
+            .iter()
+            .any(|c| c.name.starts_with("[node-1]") || c.name.starts_with("[node-2]")));
+    }
+
+    #[test]
+    fn test_get_display_data_group_bynode_returns_selected_node_data() {
+        let mut component = create_group_component();
+        component.group_view_mode = GroupViewMode::ByNode;
+        component.selected_node_tab = 0; // Select first node
+
+        let result = component.get_display_data();
+        assert!(result.is_some());
+
+        let data = result.unwrap();
+        // Should only have data from node-1
+        assert_eq!(data.hostname, "node-1");
+        assert_eq!(data.system_checks.len(), 2);
+        // No prefixing in ByNode mode - raw node data
+        assert!(data.system_checks.iter().any(|c| c.name == "cpu"));
+    }
+
+    #[test]
+    fn test_get_display_data_group_bynode_second_node() {
+        let mut component = create_group_component();
+        component.group_view_mode = GroupViewMode::ByNode;
+        component.selected_node_tab = 1; // Select second node
+
+        let result = component.get_display_data();
+        assert!(result.is_some());
+
+        let data = result.unwrap();
+        // Should only have data from node-2
+        assert_eq!(data.hostname, "node-2");
+        assert_eq!(data.system_checks.len(), 2);
+    }
+
+    #[test]
+    fn test_get_display_data_returns_none_when_tab_out_of_bounds() {
+        let mut component = create_group_component();
+        component.group_view_mode = GroupViewMode::ByNode;
+        component.selected_node_tab = 99; // Invalid tab index
+
+        let result = component.get_display_data();
+        assert!(result.is_none(), "Should return None for invalid tab index");
+    }
+
+    #[test]
+    fn test_get_display_data_group_bynode_with_no_data_for_node() {
+        let nodes = vec![
+            ("node-1".to_string(), "10.0.0.1".to_string()),
+            ("node-2".to_string(), "10.0.0.2".to_string()),
+        ];
+        let mut component = DiagnosticsComponent::new_group(
+            "Control Plane".to_string(),
+            "controlplane".to_string(),
+            nodes,
+            None,
+            None,
+        );
+        component.group_view_mode = GroupViewMode::ByNode;
+
+        // Only add data for node-1
+        component.add_node_diagnostics("node-1".to_string(), make_diagnostics_data("node-1"));
+
+        // Select node-2 which has no data
+        component.selected_node_tab = 1;
+
+        let result = component.get_display_data();
+        assert!(
+            result.is_none(),
+            "Should return None when selected node has no data"
+        );
+    }
+
+    #[test]
+    fn test_get_display_data_single_node_not_affected_by_view_mode() {
+        let mut component = create_single_node_component();
+
+        // Even with group view mode set, single node should ignore it
+        component.group_view_mode = GroupViewMode::ByNode;
+
+        let result = component.get_display_data();
+        assert!(result.is_some());
+
+        // Should still get the single node's data
+        let data = result.unwrap();
+        assert_eq!(data.system_checks.len(), 2);
     }
 }

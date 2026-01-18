@@ -93,6 +93,16 @@ impl LogLevel {
     }
 }
 
+/// View mode for group logs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupViewMode {
+    /// Interleaved logs from all nodes (default)
+    #[default]
+    Interleaved,
+    /// Logs organized by node (tabbed view)
+    ByNode,
+}
+
 /// A log entry from any service
 #[derive(Debug, Clone)]
 pub(crate) struct MultiLogEntry {
@@ -110,6 +120,8 @@ pub(crate) struct MultiLogEntry {
     message: String,
     /// Pre-computed lowercase for search
     search_text: String,
+    /// Node hostname (for group view)
+    node_hostname: String,
 }
 
 /// Service state for sidebar
@@ -160,7 +172,7 @@ pub(crate) struct MultiLogsData {
 
 /// Multi-service logs component
 pub struct MultiLogsComponent {
-    /// Node IP being viewed
+    /// Node IP being viewed (for single node mode)
     node_ip: String,
     /// Node role (controlplane/worker)
     node_role: String,
@@ -202,17 +214,17 @@ pub struct MultiLogsComponent {
     /// Current match index
     current_match: usize,
 
-    /// Talos client for streaming
+    /// Talos client for streaming (single node mode)
     client: Option<talos_rs::TalosClient>,
     /// Tail lines setting
     tail_lines: i32,
     /// Whether streaming is active
     streaming: bool,
-    /// Channel to receive streamed log lines (service_id, line)
-    stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
+    /// Channel to receive streamed log lines (hostname, service_id, line)
+    stream_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String, String)>>,
     /// Sender for stream aggregator (kept alive to prevent channel close)
     #[allow(dead_code)]
-    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
+    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, String, String)>>,
     /// Animation frame for pulsing indicator
     pulse_frame: u8,
     /// Whether to wrap long lines
@@ -221,10 +233,24 @@ pub struct MultiLogsComponent {
     selection_start: Option<usize>,
     /// Current cursor position in visible_indices (always tracked, moves with navigation)
     cursor: usize,
+
+    // Group view fields
+    /// Whether this is a group view (multiple nodes)
+    is_group_view: bool,
+    /// Group name (e.g., "Control Plane", "Workers")
+    group_name: String,
+    /// Nodes in the group: Vec<(hostname, ip)>
+    nodes: Vec<(String, String)>,
+    /// Current view mode for group logs
+    view_mode: GroupViewMode,
+    /// Clients for each node (hostname -> client)
+    node_clients: std::collections::HashMap<String, talos_rs::TalosClient>,
+    /// Selected node tab index (for ByNode view mode)
+    selected_node_tab: usize,
 }
 
 impl MultiLogsComponent {
-    /// Create a new multi-logs component
+    /// Create a new multi-logs component for single node view
     /// - active_services: services to initially show logs for
     /// - all_services: all available services (inactive ones shown greyed out in sidebar)
     pub fn new(
@@ -320,7 +346,124 @@ impl MultiLogsComponent {
             wrap: false,
             selection_start: None,
             cursor: 0,
+            // Group view fields (not used in single node mode)
+            is_group_view: false,
+            group_name: String::new(),
+            nodes: Vec::new(),
+            view_mode: GroupViewMode::default(),
+            node_clients: std::collections::HashMap::new(),
+            selected_node_tab: 0,
         }
+    }
+
+    /// Create a new multi-logs component for group view (multiple nodes)
+    /// - group_name: Name of the group (e.g., "Control Plane", "Workers")
+    /// - node_role: Role of nodes in this group
+    /// - nodes: Vec of (hostname, ip) for each node
+    /// - services: Common services across all nodes
+    pub fn new_group(
+        group_name: String,
+        node_role: String,
+        nodes: Vec<(String, String)>,
+        services: Vec<String>,
+    ) -> Self {
+        // All services are active by default for group view
+        let service_states: Vec<ServiceState> = services
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| ServiceState {
+                color: SERVICE_COLORS[i % SERVICE_COLORS.len()],
+                active: true,
+                id,
+                entry_count: 0,
+            })
+            .collect();
+
+        let mut sidebar_state = ListState::default();
+        sidebar_state.select(Some(0));
+
+        // Initialize level filters (all active by default)
+        let levels = vec![
+            LevelState {
+                level: LogLevel::Error,
+                active: true,
+                entry_count: 0,
+            },
+            LevelState {
+                level: LogLevel::Warn,
+                active: true,
+                entry_count: 0,
+            },
+            LevelState {
+                level: LogLevel::Info,
+                active: true,
+                entry_count: 0,
+            },
+            LevelState {
+                level: LogLevel::Debug,
+                active: true,
+                entry_count: 0,
+            },
+            LevelState {
+                level: LogLevel::Unknown,
+                active: true,
+                entry_count: 0,
+            },
+        ];
+        let mut levels_state = ListState::default();
+        levels_state.select(Some(0));
+
+        Self {
+            node_ip: String::new(), // Not used in group view
+            node_role,
+            services: service_states,
+            selected_service: 0,
+            sidebar_state,
+            levels,
+            selected_level: 0,
+            levels_state,
+            state: {
+                let mut state = AsyncState::new();
+                state.start_loading();
+                state.set_data(MultiLogsData::default());
+                state
+            },
+            floating_pane: FloatingPane::None,
+            scroll: 0,
+            viewport_height: 20,
+            following: true,
+            search_mode: SearchMode::Off,
+            search_query: String::new(),
+            match_set: HashSet::new(),
+            match_order: Vec::new(),
+            current_match: 0,
+            client: None,
+            tail_lines: 500,
+            streaming: false,
+            stream_rx: None,
+            stream_tx: None,
+            pulse_frame: 0,
+            wrap: false,
+            selection_start: None,
+            cursor: 0,
+            // Group view fields
+            is_group_view: true,
+            group_name,
+            nodes,
+            view_mode: GroupViewMode::default(),
+            node_clients: std::collections::HashMap::new(),
+            selected_node_tab: 0,
+        }
+    }
+
+    /// Set up clients for multiple nodes (group view)
+    pub fn set_multi_node_clients(
+        &mut self,
+        clients: std::collections::HashMap<String, talos_rs::TalosClient>,
+        tail_lines: i32,
+    ) {
+        self.node_clients = clients;
+        self.tail_lines = tail_lines;
     }
 
     /// Set the Talos client for streaming
@@ -341,6 +484,15 @@ impl MultiLogsComponent {
 
     /// Start streaming logs from all active services
     pub fn start_streaming(&mut self) {
+        if self.is_group_view {
+            self.start_multi_node_streaming();
+        } else {
+            self.start_single_node_streaming();
+        }
+    }
+
+    /// Start streaming for single node mode
+    fn start_single_node_streaming(&mut self) {
         let client = match &self.client {
             Some(c) => c.clone(),
             None => return,
@@ -349,8 +501,8 @@ impl MultiLogsComponent {
         // Stop any existing streams
         self.stop_streaming();
 
-        // Create aggregated channel
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        // Create aggregated channel - now includes hostname (empty for single node)
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, String, String)>();
         self.stream_tx = Some(tx.clone());
         self.stream_rx = Some(rx);
         self.streaming = true;
@@ -370,7 +522,8 @@ impl MultiLogsComponent {
                 match client.logs_stream(&service_id, tail_lines).await {
                     Ok(mut stream_rx) => {
                         while let Some(line) = stream_rx.recv().await {
-                            if tx.send((service_id.clone(), line)).is_err() {
+                            // Empty hostname for single node mode
+                            if tx.send((String::new(), service_id.clone(), line)).is_err() {
                                 // Channel closed, stop this stream
                                 break;
                             }
@@ -381,6 +534,58 @@ impl MultiLogsComponent {
                     }
                 }
             });
+        }
+    }
+
+    /// Start streaming logs from multiple nodes (group view)
+    pub fn start_multi_node_streaming(&mut self) {
+        if self.node_clients.is_empty() {
+            return;
+        }
+
+        // Stop any existing streams
+        self.stop_streaming();
+
+        // Create aggregated channel - (hostname, service_id, line)
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, String, String)>();
+        self.stream_tx = Some(tx.clone());
+        self.stream_rx = Some(rx);
+        self.streaming = true;
+
+        // Spawn stream tasks for each node + active service combination
+        for (hostname, client) in &self.node_clients {
+            for service in &self.services {
+                if !service.active {
+                    continue;
+                }
+
+                let hostname = hostname.clone();
+                let service_id = service.id.clone();
+                let client = client.clone();
+                let tx = tx.clone();
+                let tail_lines = self.tail_lines;
+
+                tokio::spawn(async move {
+                    match client.logs_stream(&service_id, tail_lines).await {
+                        Ok(mut stream_rx) => {
+                            while let Some(line) = stream_rx.recv().await {
+                                if tx.send((hostname.clone(), service_id.clone(), line)).is_err() {
+                                    // Channel closed, stop this stream
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to start log stream for {}:{}: {}",
+                                hostname,
+                                service_id,
+                                e
+                            );
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -399,7 +604,7 @@ impl MultiLogsComponent {
     /// Process incoming streamed log entries (call on tick)
     fn process_stream_entries(&mut self) {
         // First, drain the channel into a local vec to avoid borrow issues
-        let raw_lines: Vec<(String, String)> = {
+        let raw_lines: Vec<(String, String, String)> = {
             let rx = match &mut self.stream_rx {
                 Some(r) => r,
                 None => return,
@@ -441,9 +646,9 @@ impl MultiLogsComponent {
         // Now parse entries (can access self freely)
         let new_entries: Vec<MultiLogEntry> = raw_lines
             .into_iter()
-            .map(|(service_id, line)| {
+            .map(|(hostname, service_id, line)| {
                 let color = self.get_service_color(&service_id);
-                Self::parse_line(&line, &service_id, color)
+                Self::parse_line_with_hostname(&line, &service_id, color, &hostname)
             })
             .collect();
 
@@ -536,7 +741,7 @@ impl MultiLogsComponent {
             .unwrap_or(Color::White)
     }
 
-    /// Set log content from multiple services
+    /// Set log content from multiple services (single node mode)
     pub fn set_logs(&mut self, logs: Vec<(String, String)>) {
         // Parse entries (need service colors first)
         let mut new_entries = Vec::new();
@@ -580,8 +785,63 @@ impl MultiLogsComponent {
         }
     }
 
+    /// Set log content from multiple nodes (group view mode)
+    /// logs: Vec<(hostname, service_id, content)>
+    pub fn set_group_logs(&mut self, logs: Vec<(String, String, String)>) {
+        let mut new_entries = Vec::new();
+
+        for (hostname, service_id, content) in logs {
+            let color = self.get_service_color(&service_id);
+
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                let entry = Self::parse_line_with_hostname(line, &service_id, color, &hostname);
+                new_entries.push(entry);
+            }
+        }
+
+        // Sort by timestamp
+        new_entries.sort_by_key(|e| e.timestamp_sort);
+
+        // Enforce max entries (ring buffer behavior)
+        if new_entries.len() > MAX_LOG_ENTRIES {
+            new_entries.drain(0..new_entries.len() - MAX_LOG_ENTRIES);
+        }
+
+        // Update data
+        if let Some(data) = self.data_mut() {
+            data.entries = new_entries;
+        }
+
+        // Update counts
+        self.update_counts();
+
+        // Build visible indices
+        self.rebuild_visible_indices();
+
+        self.state.mark_loaded();
+
+        // Scroll to bottom if following
+        if self.following {
+            self.scroll_to_bottom();
+        }
+    }
+
     /// Parse a log line into a MultiLogEntry
     fn parse_line(line: &str, service_id: &str, color: Color) -> MultiLogEntry {
+        Self::parse_line_with_hostname(line, service_id, color, "")
+    }
+
+    /// Parse a log line into a MultiLogEntry with hostname (for group view)
+    fn parse_line_with_hostname(
+        line: &str,
+        service_id: &str,
+        color: Color,
+        hostname: &str,
+    ) -> MultiLogEntry {
         let line = line.trim();
         let search_text = line.to_lowercase();
 
@@ -597,6 +857,7 @@ impl MultiLogsComponent {
             level,
             message,
             search_text,
+            node_hostname: hostname.to_string(),
         }
     }
 
@@ -1416,6 +1677,39 @@ impl MultiLogsComponent {
 
         let Some(data) = self.data() else { return };
 
+        // For ByNode view, draw node tabs first
+        let (tabs_height, logs_area) = if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+            // Draw node tabs at the top
+            let tabs_area = Rect::new(area.x, area.y, area.width, 1);
+            let mut tab_spans = Vec::new();
+            for (i, (hostname, _)) in self.nodes.iter().enumerate() {
+                let short_name = if hostname.len() > 10 {
+                    &hostname[..10]
+                } else {
+                    hostname.as_str()
+                };
+                if i == self.selected_node_tab {
+                    tab_spans.push(Span::styled(
+                        format!(" [{}] ", short_name),
+                        Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+                    ));
+                } else {
+                    tab_spans.push(Span::styled(
+                        format!("  {}  ", short_name),
+                        Style::default().fg(Color::Gray),
+                    ));
+                }
+            }
+            tab_spans.push(Span::raw("  "));
+            tab_spans.push(Span::styled("[/]", Style::default().fg(Color::Yellow)));
+            tab_spans.push(Span::styled(" switch", Style::default().dim()));
+            let tabs = Paragraph::new(Line::from(tab_spans));
+            frame.render_widget(tabs, tabs_area);
+            (1, Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1)))
+        } else {
+            (0, area)
+        };
+
         if data.visible_indices.is_empty() {
             let msg = if self.active_count() == 0 || self.active_level_count() == 0 {
                 " No services/levels selected. Press 's' or 'l' to open filters."
@@ -1423,22 +1717,47 @@ impl MultiLogsComponent {
                 " No log entries"
             };
             let empty = Paragraph::new(Line::from(Span::raw(msg).dim()));
-            frame.render_widget(empty, area);
+            frame.render_widget(empty, logs_area);
             return;
         }
 
-        let visible_height = area.height as usize;
-        let content_width = area.width.saturating_sub(1) as usize; // -1 for scrollbar
+        // For ByNode view, filter entries to show only the selected node
+        let filtered_indices: Vec<usize> = if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+            if let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) {
+                data.visible_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| data.entries.get(idx).map(|e| &e.node_hostname == hostname).unwrap_or(false))
+                    .collect()
+            } else {
+                data.visible_indices.clone()
+            }
+        } else {
+            data.visible_indices.clone()
+        };
+
+        if filtered_indices.is_empty() {
+            let msg = " No log entries for this node";
+            let empty = Paragraph::new(Line::from(Span::raw(msg).dim()));
+            frame.render_widget(empty, logs_area);
+            return;
+        }
+
+        let visible_height = logs_area.height as usize;
+        let content_width = logs_area.width.saturating_sub(1) as usize; // -1 for scrollbar
 
         // Safety clamp scroll to valid range (max is where last entry is at viewport bottom)
-        let total = data.visible_indices.len();
+        let total = filtered_indices.len();
         let max_start = total.saturating_sub(visible_height);
         let start = (self.scroll as usize).min(max_start);
         let end = (start + visible_height).min(total);
 
+        // Use filtered_indices instead of data.visible_indices for the rest
+        let _ = tabs_height; // Suppress unused warning
+
         let mut lines: Vec<Line> = Vec::new();
 
-        for (vi, &entry_idx) in data.visible_indices[start..end].iter().enumerate() {
+        for (vi, &entry_idx) in filtered_indices[start..end].iter().enumerate() {
             let visible_idx = start + vi;
             let entry = &data.entries[entry_idx];
             let is_current_match = self.is_current_match(visible_idx);
@@ -1487,12 +1806,37 @@ impl MultiLogsComponent {
             }
             spans.push(Span::raw(" "));
 
-            // Service name (colored, fixed width)
-            spans.push(Span::styled(
-                format!("{:<12}", entry.service_id),
-                Style::default().fg(entry.service_color),
-            ));
-            spans.push(Span::raw(" "));
+            // For group view in interleaved mode, show node:service prefix
+            // For single node or ByNode mode, show just service
+            let prefix_width = if self.is_group_view && self.view_mode == GroupViewMode::Interleaved {
+                // Show shortened node hostname and service
+                let short_host = if entry.node_hostname.len() > 8 {
+                    &entry.node_hostname[..8]
+                } else {
+                    &entry.node_hostname
+                };
+                spans.push(Span::styled(
+                    format!("{:<8}", short_host),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::raw(":"));
+                spans.push(Span::styled(
+                    format!("{:<10}", entry.service_id),
+                    Style::default().fg(entry.service_color),
+                ));
+                spans.push(Span::raw(" "));
+                // indicator(1) + time(8) + space(1) + node(8) + colon(1) + service(10) + space(1) + level(3) + space(1)
+                1 + 8 + 1 + 8 + 1 + 10 + 1 + 3 + 1
+            } else {
+                // Service name (colored, fixed width)
+                spans.push(Span::styled(
+                    format!("{:<12}", entry.service_id),
+                    Style::default().fg(entry.service_color),
+                ));
+                spans.push(Span::raw(" "));
+                // indicator(1) + time(8) + space(1) + service(12) + space(1) + level(3) + space(1)
+                1 + 8 + 1 + 12 + 1 + 3 + 1
+            };
 
             // Level badge
             let level_style = Style::default()
@@ -1503,7 +1847,6 @@ impl MultiLogsComponent {
             spans.push(Span::raw(" "));
 
             // Message with optional highlighting
-            let prefix_width = 1 + 8 + 1 + 12 + 1 + 3 + 1; // indicator + time + service + level
             let available = content_width.saturating_sub(prefix_width);
 
             if self.wrap && entry.message.len() > available {
@@ -1568,19 +1911,19 @@ impl MultiLogsComponent {
         }
 
         let logs = Paragraph::new(lines);
-        frame.render_widget(logs, area);
+        frame.render_widget(logs, logs_area);
 
         // Scrollbar
-        if data.visible_indices.len() > visible_height {
+        if filtered_indices.len() > visible_height {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("▲"))
                 .end_symbol(Some("▼"))
                 .track_symbol(Some("│"))
                 .thumb_symbol("█");
-            let mut scrollbar_state = ScrollbarState::new(data.visible_indices.len())
+            let mut scrollbar_state = ScrollbarState::new(filtered_indices.len())
                 .position(self.scroll as usize)
                 .viewport_content_length(visible_height);
-            frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+            frame.render_stateful_widget(scrollbar, logs_area, &mut scrollbar_state);
         }
     }
 }
@@ -1857,6 +2200,48 @@ impl Component for MultiLogsComponent {
                 Ok(None)
             }
 
+            // Toggle view mode (Interleaved / ByNode) - only for group view
+            KeyCode::Char('v') => {
+                if self.is_group_view {
+                    self.view_mode = match self.view_mode {
+                        GroupViewMode::Interleaved => {
+                            // Switching to ByNode - reset cursor and scroll
+                            self.cursor = 0;
+                            self.scroll = 0;
+                            GroupViewMode::ByNode
+                        }
+                        GroupViewMode::ByNode => {
+                            // Switching to Interleaved - reset cursor and scroll
+                            self.cursor = 0;
+                            self.scroll = 0;
+                            GroupViewMode::Interleaved
+                        }
+                    };
+                }
+                Ok(None)
+            }
+
+            // Navigate between node tabs in ByNode view mode
+            KeyCode::Char('[') => {
+                if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+                    self.selected_node_tab = self.selected_node_tab.saturating_sub(1);
+                    // Reset cursor and scroll for the new tab
+                    self.cursor = 0;
+                    self.scroll = 0;
+                }
+                Ok(None)
+            }
+            KeyCode::Char(']') => {
+                if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+                    let max_tab = self.nodes.len().saturating_sub(1);
+                    self.selected_node_tab = (self.selected_node_tab + 1).min(max_tab);
+                    // Reset cursor and scroll for the new tab
+                    self.cursor = 0;
+                    self.scroll = 0;
+                }
+                Ok(None)
+            }
+
             // Visual line selection mode
             KeyCode::Char('V') => {
                 if self.in_visual_mode() {
@@ -1933,21 +2318,49 @@ impl Component for MultiLogsComponent {
             Span::styled("○ PAUSED ", Style::default().fg(Color::DarkGray))
         };
 
-        let mut header_spans = vec![
-            Span::raw(" Multi-Service Logs: ").bold().fg(Color::Cyan),
-            Span::raw(&self.node_ip).fg(Color::White),
-            Span::raw(format!(" ({})", self.node_role)).dim(),
-            Span::raw("  "),
-            follow_indicator,
-            Span::raw(format!(
-                " [{}/{} svcs, {}/{} lvls]",
-                self.active_count(),
-                self.services.len(),
-                self.active_level_count(),
-                self.levels.len()
-            ))
-            .dim(),
-        ];
+        // Build header based on whether this is a group view or single node view
+        let mut header_spans = if self.is_group_view {
+            // Group view header: "Group Logs: Control Plane (3 nodes) (controlplane)"
+            let view_mode_indicator = match self.view_mode {
+                GroupViewMode::Interleaved => "[Interleaved]",
+                GroupViewMode::ByNode => "[ByNode]",
+            };
+            vec![
+                Span::raw(" Group Logs: ").bold().fg(Color::Cyan),
+                Span::raw(&self.group_name).fg(Color::White),
+                Span::raw(format!(" ({} nodes)", self.nodes.len())).fg(Color::Yellow),
+                Span::raw(format!(" ({})", self.node_role)).dim(),
+                Span::raw("  "),
+                follow_indicator,
+                Span::raw(format!(
+                    " [{}/{} svcs, {}/{} lvls]",
+                    self.active_count(),
+                    self.services.len(),
+                    self.active_level_count(),
+                    self.levels.len()
+                ))
+                .dim(),
+                Span::raw("  "),
+                Span::raw(view_mode_indicator).fg(Color::Magenta),
+            ]
+        } else {
+            // Single node view header
+            vec![
+                Span::raw(" Multi-Service Logs: ").bold().fg(Color::Cyan),
+                Span::raw(&self.node_ip).fg(Color::White),
+                Span::raw(format!(" ({})", self.node_role)).dim(),
+                Span::raw("  "),
+                follow_indicator,
+                Span::raw(format!(
+                    " [{}/{} svcs, {}/{} lvls]",
+                    self.active_count(),
+                    self.services.len(),
+                    self.active_level_count(),
+                    self.levels.len()
+                ))
+                .dim(),
+            ]
+        };
 
         // Show match count when searching
         if !self.match_order.is_empty() {
@@ -2094,7 +2507,7 @@ impl Component for MultiLogsComponent {
         } else {
             let stream_text = if self.streaming { " stop" } else { " stream" };
             let wrap_text = if self.wrap { " nowrap" } else { " wrap" };
-            vec![
+            let mut spans = vec![
                 Span::raw(" [s]").fg(Color::Yellow),
                 Span::raw(" svcs").dim(),
                 Span::raw(" "),
@@ -2112,6 +2525,14 @@ impl Component for MultiLogsComponent {
                 Span::raw(" "),
                 Span::raw("[w]").fg(Color::Yellow),
                 Span::raw(wrap_text).dim(),
+            ];
+            // Add view mode toggle for group view
+            if self.is_group_view {
+                spans.push(Span::raw(" "));
+                spans.push(Span::raw("[v]").fg(Color::Yellow));
+                spans.push(Span::raw(" view").dim());
+            }
+            spans.extend([
                 Span::raw(" "),
                 Span::raw("[V]").fg(Color::Yellow),
                 Span::raw(" visual").dim(),
@@ -2121,7 +2542,8 @@ impl Component for MultiLogsComponent {
                 Span::raw(" "),
                 Span::raw("[q]").fg(Color::Yellow),
                 Span::raw(" back").dim(),
-            ]
+            ]);
+            spans
         };
 
         let footer = Paragraph::new(Line::from(footer_spans)).block(
