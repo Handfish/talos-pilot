@@ -547,6 +547,38 @@ pub async fn get_discovery_members_for_context(
     parse_discovery_members_yaml(&output)
 }
 
+/// Get discovery members with automatic retry on transient failures.
+/// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
+pub async fn get_discovery_members_with_retry(
+    context: &str,
+    config_path: Option<&str>,
+) -> Result<Vec<DiscoveryMember>, TalosError> {
+    const MAX_RETRIES: u32 = 3;
+    const BASE_DELAY_MS: u64 = 100;
+
+    let mut last_error = None;
+
+    for attempt in 0..=MAX_RETRIES {
+        match get_discovery_members_for_context(context, config_path).await {
+            Ok(members) => return Ok(members),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < MAX_RETRIES {
+                    let delay_ms = BASE_DELAY_MS * (1 << attempt);
+                    tracing::debug!(
+                        "Discovery fetch attempt {} failed, retrying in {}ms",
+                        attempt + 1,
+                        delay_ms
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap())
+}
+
 /// Get address status for a node (for VIP detection)
 ///
 /// Executes: talosctl get addressstatus --nodes <node> -o yaml
