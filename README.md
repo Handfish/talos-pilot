@@ -101,6 +101,61 @@ cargo build --release
 ./target/release/talos-pilot
 ```
 
+### NixOS
+
+Talos pilot is available as a Nix flake but can also be run without installing.
+
+#### Run talos-pilot without installing
+
+You can test the app directly by using a nix shell
+
+```bash
+nix shell github:Handfish/talos-pilot
+```
+
+Or run it directly
+
+```bash
+nix run github:Handfish/talos-pilot
+```
+
+#### Usage in flakes
+
+```nix
+# flake.nix
+{
+  inputs = {
+    # ...
+    talos-pilot.url = "github:Handfish/talos-pilot";
+  };
+  outputs =
+    {
+      self,
+      nixpkgs,
+      talos-pilot,
+      # ...
+    }:
+    {
+      nixosConfigurations.mymachine = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          {
+            # provides `pkgs.talos-pilot`
+            nixpkgs.overlays = [ talos-pilot.overlays.default ];
+          }
+          (
+            { pkgs, ... }:
+            {
+              # install talos-pilot
+              environment.systemPackages = [ pkgs.talos-pilot ];
+            }
+          )
+        ];
+      };
+    };
+}
+```
+
 ### Requirements
 
 - Valid `~/.talos/config` (talosconfig)
