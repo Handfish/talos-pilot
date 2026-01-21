@@ -421,14 +421,45 @@ impl NetworkStatsComponent {
             return;
         }
 
-        // Store node data
-        let mut node_network = NodeNetworkData {
-            hostname: hostname.clone(),
-            data: NetworkData::default(),
-        };
-        node_network.data.devices = devices;
+        let now = Instant::now();
 
-        self.node_data.insert(hostname, node_network);
+        // Get or create node data, preserving previous samples for rate calculation
+        let node_network =
+            self.node_data
+                .entry(hostname.clone())
+                .or_insert_with(|| NodeNetworkData {
+                    hostname: hostname.clone(),
+                    data: NetworkData::default(),
+                });
+
+        // Calculate rates if we have previous data
+        let elapsed_secs = node_network
+            .data
+            .last_sample
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+
+        if elapsed_secs > 0.1 {
+            for dev in &devices {
+                if let Some(prev) = node_network.data.prev_devices.get(&dev.name) {
+                    let rate = NetDevRate::from_delta(prev, dev, elapsed_secs);
+                    node_network.data.rates.insert(dev.name.clone(), rate);
+                }
+            }
+        }
+
+        // Store current as previous for next calculation
+        node_network.data.prev_devices.clear();
+        for dev in &devices {
+            node_network
+                .data
+                .prev_devices
+                .insert(dev.name.clone(), dev.clone());
+        }
+        node_network.data.last_sample = Some(now);
+
+        // Store devices
+        node_network.data.devices = devices;
 
         // Rebuild merged view
         self.rebuild_group_data();
@@ -440,15 +471,22 @@ impl NetworkStatsComponent {
             return;
         }
 
-        // Merge all devices (prefixed with hostname for disambiguation)
+        // Merge all devices and rates (prefixed with hostname for disambiguation)
         let mut merged_devices = Vec::new();
+        let mut merged_rates = HashMap::new();
 
         for node_data in self.node_data.values() {
             for device in &node_data.data.devices {
                 // Clone and prefix device name with hostname for clarity
                 let mut prefixed_device = device.clone();
-                prefixed_device.name = format!("{}:{}", node_data.hostname, device.name);
+                let prefixed_name = format!("{}:{}", node_data.hostname, device.name);
+                prefixed_device.name = prefixed_name.clone();
                 merged_devices.push(prefixed_device);
+
+                // Also copy the rate with prefixed key
+                if let Some(rate) = node_data.data.rates.get(&device.name) {
+                    merged_rates.insert(prefixed_name, rate.clone());
+                }
             }
         }
 
@@ -459,8 +497,9 @@ impl NetworkStatsComponent {
 
         if let Some(data) = self.state.data_mut() {
             data.devices = merged_devices;
+            data.rates = merged_rates;
 
-            // Calculate totals
+            // Calculate totals from merged rates
             data.total_rx_rate = data.rates.values().map(|r| r.rx_bytes_per_sec).sum();
             data.total_tx_rate = data.rates.values().map(|r| r.tx_bytes_per_sec).sum();
             data.total_errors = data.devices.iter().map(|d| d.total_errors()).sum();
@@ -616,8 +655,8 @@ impl NetworkStatsComponent {
     async fn refresh_group(&mut self, client: TalosClient) -> Result<()> {
         self.state.start_loading();
 
-        // Clear existing node data
-        self.node_data.clear();
+        // Note: We don't clear node_data here to preserve prev_devices for rate calculation
+        // The add_node_network() function uses entry() to update existing entries
 
         // Clone nodes to avoid borrow issues
         let nodes = self.nodes.clone();
