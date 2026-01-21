@@ -41,6 +41,9 @@ tar = "0.4"
 # Logging
 tracing.workspace = true
 
+# Random (for fallback node shuffling)
+fastrand = "2"
+
 [build-dependencies]
 tonic-build = "0.12"
 

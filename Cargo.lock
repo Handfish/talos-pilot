@@ -2833,6 +2833,7 @@ version = "0.1.7"
 dependencies = [
  "base64",
  "dirs-next",
+ "fastrand",
  "flate2",
  "futures",
  "prost",

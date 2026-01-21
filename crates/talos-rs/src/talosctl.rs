@@ -547,6 +547,95 @@ pub async fn get_discovery_members_for_context(
     parse_discovery_members_yaml(&output)
 }
 
+/// Get discovery members for a specific node IP using context certificates (async).
+///
+/// This allows querying a specific control plane node directly instead of going through the VIP.
+async fn get_discovery_members_for_node_async(
+    context: &str,
+    node_ip: &str,
+) -> Result<Vec<DiscoveryMember>, TalosError> {
+    let output = exec_talosctl_async(&[
+        "--context",
+        context,
+        "-n",
+        node_ip,
+        "get",
+        "members",
+        "-o",
+        "yaml",
+    ])
+    .await?;
+    parse_discovery_members_yaml(&output)
+}
+
+/// Get discovery members with automatic retry and fallback to specific nodes.
+///
+/// First tries the VIP endpoint (via context), then falls back to querying
+/// individual control plane nodes directly if the VIP fails.
+///
+/// This handles transient "no request forwarding" errors that occur when
+/// the VIP routes to a node that can't forward the request.
+pub async fn get_discovery_members_with_retry(
+    context: &str,
+    config_path: Option<&str>,
+    fallback_node_ips: &[String],
+) -> Result<Vec<DiscoveryMember>, TalosError> {
+    // First, try the VIP-based approach with retries
+    // VIP_MAX_RETRIES=2 means 3 total attempts (initial + 2 retries)
+    const VIP_MAX_RETRIES: u32 = 2;
+    const BASE_DELAY_MS: u64 = 100;
+
+    let mut last_error = None;
+
+    for attempt in 0..=VIP_MAX_RETRIES {
+        match get_discovery_members_for_context(context, config_path).await {
+            Ok(members) => return Ok(members),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < VIP_MAX_RETRIES {
+                    let delay_ms = BASE_DELAY_MS * (1 << attempt);
+                    tracing::debug!(
+                        "Discovery fetch via VIP attempt {} failed, retrying in {}ms",
+                        attempt + 1,
+                        delay_ms
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    // VIP failed, try fallback nodes directly
+    // Shuffle to distribute load and avoid repeatedly hitting a problematic node first
+    if !fallback_node_ips.is_empty() {
+        tracing::debug!(
+            "VIP-based discovery failed, trying {} fallback nodes directly",
+            fallback_node_ips.len()
+        );
+
+        let mut shuffled_ips: Vec<&String> = fallback_node_ips.iter().collect();
+        fastrand::shuffle(&mut shuffled_ips);
+
+        for node_ip in shuffled_ips {
+            match get_discovery_members_for_node_async(context, node_ip).await {
+                Ok(members) => {
+                    tracing::debug!(
+                        "Successfully fetched discovery members from fallback node {}",
+                        node_ip
+                    );
+                    return Ok(members);
+                }
+                Err(e) => {
+                    tracing::debug!("Fallback node {} failed: {}", node_ip, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| TalosError::NoEndpoints(context.to_string())))
+}
+
 /// Get address status for a node (for VIP detection)
 ///
 /// Executes: talosctl get addressstatus --nodes <node> -o yaml
@@ -1209,5 +1298,115 @@ spec:
         assert_eq!(disks[1].serial, Some("S4EVNG0N123456".to_string()));
         assert_eq!(disks[1].transport, Some("nvme".to_string()));
         assert!(!disks[1].rotational);
+    }
+
+    #[test]
+    fn test_parse_discovery_members() {
+        let yaml = r#"
+node: 192.168.9.11
+metadata:
+    namespace: cluster
+    type: Members.cluster.talos.dev
+    id: 3xKYjp
+    version: 1
+    owner: cluster.DiscoveryService
+    phase: running
+spec:
+    nodeId: 3xKYjp
+    addresses:
+        - 192.168.9.11
+    hostname: cp-1
+    machineType: controlplane
+    operatingSystem: Talos (v1.9.2)
+---
+node: 192.168.9.11
+metadata:
+    namespace: cluster
+    type: Members.cluster.talos.dev
+    id: 4yLZkq
+    version: 1
+    owner: cluster.DiscoveryService
+    phase: running
+spec:
+    nodeId: 4yLZkq
+    addresses:
+        - 192.168.9.21
+        - 10.244.0.1
+    hostname: worker-1
+    machineType: worker
+    operatingSystem: Talos (v1.9.2)
+"#;
+
+        let members = parse_discovery_members_yaml(yaml).unwrap();
+        assert_eq!(members.len(), 2);
+
+        // Control plane node
+        assert_eq!(members[0].id, "3xKYjp");
+        assert_eq!(members[0].hostname, "cp-1");
+        assert_eq!(members[0].machine_type, "controlplane");
+        assert_eq!(members[0].addresses, vec!["192.168.9.11"]);
+        assert!(members[0].operating_system.contains("Talos"));
+
+        // Worker node with multiple addresses
+        assert_eq!(members[1].id, "4yLZkq");
+        assert_eq!(members[1].hostname, "worker-1");
+        assert_eq!(members[1].machine_type, "worker");
+        assert_eq!(members[1].addresses.len(), 2);
+        assert!(members[1].addresses.contains(&"192.168.9.21".to_string()));
+    }
+
+    #[test]
+    fn test_parse_discovery_members_empty() {
+        let yaml = "";
+        let members = parse_discovery_members_yaml(yaml).unwrap();
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn test_parse_discovery_members_invalid_yaml() {
+        // Should skip invalid documents and not panic
+        let yaml = r#"
+not valid yaml: [
+---
+node: 192.168.9.11
+metadata:
+    namespace: cluster
+    type: Members.cluster.talos.dev
+    id: valid
+spec:
+    hostname: valid-host
+    machineType: controlplane
+"#;
+        let members = parse_discovery_members_yaml(yaml).unwrap();
+        // Should have parsed the valid document
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].id, "valid");
+    }
+
+    #[test]
+    fn test_shuffle_fallback_ips_does_not_panic() {
+        // Test that shuffle works correctly on various inputs
+        let empty: Vec<String> = vec![];
+        let mut shuffled: Vec<&String> = empty.iter().collect();
+        fastrand::shuffle(&mut shuffled);
+        assert!(shuffled.is_empty());
+
+        let single = ["192.168.1.1".to_string()];
+        let mut shuffled: Vec<&String> = single.iter().collect();
+        fastrand::shuffle(&mut shuffled);
+        assert_eq!(shuffled.len(), 1);
+
+        let multiple = vec![
+            "192.168.1.1".to_string(),
+            "192.168.1.2".to_string(),
+            "192.168.1.3".to_string(),
+        ];
+        let mut shuffled: Vec<&String> = multiple.iter().collect();
+        fastrand::shuffle(&mut shuffled);
+        assert_eq!(shuffled.len(), 3);
+        // All original elements should still be present
+        for ip in &multiple {
+            assert!(shuffled.contains(&ip));
+        }
     }
 }

@@ -14,7 +14,7 @@ use ratatui::{
 use std::collections::HashMap;
 use talos_rs::{
     DiscoveryMember, EtcdMemberInfo, MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory, NodeServices,
-    ServiceInfo, TalosClient, TalosConfig, VersionInfo, get_discovery_members_for_context,
+    ServiceInfo, TalosClient, TalosConfig, VersionInfo, get_discovery_members_with_retry,
 };
 
 /// Simple etcd status for header display
@@ -463,9 +463,21 @@ impl ClusterComponent {
         }
 
         // Try to get discovery members (ALL nodes including workers)
-        // Use context-aware async function to avoid blocking and to use correct certificates
+        // Use context-aware async function with retry to avoid blocking and to use correct certificates
+        // Pass etcd member IPs as fallback in case VIP-based discovery fails
         let context_name = cluster.name.clone();
-        match get_discovery_members_for_context(&context_name, self.config_path.as_deref()).await {
+        let fallback_ips: Vec<String> = cluster
+            .etcd_members
+            .iter()
+            .filter_map(|m| m.ip_address())
+            .collect();
+        match get_discovery_members_with_retry(
+            &context_name,
+            self.config_path.as_deref(),
+            &fallback_ips,
+        )
+        .await
+        {
             Ok(members) => {
                 cluster.node_ips.clear();
                 for member in &members {
@@ -477,11 +489,11 @@ impl ClusterComponent {
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to fetch discovery members for {}: {}",
+                    "Failed to fetch discovery members for {} after retries: {} (using cached data)",
                     cluster.name,
                     e
                 );
-                cluster.discovery_members.clear();
+                // DO NOT clear - preserve existing data for resilience
             }
         }
 
@@ -516,7 +528,25 @@ impl ClusterComponent {
                     })
                 })
                 .collect()
+        } else if !cluster.versions.is_empty() {
+            // Tertiary fallback: use nodes from previous version queries
+            tracing::debug!(
+                "Using version info as fallback node source for {}",
+                cluster.name
+            );
+            cluster
+                .versions
+                .iter()
+                .map(|v| {
+                    let ip = v.node.split(':').next().unwrap_or(&v.node).to_string();
+                    (v.node.clone(), ip)
+                })
+                .collect()
         } else {
+            tracing::warn!(
+                "No node sources available for {}, skipping queries",
+                cluster.name
+            );
             Vec::new()
         };
 

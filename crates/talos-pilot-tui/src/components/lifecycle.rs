@@ -23,7 +23,7 @@ use std::time::Duration;
 use talos_pilot_core::{AsyncState, HasHealth, HealthIndicator, SelectableList};
 use talos_rs::{
     DiscoveryMember, NodeTimeInfo, TalosClient, TalosConfig, VersionInfo,
-    get_discovery_members_for_context,
+    get_discovery_members_with_retry,
 };
 
 /// Auto-refresh interval in seconds
@@ -284,15 +284,28 @@ impl LifecycleComponent {
         };
 
         if !context_name.is_empty() {
-            match get_discovery_members_for_context(&context_name, self.config_path.as_deref())
-                .await
+            // Use version info nodes as fallback in case VIP-based discovery fails
+            let fallback_ips: Vec<String> = data
+                .versions
+                .iter()
+                .map(|v| v.node.split(':').next().unwrap_or(&v.node).to_string())
+                .collect();
+            match get_discovery_members_with_retry(
+                &context_name,
+                self.config_path.as_deref(),
+                &fallback_ips,
+            )
+            .await
             {
                 Ok(members) => {
                     data.discovery_members = members;
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to get discovery members: {}", e);
-                    data.discovery_members.clear();
+                    tracing::debug!(
+                        "Failed to get discovery members after retries: {} (preserving cached)",
+                        e
+                    );
+                    // DO NOT clear - preserve existing data
                 }
             }
         }
