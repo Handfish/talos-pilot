@@ -195,7 +195,7 @@ impl DiagnosticsComponent {
             group_view_mode: GroupViewMode::default(),
             node_data: std::collections::HashMap::new(),
             selected_node_tab: 0,
-            node_role: node_role,
+            node_role,
         }
     }
 
@@ -1224,24 +1224,26 @@ impl Component for DiagnosticsComponent {
             }
             KeyCode::Char('[') => {
                 // Previous node tab (only in group view with ByNode mode)
-                if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
-                    if self.selected_node_tab > 0 {
-                        self.selected_node_tab -= 1;
-                        // Reset selection when changing tabs
-                        self.selected_check = 0;
-                        self.table_state.select(Some(0));
-                    }
+                if self.is_group_view
+                    && self.group_view_mode == GroupViewMode::ByNode
+                    && self.selected_node_tab > 0
+                {
+                    self.selected_node_tab -= 1;
+                    // Reset selection when changing tabs
+                    self.selected_check = 0;
+                    self.table_state.select(Some(0));
                 }
             }
             KeyCode::Char(']') => {
                 // Next node tab (only in group view with ByNode mode)
-                if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
-                    if self.selected_node_tab + 1 < self.nodes.len() {
-                        self.selected_node_tab += 1;
-                        // Reset selection when changing tabs
-                        self.selected_check = 0;
-                        self.table_state.select(Some(0));
-                    }
+                if self.is_group_view
+                    && self.group_view_mode == GroupViewMode::ByNode
+                    && self.selected_node_tab + 1 < self.nodes.len()
+                {
+                    self.selected_node_tab += 1;
+                    // Reset selection when changing tabs
+                    self.selected_check = 0;
+                    self.table_state.select(Some(0));
                 }
             }
             _ => {}
@@ -1283,7 +1285,10 @@ impl Component for DiagnosticsComponent {
         // Build header spans based on single node vs group view
         let header_spans = if self.is_group_view {
             let mut spans = vec![
-                Span::styled(" Diagnostics: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Diagnostics: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(&self.group_name, Style::default().fg(Color::Cyan)),
                 Span::styled(
                     format!(" ({} nodes)", self.nodes.len()),
@@ -1309,7 +1314,9 @@ impl Component for DiagnosticsComponent {
                     if i == self.selected_node_tab {
                         spans.push(Span::styled(
                             format!("[{}]", node_hostname),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
                         ));
                     } else {
                         spans.push(Span::styled(
@@ -1323,12 +1330,10 @@ impl Component for DiagnosticsComponent {
             spans
         } else {
             // Single node header
-            vec![
-                Span::styled(
-                    format!(" Diagnostics: {} ({}) [{}] ", hostname, address, cni_label),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]
+            vec![Span::styled(
+                format!(" Diagnostics: {} ({}) [{}] ", hostname, address, cni_label),
+                Style::default().add_modifier(Modifier::BOLD),
+            )]
         };
 
         // Header
@@ -1541,10 +1546,11 @@ mod tests {
         // Should have merged checks from both nodes (4 system checks total: 2 per node)
         assert_eq!(data.system_checks.len(), 4);
         // Check names should be prefixed with hostname
-        assert!(data
-            .system_checks
-            .iter()
-            .any(|c| c.name.starts_with("[node-1]") || c.name.starts_with("[node-2]")));
+        assert!(
+            data.system_checks
+                .iter()
+                .any(|c| c.name.starts_with("[node-1]") || c.name.starts_with("[node-2]"))
+        );
     }
 
     #[test]

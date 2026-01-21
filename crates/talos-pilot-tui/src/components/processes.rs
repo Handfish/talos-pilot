@@ -710,10 +710,11 @@ impl ProcessesComponent {
         }
 
         // Reset selection if needed
-        if let Some(data) = self.data() {
-            if !data.display_entries.is_empty() && self.selected >= data.display_entries.len() {
-                self.selected = 0;
-            }
+        if let Some(data) = self.data()
+            && !data.display_entries.is_empty()
+            && self.selected >= data.display_entries.len()
+        {
+            self.selected = 0;
         }
         self.table_state.select(Some(self.selected));
 
@@ -1049,13 +1050,17 @@ impl ProcessesComponent {
         let proc_count = format!("{} procs", data.display_entries.len());
 
         // Build header based on single node vs group view
-        let mut spans = vec![
-            Span::styled("Processes: ", Style::default().add_modifier(Modifier::BOLD)),
-        ];
+        let mut spans = vec![Span::styled(
+            "Processes: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
 
         if self.is_group_view {
             // Group view header
-            spans.push(Span::styled(&self.group_name, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(
+                &self.group_name,
+                Style::default().fg(Color::Cyan),
+            ));
             spans.push(Span::styled(
                 format!(" ({} nodes)", self.nodes.len()),
                 Style::default().fg(Color::DarkGray),
@@ -1079,7 +1084,9 @@ impl ProcessesComponent {
                     if i == self.selected_node_tab {
                         spans.push(Span::styled(
                             format!("[{}]", hostname),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
                         ));
                     } else {
                         spans.push(Span::styled(
@@ -1113,7 +1120,10 @@ impl ProcessesComponent {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled("[", Style::default().fg(Color::DarkGray)));
                 if !cpu_info.is_empty() {
-                    spans.push(Span::styled(cpu_info.clone(), Style::default().fg(Color::Cyan)));
+                    spans.push(Span::styled(
+                        cpu_info.clone(),
+                        Style::default().fg(Color::Cyan),
+                    ));
                 }
                 if !cpu_info.is_empty() && !mem_info.is_empty() {
                     spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
@@ -1361,21 +1371,22 @@ impl ProcessesComponent {
         let max_cmd_len = area.width.saturating_sub(45) as usize;
 
         // Get effective processes based on view mode
-        let (processes, cpu_percentages) = if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
-            // ByNode mode: show processes from selected node only
-            if let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) {
-                if let Some(node_data) = self.node_data.get(hostname) {
-                    (&node_data.processes, &node_data.cpu_percentages)
+        let (processes, cpu_percentages) =
+            if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+                // ByNode mode: show processes from selected node only
+                if let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) {
+                    if let Some(node_data) = self.node_data.get(hostname) {
+                        (&node_data.processes, &node_data.cpu_percentages)
+                    } else {
+                        return None;
+                    }
                 } else {
                     return None;
                 }
             } else {
-                return None;
-            }
-        } else {
-            // Interleaved mode or single node: use merged data
-            (&data.processes, &data.cpu_percentages)
-        };
+                // Interleaved mode or single node: use merged data
+                (&data.processes, &data.cpu_percentages)
+            };
 
         let max_mem = processes
             .iter()
@@ -1717,14 +1728,23 @@ impl ProcessesComponent {
 
         // Add view mode toggle hint if in group view
         if self.is_group_view {
-            spans.push(Span::styled("[v]", Style::default().add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(
+                "[v]",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
             spans.push(Span::raw(" view "));
 
             // Add tab navigation hint if in ByNode mode
             if self.view_mode == GroupViewMode::ByNode {
-                spans.push(Span::styled("[", Style::default().add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    "[",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
                 spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled("]", Style::default().add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    "]",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
                 spans.push(Span::raw(" tabs "));
             }
         }
@@ -1982,25 +2002,27 @@ impl ProcessesComponent {
             }
             KeyCode::Char('[') => {
                 // Previous node tab (only in group view with ByNode mode)
-                if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
-                    if self.selected_node_tab > 0 {
-                        self.selected_node_tab -= 1;
-                        // Reset selection when changing tabs
-                        self.selected = 0;
-                        self.table_state.select(Some(0));
-                    }
+                if self.is_group_view
+                    && self.view_mode == GroupViewMode::ByNode
+                    && self.selected_node_tab > 0
+                {
+                    self.selected_node_tab -= 1;
+                    // Reset selection when changing tabs
+                    self.selected = 0;
+                    self.table_state.select(Some(0));
                 }
                 Ok(None)
             }
             KeyCode::Char(']') => {
                 // Next node tab (only in group view with ByNode mode)
-                if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
-                    if self.selected_node_tab + 1 < self.nodes.len() {
-                        self.selected_node_tab += 1;
-                        // Reset selection when changing tabs
-                        self.selected = 0;
-                        self.table_state.select(Some(0));
-                    }
+                if self.is_group_view
+                    && self.view_mode == GroupViewMode::ByNode
+                    && self.selected_node_tab + 1 < self.nodes.len()
+                {
+                    self.selected_node_tab += 1;
+                    // Reset selection when changing tabs
+                    self.selected = 0;
+                    self.table_state.select(Some(0));
                 }
                 Ok(None)
             }

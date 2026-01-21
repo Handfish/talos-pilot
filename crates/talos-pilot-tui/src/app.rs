@@ -994,11 +994,7 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to fetch logs from {}: {}",
-                                    hostname,
-                                    e
-                                );
+                                tracing::warn!("Failed to fetch logs from {}: {}", hostname, e);
                             }
                         }
                     }
@@ -1269,7 +1265,8 @@ impl App {
                 );
 
                 // Create processes component in group mode
-                let mut processes = ProcessesComponent::new_group(group_name.clone(), nodes.clone());
+                let mut processes =
+                    ProcessesComponent::new_group(group_name.clone(), nodes.clone());
 
                 // Fetch processes from all nodes
                 if let Some(client) = self.cluster.client() {
@@ -1286,7 +1283,11 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to fetch processes from {}: {}", hostname, e);
+                                tracing::warn!(
+                                    "Failed to fetch processes from {}: {}",
+                                    hostname,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1304,7 +1305,8 @@ impl App {
                 );
 
                 // Create network component in group mode
-                let mut network = NetworkStatsComponent::new_group(group_name.clone(), nodes.clone());
+                let mut network =
+                    NetworkStatsComponent::new_group(group_name.clone(), nodes.clone());
 
                 // Fetch network stats from all nodes
                 if let Some(client) = self.cluster.client() {
@@ -1321,7 +1323,11 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to fetch network stats from {}: {}", hostname, e);
+                                tracing::warn!(
+                                    "Failed to fetch network stats from {}: {}",
+                                    hostname,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1354,16 +1360,32 @@ impl App {
                     let node_ip = ip.split(':').next().unwrap_or(ip);
                     if let Some(ctx) = &context {
                         // Fetch disks
-                        match talos_rs::get_disks_for_node(ctx, node_ip, config_path.as_deref()).await {
+                        match talos_rs::get_disks_for_node(ctx, node_ip, config_path.as_deref())
+                            .await
+                        {
                             Ok(disks) => {
                                 // Fetch volumes
-                                match talos_rs::get_volume_status_for_node(ctx, node_ip, config_path.as_deref()).await {
+                                match talos_rs::get_volume_status_for_node(
+                                    ctx,
+                                    node_ip,
+                                    config_path.as_deref(),
+                                )
+                                .await
+                                {
                                     Ok(volumes) => {
                                         storage.add_node_storage(hostname.clone(), disks, volumes);
                                     }
                                     Err(e) => {
-                                        tracing::warn!("Failed to fetch volumes from {}: {}", hostname, e);
-                                        storage.add_node_storage(hostname.clone(), disks, Vec::new());
+                                        tracing::warn!(
+                                            "Failed to fetch volumes from {}: {}",
+                                            hostname,
+                                            e
+                                        );
+                                        storage.add_node_storage(
+                                            hostname.clone(),
+                                            disks,
+                                            Vec::new(),
+                                        );
                                     }
                                 }
                             }
@@ -1422,7 +1444,11 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to fetch diagnostics from {}: {}", hostname, e);
+                                tracing::warn!(
+                                    "Failed to fetch diagnostics from {}: {}",
+                                    hostname,
+                                    e
+                                );
                             }
                         }
                     }

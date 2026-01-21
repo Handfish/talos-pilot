@@ -1152,13 +1152,17 @@ impl NetworkStatsComponent {
         };
 
         // Build header spans based on single node vs group view
-        let mut spans = vec![
-            Span::styled("Network: ", Style::default().add_modifier(Modifier::BOLD)),
-        ];
+        let mut spans = vec![Span::styled(
+            "Network: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
 
         if self.is_group_view {
             // Group view header
-            spans.push(Span::styled(&self.group_name, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(
+                &self.group_name,
+                Style::default().fg(Color::Cyan),
+            ));
             spans.push(Span::styled(
                 format!(" ({} nodes)", self.nodes.len()),
                 Style::default().fg(Color::DarkGray),
@@ -1182,7 +1186,9 @@ impl NetworkStatsComponent {
                     if i == self.selected_node_tab {
                         spans.push(Span::styled(
                             format!("[{}]", hostname),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
                         ));
                     } else {
                         spans.push(Span::styled(
@@ -1565,22 +1571,23 @@ impl NetworkStatsComponent {
     /// Draw the detail section for selected device
     fn draw_detail_section(&self, frame: &mut Frame, area: Rect) {
         // Get devices and rates based on view mode
-        let (devices, rates) = if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
-            // ByNode mode: get from selected node
-            let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) else {
-                return;
+        let (devices, rates) =
+            if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
+                // ByNode mode: get from selected node
+                let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) else {
+                    return;
+                };
+                let Some(node_data) = self.node_data.get(hostname) else {
+                    return;
+                };
+                (&node_data.data.devices, &node_data.data.rates)
+            } else {
+                // Interleaved mode: use merged data
+                let Some(data) = self.data() else {
+                    return;
+                };
+                (&data.devices, &data.rates)
             };
-            let Some(node_data) = self.node_data.get(hostname) else {
-                return;
-            };
-            (&node_data.data.devices, &node_data.data.rates)
-        } else {
-            // Interleaved mode: use merged data
-            let Some(data) = self.data() else {
-                return;
-            };
-            (&data.devices, &data.rates)
-        };
 
         let Some(dev) = devices.get(self.selected) else {
             return;
@@ -1673,21 +1680,22 @@ impl NetworkStatsComponent {
 
         // Add connection summary line if we have connection data
         // Get connection data from the appropriate source
-        let (connections, conn_counts) = if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
-            if let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) {
-                if let Some(node_data) = self.node_data.get(hostname) {
-                    (&node_data.data.connections, &node_data.data.conn_counts)
+        let (connections, conn_counts) =
+            if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
+                if let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) {
+                    if let Some(node_data) = self.node_data.get(hostname) {
+                        (&node_data.data.connections, &node_data.data.conn_counts)
+                    } else {
+                        return;
+                    }
                 } else {
                     return;
                 }
+            } else if let Some(data) = self.data() {
+                (&data.connections, &data.conn_counts)
             } else {
                 return;
-            }
-        } else if let Some(data) = self.data() {
-            (&data.connections, &data.conn_counts)
-        } else {
-            return;
-        };
+            };
 
         if !connections.is_empty() {
             let cc = conn_counts;
@@ -2701,25 +2709,27 @@ impl NetworkStatsComponent {
             }
             KeyCode::Char('[') => {
                 // Previous node tab (only in group view with ByNode mode)
-                if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
-                    if self.selected_node_tab > 0 {
-                        self.selected_node_tab -= 1;
-                        // Reset selection when changing tabs
-                        self.selected = 0;
-                        self.table_state.select(Some(0));
-                    }
+                if self.is_group_view
+                    && self.group_view_mode == GroupViewMode::ByNode
+                    && self.selected_node_tab > 0
+                {
+                    self.selected_node_tab -= 1;
+                    // Reset selection when changing tabs
+                    self.selected = 0;
+                    self.table_state.select(Some(0));
                 }
                 Ok(None)
             }
             KeyCode::Char(']') => {
                 // Next node tab (only in group view with ByNode mode)
-                if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
-                    if self.selected_node_tab + 1 < self.nodes.len() {
-                        self.selected_node_tab += 1;
-                        // Reset selection when changing tabs
-                        self.selected = 0;
-                        self.table_state.select(Some(0));
-                    }
+                if self.is_group_view
+                    && self.group_view_mode == GroupViewMode::ByNode
+                    && self.selected_node_tab + 1 < self.nodes.len()
+                {
+                    self.selected_node_tab += 1;
+                    // Reset selection when changing tabs
+                    self.selected = 0;
+                    self.table_state.select(Some(0));
                 }
                 Ok(None)
             }
@@ -4065,8 +4075,10 @@ mod tests {
             NetworkStatsComponent::new("test-node".to_string(), "10.0.0.1".to_string());
 
         // Set up data with devices
-        let mut data = NetworkData::default();
-        data.devices = vec![make_device("eth0"), make_device("lo"), make_device("cni0")];
+        let data = NetworkData {
+            devices: vec![make_device("eth0"), make_device("lo"), make_device("cni0")],
+            ..Default::default()
+        };
 
         component.state.set_data(data);
         component
@@ -4124,9 +4136,11 @@ mod tests {
         // Should have merged devices from both nodes (prefixed with hostname)
         assert_eq!(devices.len(), 4);
         // Device names should be prefixed with hostname
-        assert!(devices
-            .iter()
-            .any(|d| d.name.contains("node-1:") || d.name.contains("node-2:")));
+        assert!(
+            devices
+                .iter()
+                .any(|d| d.name.contains("node-1:") || d.name.contains("node-2:"))
+        );
     }
 
     #[test]

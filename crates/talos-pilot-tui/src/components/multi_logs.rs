@@ -569,7 +569,10 @@ impl MultiLogsComponent {
                     match client.logs_stream(&service_id, tail_lines).await {
                         Ok(mut stream_rx) => {
                             while let Some(line) = stream_rx.recv().await {
-                                if tx.send((hostname.clone(), service_id.clone(), line)).is_err() {
+                                if tx
+                                    .send((hostname.clone(), service_id.clone(), line))
+                                    .is_err()
+                                {
                                     // Channel closed, stop this stream
                                     break;
                                 }
@@ -1678,37 +1681,46 @@ impl MultiLogsComponent {
         let Some(data) = self.data() else { return };
 
         // For ByNode view, draw node tabs first
-        let (tabs_height, logs_area) = if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
-            // Draw node tabs at the top
-            let tabs_area = Rect::new(area.x, area.y, area.width, 1);
-            let mut tab_spans = Vec::new();
-            for (i, (hostname, _)) in self.nodes.iter().enumerate() {
-                let short_name = if hostname.len() > 10 {
-                    &hostname[..10]
-                } else {
-                    hostname.as_str()
-                };
-                if i == self.selected_node_tab {
-                    tab_spans.push(Span::styled(
-                        format!(" [{}] ", short_name),
-                        Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
-                    ));
-                } else {
-                    tab_spans.push(Span::styled(
-                        format!("  {}  ", short_name),
-                        Style::default().fg(Color::Gray),
-                    ));
+        let (tabs_height, logs_area) =
+            if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+                // Draw node tabs at the top
+                let tabs_area = Rect::new(area.x, area.y, area.width, 1);
+                let mut tab_spans = Vec::new();
+                for (i, (hostname, _)) in self.nodes.iter().enumerate() {
+                    let short_name = if hostname.len() > 10 {
+                        &hostname[..10]
+                    } else {
+                        hostname.as_str()
+                    };
+                    if i == self.selected_node_tab {
+                        tab_spans.push(Span::styled(
+                            format!(" [{}] ", short_name),
+                            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+                        ));
+                    } else {
+                        tab_spans.push(Span::styled(
+                            format!("  {}  ", short_name),
+                            Style::default().fg(Color::Gray),
+                        ));
+                    }
                 }
-            }
-            tab_spans.push(Span::raw("  "));
-            tab_spans.push(Span::styled("[/]", Style::default().fg(Color::Yellow)));
-            tab_spans.push(Span::styled(" switch", Style::default().dim()));
-            let tabs = Paragraph::new(Line::from(tab_spans));
-            frame.render_widget(tabs, tabs_area);
-            (1, Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1)))
-        } else {
-            (0, area)
-        };
+                tab_spans.push(Span::raw("  "));
+                tab_spans.push(Span::styled("[/]", Style::default().fg(Color::Yellow)));
+                tab_spans.push(Span::styled(" switch", Style::default().dim()));
+                let tabs = Paragraph::new(Line::from(tab_spans));
+                frame.render_widget(tabs, tabs_area);
+                (
+                    1,
+                    Rect::new(
+                        area.x,
+                        area.y + 1,
+                        area.width,
+                        area.height.saturating_sub(1),
+                    ),
+                )
+            } else {
+                (0, area)
+            };
 
         if data.visible_indices.is_empty() {
             let msg = if self.active_count() == 0 || self.active_level_count() == 0 {
@@ -1722,19 +1734,25 @@ impl MultiLogsComponent {
         }
 
         // For ByNode view, filter entries to show only the selected node
-        let filtered_indices: Vec<usize> = if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
-            if let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) {
-                data.visible_indices
-                    .iter()
-                    .copied()
-                    .filter(|&idx| data.entries.get(idx).map(|e| &e.node_hostname == hostname).unwrap_or(false))
-                    .collect()
+        let filtered_indices: Vec<usize> =
+            if self.is_group_view && self.view_mode == GroupViewMode::ByNode {
+                if let Some((hostname, _)) = self.nodes.get(self.selected_node_tab) {
+                    data.visible_indices
+                        .iter()
+                        .copied()
+                        .filter(|&idx| {
+                            data.entries
+                                .get(idx)
+                                .map(|e| &e.node_hostname == hostname)
+                                .unwrap_or(false)
+                        })
+                        .collect()
+                } else {
+                    data.visible_indices.clone()
+                }
             } else {
                 data.visible_indices.clone()
-            }
-        } else {
-            data.visible_indices.clone()
-        };
+            };
 
         if filtered_indices.is_empty() {
             let msg = " No log entries for this node";
@@ -1808,7 +1826,8 @@ impl MultiLogsComponent {
 
             // For group view in interleaved mode, show node:service prefix
             // For single node or ByNode mode, show just service
-            let prefix_width = if self.is_group_view && self.view_mode == GroupViewMode::Interleaved {
+            let prefix_width = if self.is_group_view && self.view_mode == GroupViewMode::Interleaved
+            {
                 // Show shortened node hostname and service
                 let short_host = if entry.node_hostname.len() > 8 {
                     &entry.node_hostname[..8]

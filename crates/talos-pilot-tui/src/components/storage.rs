@@ -212,7 +212,12 @@ impl StorageComponent {
     }
 
     /// Add storage data from a node (for group view)
-    pub fn add_node_storage(&mut self, hostname: String, disks: Vec<DiskInfo>, volumes: Vec<VolumeStatus>) {
+    pub fn add_node_storage(
+        &mut self,
+        hostname: String,
+        disks: Vec<DiskInfo>,
+        volumes: Vec<VolumeStatus>,
+    ) {
         if !self.is_group_view {
             return;
         }
@@ -353,7 +358,9 @@ impl StorageComponent {
             match get_disks_for_node(&context, node_ip, config_path.as_deref()).await {
                 Ok(disks) => {
                     // Fetch volumes
-                    match get_volume_status_for_node(&context, node_ip, config_path.as_deref()).await {
+                    match get_volume_status_for_node(&context, node_ip, config_path.as_deref())
+                        .await
+                    {
                         Ok(volumes) => {
                             self.add_node_storage(hostname.clone(), disks, volumes);
                         }
@@ -749,7 +756,10 @@ impl StorageComponent {
 
         if self.is_group_view {
             // Group view header
-            line_spans.push(Span::styled(&self.group_name, Style::default().fg(Color::Cyan)));
+            line_spans.push(Span::styled(
+                &self.group_name,
+                Style::default().fg(Color::Cyan),
+            ));
             line_spans.push(Span::styled(
                 format!(" ({} nodes)", self.nodes.len()),
                 Style::default().fg(Color::DarkGray),
@@ -773,7 +783,9 @@ impl StorageComponent {
                     if i == self.selected_node_tab {
                         line_spans.push(Span::styled(
                             format!("[{}]", hostname),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
                         ));
                     } else {
                         line_spans.push(Span::styled(
@@ -830,24 +842,26 @@ impl Component for StorageComponent {
             }
             KeyCode::Char('[') => {
                 // Previous node tab (only in group view with ByNode mode)
-                if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
-                    if self.selected_node_tab > 0 {
-                        self.selected_node_tab -= 1;
-                        // Reset selection when changing tabs
-                        self.disk_table_state.select(Some(0));
-                        self.volume_table_state.select(Some(0));
-                    }
+                if self.is_group_view
+                    && self.group_view_mode == GroupViewMode::ByNode
+                    && self.selected_node_tab > 0
+                {
+                    self.selected_node_tab -= 1;
+                    // Reset selection when changing tabs
+                    self.disk_table_state.select(Some(0));
+                    self.volume_table_state.select(Some(0));
                 }
             }
             KeyCode::Char(']') => {
                 // Next node tab (only in group view with ByNode mode)
-                if self.is_group_view && self.group_view_mode == GroupViewMode::ByNode {
-                    if self.selected_node_tab + 1 < self.nodes.len() {
-                        self.selected_node_tab += 1;
-                        // Reset selection when changing tabs
-                        self.disk_table_state.select(Some(0));
-                        self.volume_table_state.select(Some(0));
-                    }
+                if self.is_group_view
+                    && self.group_view_mode == GroupViewMode::ByNode
+                    && self.selected_node_tab + 1 < self.nodes.len()
+                {
+                    self.selected_node_tab += 1;
+                    // Reset selection when changing tabs
+                    self.disk_table_state.select(Some(0));
+                    self.volume_table_state.select(Some(0));
                 }
             }
             _ => {}
@@ -970,17 +984,15 @@ mod tests {
 
     /// Create a StorageComponent for single node view
     fn create_single_node_component() -> StorageComponent {
-        let mut component = StorageComponent::new(
-            "test-node".to_string(),
-            "10.0.0.1".to_string(),
-            None,
-            None,
-        );
+        let mut component =
+            StorageComponent::new("test-node".to_string(), "10.0.0.1".to_string(), None, None);
 
         // Set up data
-        let mut data = StorageData::default();
-        data.disks = vec![make_disk("sda"), make_disk("sdb")];
-        data.volumes = vec![make_volume("STATE"), make_volume("EPHEMERAL")];
+        let data = StorageData {
+            disks: vec![make_disk("sda"), make_disk("sdb")],
+            volumes: vec![make_volume("STATE"), make_volume("EPHEMERAL")],
+            ..Default::default()
+        };
 
         component.state.set_data(data);
         component
@@ -1038,9 +1050,11 @@ mod tests {
         // Should have merged disks from both nodes (3 total)
         assert_eq!(disks.len(), 3);
         // Dev paths should be prefixed with hostname
-        assert!(disks
-            .iter()
-            .any(|d| d.dev_path.contains("node-1:") || d.dev_path.contains("node-2:")));
+        assert!(
+            disks
+                .iter()
+                .any(|d| d.dev_path.contains("node-1:") || d.dev_path.contains("node-2:"))
+        );
     }
 
     #[test]
@@ -1115,9 +1129,11 @@ mod tests {
         // Should have merged volumes from both nodes (3 total)
         assert_eq!(volumes.len(), 3);
         // IDs should be prefixed with hostname
-        assert!(volumes
-            .iter()
-            .any(|v| v.id.contains("node-1:") || v.id.contains("node-2:")));
+        assert!(
+            volumes
+                .iter()
+                .any(|v| v.id.contains("node-1:") || v.id.contains("node-2:"))
+        );
     }
 
     #[test]
