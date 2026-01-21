@@ -848,6 +848,88 @@ impl ClusterComponent {
         }
     }
 
+    /// If the current selection is a group header (ControlPlaneHeader or WorkersHeader),
+    /// returns (group_name, role, nodes) where nodes is Vec<(hostname, ip)>.
+    /// Returns None if the selection is not a group header.
+    #[allow(clippy::type_complexity)]
+    fn current_group_nodes(&self) -> Option<(String, String, Vec<(String, String)>)> {
+        match &self.selected_item {
+            NodeListItem::ControlPlaneHeader(cluster_idx) => {
+                let cluster = self.clusters.get(*cluster_idx)?;
+                let cp_nodes = self.controlplane_nodes_for(*cluster_idx);
+                let nodes: Vec<(String, String)> = cp_nodes
+                    .iter()
+                    .filter_map(|(_, v)| {
+                        let hostname = v.node.clone();
+                        let ip = cluster.node_ips.get(&hostname).cloned()?;
+                        Some((hostname, ip))
+                    })
+                    .collect();
+                if nodes.is_empty() {
+                    None
+                } else {
+                    Some((
+                        "Control Plane".to_string(),
+                        "controlplane".to_string(),
+                        nodes,
+                    ))
+                }
+            }
+            NodeListItem::WorkersHeader(cluster_idx) => {
+                let cluster = self.clusters.get(*cluster_idx)?;
+                let worker_nodes = self.worker_nodes_for(*cluster_idx);
+                let nodes: Vec<(String, String)> = worker_nodes
+                    .iter()
+                    .filter_map(|(_, v)| {
+                        let hostname = v.node.clone();
+                        let ip = cluster.node_ips.get(&hostname).cloned()?;
+                        Some((hostname, ip))
+                    })
+                    .collect();
+                if nodes.is_empty() {
+                    None
+                } else {
+                    Some(("Workers".to_string(), "worker".to_string(), nodes))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Find services that are common to all nodes in a group.
+    /// Returns services present on every node.
+    fn common_services_for_group(&self, nodes: &[(String, String)]) -> Vec<String> {
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+
+        // Get service sets for each node
+        let mut service_sets: Vec<std::collections::HashSet<String>> = Vec::new();
+
+        for (hostname, _) in nodes {
+            if let Some(services) = self.get_node_services(hostname) {
+                let set: std::collections::HashSet<String> =
+                    services.iter().map(|s| s.id.clone()).collect();
+                service_sets.push(set);
+            }
+        }
+
+        if service_sets.is_empty() {
+            return Vec::new();
+        }
+
+        // Find intersection of all service sets
+        let mut common = service_sets[0].clone();
+        for set in service_sets.iter().skip(1) {
+            common = common.intersection(set).cloned().collect();
+        }
+
+        // Convert to sorted Vec for consistent ordering
+        let mut result: Vec<String> = common.into_iter().collect();
+        result.sort();
+        result
+    }
+
     /// Navigate to the currently selected menu item (1-based index, 0 = on node)
     fn navigate_to_selected_menu(&self) -> Result<Option<Action>> {
         if self.selected_menu_item == 0 || self.selected_menu_item > NavMenuItem::ALL.len() {
@@ -1096,9 +1178,20 @@ impl Component for ClusterComponent {
                 }
             }
 
-            // 'l' / 'L' - show logs (all services for node)
+            // 'l' / 'L' - show logs (all services for node or group)
             KeyCode::Char('l') | KeyCode::Char('L') => {
-                if let Some(node_name) = self.current_node_name() {
+                // First check if we're on a group header
+                if let Some((group_name, role, nodes)) = self.current_group_nodes() {
+                    let services = self.common_services_for_group(&nodes);
+                    if !services.is_empty() {
+                        Ok(Some(Action::ShowGroupLogs(
+                            group_name, role, nodes, services,
+                        )))
+                    } else {
+                        Ok(None)
+                    }
+                } else if let Some(node_name) = self.current_node_name() {
+                    // Fall back to single node behavior
                     let service_ids = self.current_service_ids();
                     if !service_ids.is_empty() {
                         let node_role = self.current_node_role();
@@ -1124,7 +1217,10 @@ impl Component for ClusterComponent {
             // Direct hotkeys for screens (always work)
             KeyCode::Char('e') => Ok(Some(Action::ShowEtcd)),
             KeyCode::Char('p') => {
-                if let Some(node_name) = self.current_node_name() {
+                // Check if on a group header first
+                if let Some((group_name, _role, nodes)) = self.current_group_nodes() {
+                    Ok(Some(Action::ShowGroupProcesses(group_name, nodes)))
+                } else if let Some(node_name) = self.current_node_name() {
                     let node_ip = self
                         .node_ips()
                         .get(&node_name)
@@ -1136,7 +1232,10 @@ impl Component for ClusterComponent {
                 }
             }
             KeyCode::Char('n') => {
-                if let Some(node_name) = self.current_node_name() {
+                // Check if on a group header first
+                if let Some((group_name, _role, nodes)) = self.current_group_nodes() {
+                    Ok(Some(Action::ShowGroupNetwork(group_name, nodes)))
+                } else if let Some(node_name) = self.current_node_name() {
                     let node_ip = self
                         .node_ips()
                         .get(&node_name)
@@ -1148,7 +1247,10 @@ impl Component for ClusterComponent {
                 }
             }
             KeyCode::Char('s') => {
-                if let Some(node_name) = self.current_node_name() {
+                // Check if on a group header first
+                if let Some((group_name, _role, nodes)) = self.current_group_nodes() {
+                    Ok(Some(Action::ShowGroupStorage(group_name, nodes)))
+                } else if let Some(node_name) = self.current_node_name() {
                     let node_ip = self
                         .node_ips()
                         .get(&node_name)
@@ -1160,7 +1262,21 @@ impl Component for ClusterComponent {
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(node_name) = self.current_node_name() {
+                // Check if on a group header first
+                if let Some((group_name, role, nodes)) = self.current_group_nodes() {
+                    // For worker groups, provide a control plane endpoint to fetch kubeconfig from
+                    let cp_endpoint = if role == "worker" {
+                        self.get_controlplane_endpoint()
+                    } else {
+                        None
+                    };
+                    Ok(Some(Action::ShowGroupDiagnostics(
+                        group_name,
+                        role,
+                        nodes,
+                        cp_endpoint,
+                    )))
+                } else if let Some(node_name) = self.current_node_name() {
                     let node_ip = self
                         .node_ips()
                         .get(&node_name)
@@ -2067,5 +2183,369 @@ impl ClusterComponent {
 
             frame.render_widget(Paragraph::new(svc_lines), panel_layout[1]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a test ServiceInfo with the given ID
+    fn make_service(id: &str) -> ServiceInfo {
+        ServiceInfo {
+            id: id.to_string(),
+            state: "Running".to_string(),
+            health: None,
+        }
+    }
+
+    /// Create a test VersionInfo for a node
+    fn make_version_info(node: &str) -> VersionInfo {
+        VersionInfo {
+            node: node.to_string(),
+            version: "v1.8.0".to_string(),
+            sha: "abc123".to_string(),
+            built: "2024-01-01".to_string(),
+            go_version: "1.22".to_string(),
+            os: "linux".to_string(),
+            arch: "amd64".to_string(),
+            platform: "metal".to_string(),
+        }
+    }
+
+    /// Create a test NodeServices for a node with given service IDs
+    fn make_node_services(node: &str, service_ids: &[&str]) -> NodeServices {
+        NodeServices {
+            node: node.to_string(),
+            services: service_ids.iter().map(|id| make_service(id)).collect(),
+        }
+    }
+
+    /// Create a ClusterComponent with test data
+    fn create_test_component() -> ClusterComponent {
+        let mut component = ClusterComponent::new(None, None);
+
+        // Create a cluster with controlplane and worker nodes
+        let cluster = ClusterData {
+            name: "test-cluster".to_string(),
+            client: None,
+            connected: true,
+            error: None,
+            versions: vec![
+                make_version_info("cp-node-1"),
+                make_version_info("cp-node-2"),
+                make_version_info("worker-1"),
+                make_version_info("worker-2"),
+            ],
+            services: vec![
+                // Control plane nodes have etcd
+                make_node_services("cp-node-1", &["etcd", "kubelet", "apid", "containerd"]),
+                make_node_services("cp-node-2", &["etcd", "kubelet", "apid", "containerd"]),
+                // Worker nodes do not have etcd
+                make_node_services("worker-1", &["kubelet", "apid", "containerd"]),
+                make_node_services("worker-2", &["kubelet", "apid", "containerd"]),
+            ],
+            memory: Vec::new(),
+            load_avg: Vec::new(),
+            cpu_info: Vec::new(),
+            etcd_members: Vec::new(),
+            discovery_members: Vec::new(),
+            etcd_summary: None,
+            node_ips: HashMap::from([
+                ("cp-node-1".to_string(), "10.0.0.1".to_string()),
+                ("cp-node-2".to_string(), "10.0.0.2".to_string()),
+                ("worker-1".to_string(), "10.0.0.3".to_string()),
+                ("worker-2".to_string(), "10.0.0.4".to_string()),
+            ]),
+            expanded: true,
+            controlplane_expanded: true,
+            workers_expanded: true,
+        };
+
+        component.clusters.push(cluster);
+        component.active_cluster = 0;
+        component
+    }
+
+    // ==========================================================================
+    // Tests for current_group_nodes()
+    // ==========================================================================
+
+    #[test]
+    fn test_current_group_nodes_returns_none_for_cluster_header() {
+        let mut component = create_test_component();
+        component.selected_item = NodeListItem::ClusterHeader(0);
+
+        let result = component.current_group_nodes();
+        assert!(
+            result.is_none(),
+            "ClusterHeader should not return group nodes"
+        );
+    }
+
+    #[test]
+    fn test_current_group_nodes_returns_controlplane_when_on_controlplane_header() {
+        let mut component = create_test_component();
+        component.selected_item = NodeListItem::ControlPlaneHeader(0);
+
+        let result = component.current_group_nodes();
+        assert!(
+            result.is_some(),
+            "ControlPlaneHeader should return group nodes"
+        );
+
+        let (group_name, role, nodes) = result.unwrap();
+        assert_eq!(group_name, "Control Plane");
+        assert_eq!(role, "controlplane");
+        assert_eq!(nodes.len(), 2, "Should have 2 control plane nodes");
+
+        // Verify node hostnames and IPs
+        assert!(
+            nodes
+                .iter()
+                .any(|(h, ip)| h == "cp-node-1" && ip == "10.0.0.1")
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|(h, ip)| h == "cp-node-2" && ip == "10.0.0.2")
+        );
+    }
+
+    #[test]
+    fn test_current_group_nodes_returns_workers_when_on_workers_header() {
+        let mut component = create_test_component();
+        component.selected_item = NodeListItem::WorkersHeader(0);
+
+        let result = component.current_group_nodes();
+        assert!(result.is_some(), "WorkersHeader should return group nodes");
+
+        let (group_name, role, nodes) = result.unwrap();
+        assert_eq!(group_name, "Workers");
+        assert_eq!(role, "worker");
+        assert_eq!(nodes.len(), 2, "Should have 2 worker nodes");
+
+        // Verify node hostnames and IPs
+        assert!(
+            nodes
+                .iter()
+                .any(|(h, ip)| h == "worker-1" && ip == "10.0.0.3")
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|(h, ip)| h == "worker-2" && ip == "10.0.0.4")
+        );
+    }
+
+    #[test]
+    fn test_current_group_nodes_returns_none_when_no_controlplane_nodes() {
+        let mut component = ClusterComponent::new(None, None);
+
+        // Create a cluster with only workers (no etcd services)
+        let cluster = ClusterData {
+            name: "workers-only".to_string(),
+            client: None,
+            connected: true,
+            error: None,
+            versions: vec![make_version_info("worker-1")],
+            services: vec![make_node_services("worker-1", &["kubelet", "containerd"])],
+            memory: Vec::new(),
+            load_avg: Vec::new(),
+            cpu_info: Vec::new(),
+            etcd_members: Vec::new(),
+            discovery_members: Vec::new(),
+            etcd_summary: None,
+            node_ips: HashMap::from([("worker-1".to_string(), "10.0.0.1".to_string())]),
+            expanded: true,
+            controlplane_expanded: true,
+            workers_expanded: true,
+        };
+
+        component.clusters.push(cluster);
+        component.selected_item = NodeListItem::ControlPlaneHeader(0);
+
+        let result = component.current_group_nodes();
+        assert!(
+            result.is_none(),
+            "ControlPlaneHeader with no controlplane nodes should return None"
+        );
+    }
+
+    #[test]
+    fn test_current_group_nodes_returns_none_when_no_worker_nodes() {
+        let mut component = ClusterComponent::new(None, None);
+
+        // Create a cluster with only control plane nodes
+        let cluster = ClusterData {
+            name: "cp-only".to_string(),
+            client: None,
+            connected: true,
+            error: None,
+            versions: vec![make_version_info("cp-node-1")],
+            services: vec![make_node_services("cp-node-1", &["etcd", "kubelet"])],
+            memory: Vec::new(),
+            load_avg: Vec::new(),
+            cpu_info: Vec::new(),
+            etcd_members: Vec::new(),
+            discovery_members: Vec::new(),
+            etcd_summary: None,
+            node_ips: HashMap::from([("cp-node-1".to_string(), "10.0.0.1".to_string())]),
+            expanded: true,
+            controlplane_expanded: true,
+            workers_expanded: true,
+        };
+
+        component.clusters.push(cluster);
+        component.selected_item = NodeListItem::WorkersHeader(0);
+
+        let result = component.current_group_nodes();
+        assert!(
+            result.is_none(),
+            "WorkersHeader with no worker nodes should return None"
+        );
+    }
+
+    #[test]
+    fn test_current_group_nodes_returns_none_for_individual_nodes() {
+        let mut component = create_test_component();
+
+        // Test ControlPlaneNode
+        component.selected_item = NodeListItem::ControlPlaneNode(0, 0);
+        assert!(
+            component.current_group_nodes().is_none(),
+            "ControlPlaneNode should return None"
+        );
+
+        // Test WorkerNode
+        component.selected_item = NodeListItem::WorkerNode(0, 0);
+        assert!(
+            component.current_group_nodes().is_none(),
+            "WorkerNode should return None"
+        );
+    }
+
+    // ==========================================================================
+    // Tests for common_services_for_group()
+    // ==========================================================================
+
+    #[test]
+    fn test_common_services_for_group_returns_empty_for_empty_nodes() {
+        let component = create_test_component();
+
+        let result = component.common_services_for_group(&[]);
+        assert!(
+            result.is_empty(),
+            "Empty nodes should return empty services"
+        );
+    }
+
+    #[test]
+    fn test_common_services_for_group_returns_all_services_for_single_node() {
+        let component = create_test_component();
+
+        // Single control plane node
+        let nodes = vec![("cp-node-1".to_string(), "10.0.0.1".to_string())];
+
+        let result = component.common_services_for_group(&nodes);
+        assert_eq!(
+            result.len(),
+            4,
+            "Single node should return all its services"
+        );
+        assert!(result.contains(&"etcd".to_string()));
+        assert!(result.contains(&"kubelet".to_string()));
+        assert!(result.contains(&"apid".to_string()));
+        assert!(result.contains(&"containerd".to_string()));
+    }
+
+    #[test]
+    fn test_common_services_for_group_returns_intersection_for_multiple_nodes() {
+        let component = create_test_component();
+
+        // Control plane and worker nodes have different services
+        let nodes = vec![
+            ("cp-node-1".to_string(), "10.0.0.1".to_string()),
+            ("worker-1".to_string(), "10.0.0.3".to_string()),
+        ];
+
+        let result = component.common_services_for_group(&nodes);
+
+        // Common services: kubelet, apid, containerd (not etcd which is only on cp)
+        assert_eq!(
+            result.len(),
+            3,
+            "Should return only common services (intersection)"
+        );
+        assert!(result.contains(&"kubelet".to_string()));
+        assert!(result.contains(&"apid".to_string()));
+        assert!(result.contains(&"containerd".to_string()));
+        assert!(
+            !result.contains(&"etcd".to_string()),
+            "etcd should not be in common services"
+        );
+    }
+
+    #[test]
+    fn test_common_services_for_group_returns_empty_when_no_common_services() {
+        let mut component = ClusterComponent::new(None, None);
+
+        // Create nodes with completely different services
+        let cluster = ClusterData {
+            name: "test".to_string(),
+            client: None,
+            connected: true,
+            error: None,
+            versions: vec![make_version_info("node-a"), make_version_info("node-b")],
+            services: vec![
+                make_node_services("node-a", &["service-a", "service-b"]),
+                make_node_services("node-b", &["service-c", "service-d"]),
+            ],
+            memory: Vec::new(),
+            load_avg: Vec::new(),
+            cpu_info: Vec::new(),
+            etcd_members: Vec::new(),
+            discovery_members: Vec::new(),
+            etcd_summary: None,
+            node_ips: HashMap::from([
+                ("node-a".to_string(), "10.0.0.1".to_string()),
+                ("node-b".to_string(), "10.0.0.2".to_string()),
+            ]),
+            expanded: true,
+            controlplane_expanded: true,
+            workers_expanded: true,
+        };
+
+        component.clusters.push(cluster);
+        component.active_cluster = 0;
+
+        let nodes = vec![
+            ("node-a".to_string(), "10.0.0.1".to_string()),
+            ("node-b".to_string(), "10.0.0.2".to_string()),
+        ];
+
+        let result = component.common_services_for_group(&nodes);
+        assert!(
+            result.is_empty(),
+            "Nodes with no common services should return empty"
+        );
+    }
+
+    #[test]
+    fn test_common_services_for_group_sorts_results() {
+        let component = create_test_component();
+
+        // Use two control plane nodes that have the same services
+        let nodes = vec![
+            ("cp-node-1".to_string(), "10.0.0.1".to_string()),
+            ("cp-node-2".to_string(), "10.0.0.2".to_string()),
+        ];
+
+        let result = component.common_services_for_group(&nodes);
+
+        // Verify the result is sorted
+        let mut sorted = result.clone();
+        sorted.sort();
+        assert_eq!(result, sorted, "Results should be sorted alphabetically");
     }
 }
