@@ -3,6 +3,7 @@
 use clap::Parser;
 use color_eyre::Result;
 use std::fs::File;
+use std::path::PathBuf;
 use talos_pilot_tui::App;
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -24,9 +25,9 @@ struct Cli {
     #[arg(short, long)]
     debug: bool,
 
-    /// Log file path (default: /tmp/talos-pilot.log)
-    #[arg(long, default_value = "/tmp/talos-pilot.log")]
-    log_file: String,
+    /// Log file path (default: <temp_dir>/talos-pilot.log)
+    #[arg(long)]
+    log_file: Option<String>,
 
     /// Number of log lines to fetch (default: 500)
     #[arg(short, long, default_value = "500")]
@@ -50,7 +51,8 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
 
     // Initialize logging to file (not stdout, which would corrupt TUI)
-    let log_file = File::create(&cli.log_file)?;
+    let log_path = resolve_log_path(cli.log_file);
+    let log_file = File::create(&log_path)?;
 
     // Build filter: set base level, but quiet down noisy HTTP/gRPC libraries
     let filter = if cli.debug {
@@ -110,4 +112,41 @@ async fn main() -> Result<()> {
 
     tracing::info!("Goodbye!");
     Ok(())
+}
+
+/// Resolve the log file path, falling back to the platform temp directory.
+fn resolve_log_path(log_file: Option<String>) -> PathBuf {
+    match log_file {
+        Some(path) => PathBuf::from(path),
+        None => std::env::temp_dir().join("talos-pilot.log"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_log_path_uses_temp_dir() {
+        let path = resolve_log_path(None);
+        let expected = std::env::temp_dir().join("talos-pilot.log");
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn default_log_path_parent_exists() {
+        let path = resolve_log_path(None);
+        assert!(
+            path.parent().unwrap().exists(),
+            "default log path parent directory does not exist: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn explicit_log_path_is_used() {
+        let custom = "/some/custom/path.log".to_string();
+        let path = resolve_log_path(Some(custom.clone()));
+        assert_eq!(path, PathBuf::from(custom));
+    }
 }
