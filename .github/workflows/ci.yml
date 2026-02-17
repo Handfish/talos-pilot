@@ -81,6 +81,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
           - os: windows-latest
             target: x86_64-pc-windows-msvc
           - os: macos-latest
@@ -101,6 +103,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+          if [[ "${{ matrix.target }}" == *"musl"* ]]; then
+            sudo apt-get install -y musl-tools
+          fi
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
