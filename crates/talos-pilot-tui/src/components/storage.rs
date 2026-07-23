@@ -347,7 +347,7 @@ impl StorageComponent {
                         Span::styled("Size: ", Style::default().fg(Color::Gray)),
                         Span::raw(format!(
                             "{} ({})",
-                            &disk.size_pretty,
+                            disk.size_pretty,
                             format_bytes(disk.size)
                         )),
                     ]),

@@ -681,7 +681,7 @@ impl NetworkStatsComponent {
                 });
             }
             ConnSortBy::Port => {
-                conns.sort_by(|a, b| a.local_port.cmp(&b.local_port));
+                conns.sort_by_key(|a| a.local_port);
             }
         }
 

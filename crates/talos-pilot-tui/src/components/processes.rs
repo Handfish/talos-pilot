@@ -224,7 +224,7 @@ impl ProcessesComponent {
                 }
                 SortBy::Mem => {
                     data.processes
-                        .sort_by(|a, b| b.resident_memory.cmp(&a.resident_memory));
+                        .sort_by_key(|p| std::cmp::Reverse(p.resident_memory));
                 }
             }
         }
@@ -579,7 +579,7 @@ impl ProcessesComponent {
             }
             SortBy::Mem => {
                 data.processes
-                    .sort_by(|a, b| b.resident_memory.cmp(&a.resident_memory));
+                    .sort_by_key(|p| std::cmp::Reverse(p.resident_memory));
             }
         }
     }
