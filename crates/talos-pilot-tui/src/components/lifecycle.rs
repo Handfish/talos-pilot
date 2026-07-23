@@ -228,8 +228,14 @@ impl LifecycleComponent {
         // Get or create data
         let mut data = self.state.take_data().unwrap_or_default();
 
-        // Fetch version information
-        match client.version().await {
+        // Fetch version information.
+        //
+        // Non-fatal: a version RPC failure must NOT abort the refresh. The K8s,
+        // etcd, and pod/PDB pre-operation checks below use independent data
+        // sources and can still succeed. Previously this early-returned after
+        // set_data() (which clears the just-set error), leaving every section
+        // stuck on "unknown"/"unavailable" with no error and no further fetches.
+        let version_error = match client.version().await {
             Ok(versions) => {
                 // Get context name from talosconfig if not already set
                 if !versions.is_empty() && data.context_name.is_empty() {
@@ -246,14 +252,17 @@ impl LifecycleComponent {
                 }
 
                 data.versions = versions;
+                None
             }
             Err(e) => {
-                self.state
-                    .set_error(format!("Failed to fetch versions: {}", e));
-                self.state.set_data(data);
-                return Ok(());
+                tracing::warn!(
+                    "Failed to fetch versions: {} (continuing with etcd/K8s pre-op checks)",
+                    e
+                );
+                // Preserve any cached versions for display; do not abort.
+                Some(format!("Failed to fetch versions: {}", e))
             }
-        }
+        };
 
         // Fetch time sync status
         match client.time().await {
@@ -352,9 +361,31 @@ impl LifecycleComponent {
         // Generate alerts
         Self::generate_alerts_into(&mut data);
 
-        // Store the data
+        // Store the data (this clears any prior error).
         self.state.set_data(data);
+
+        // If the version RPC failed AND nothing else could be gathered, surface
+        // the error instead of a silent all-"unknown" screen. If any pre-op
+        // check succeeded we keep the partial view (graceful degradation).
+        if let Some(err) = version_error {
+            let nothing_loaded = self.data().map(Self::gathered_nothing).unwrap_or(true);
+            if nothing_loaded {
+                self.state.set_error(err);
+            }
+        }
         Ok(())
+    }
+
+    /// True when a refresh produced no usable data at all (no versions, no node
+    /// rows, and no pre-operation check succeeded). Used to decide whether a
+    /// version-fetch failure should surface as an error banner rather than a
+    /// silent all-"unknown" screen. Kept pure so it can be unit-tested.
+    fn gathered_nothing(data: &LifecycleData) -> bool {
+        data.versions.is_empty()
+            && data.node_statuses.is_empty()
+            && data.pre_op_checks.pod_health.is_none()
+            && data.pre_op_checks.pdb_health.is_none()
+            && data.pre_op_checks.etcd_quorum.is_none()
     }
 
     /// Fetch pre-operation health checks into data
@@ -1030,5 +1061,52 @@ impl Component for LifecycleComponent {
         self.draw_footer(frame, chunks[5]);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A totally empty refresh result (e.g. version RPC failed and no pre-op
+    /// check succeeded) must be reported as "nothing gathered" so the caller
+    /// surfaces an error instead of a silent all-"unknown" screen. This is the
+    /// regression guard for issue #2 (lifecycle view stuck on "unknown").
+    #[test]
+    fn gathered_nothing_is_true_for_empty_data() {
+        let data = LifecycleData::default();
+        assert!(LifecycleComponent::gathered_nothing(&data));
+    }
+
+    /// If any single pre-op check succeeded, the refresh produced usable data,
+    /// so we keep the partial view rather than replacing it with an error
+    /// (graceful degradation — the whole point of not aborting on version()).
+    #[test]
+    fn gathered_nothing_is_false_when_etcd_quorum_present() {
+        let mut data = LifecycleData::default();
+        data.pre_op_checks.etcd_quorum = Some(EtcdQuorumInfo {
+            total_members: 3,
+            healthy_members: 3,
+            can_lose: 1,
+            is_healthy: true,
+        });
+        assert!(!LifecycleComponent::gathered_nothing(&data));
+    }
+
+    /// Versions present (the happy path) is likewise not "nothing".
+    #[test]
+    fn gathered_nothing_is_false_when_versions_present() {
+        let mut data = LifecycleData::default();
+        data.versions.push(VersionInfo {
+            node: "10.5.0.2".to_string(),
+            version: "v1.12.1".to_string(),
+            sha: String::new(),
+            built: String::new(),
+            go_version: String::new(),
+            os: String::new(),
+            arch: String::new(),
+            platform: "container".to_string(),
+        });
+        assert!(!LifecycleComponent::gathered_nothing(&data));
     }
 }
