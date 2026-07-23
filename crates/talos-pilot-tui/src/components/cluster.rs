@@ -145,6 +145,9 @@ struct ClusterData {
     controlplane_expanded: bool,
     /// Whether workers group is expanded
     workers_expanded: bool,
+    /// Non-fatal warning when worker discovery is unavailable, so the node list
+    /// (control-plane-only in that case) isn't silently misleading.
+    discovery_warning: Option<String>,
 }
 
 /// Cluster component showing overview with node list
@@ -209,7 +212,30 @@ impl ClusterComponent {
         }
     }
 
-    /// Get control plane nodes for a cluster (nodes with etcd service)
+    /// Whether a node is a control plane node.
+    ///
+    /// Discovery `machineType` is authoritative when available; otherwise we
+    /// fall back to the etcd-service heuristic (only control plane nodes run
+    /// etcd). Keeping these two in one place ensures the control-plane and
+    /// worker groups stay complementary (every node lands in exactly one).
+    fn node_is_controlplane(&self, cluster_idx: usize, node: &str) -> bool {
+        if let Some(cluster) = self.clusters.get(cluster_idx) {
+            let key = node.split(':').next().unwrap_or(node);
+            if let Some(member) = cluster.discovery_members.iter().find(|m| {
+                m.hostname.eq_ignore_ascii_case(node)
+                    || m.hostname.eq_ignore_ascii_case(key)
+                    || m.addresses.iter().any(|a| a == node || a == key)
+            }) {
+                return member.machine_type.eq_ignore_ascii_case("controlplane");
+            }
+        }
+        // Fallback: presence of the etcd service marks a control plane node.
+        self.get_node_services_for(cluster_idx, node)
+            .map(|s| s.iter().any(|svc| svc.id == "etcd"))
+            .unwrap_or(false)
+    }
+
+    /// Get control plane nodes for a cluster (discovery machineType, else etcd service)
     fn controlplane_nodes_for(&self, cluster_idx: usize) -> Vec<(usize, &VersionInfo)> {
         let Some(cluster) = self.clusters.get(cluster_idx) else {
             return Vec::new();
@@ -218,15 +244,11 @@ impl ClusterComponent {
             .versions
             .iter()
             .enumerate()
-            .filter(|(_, v)| {
-                self.get_node_services_for(cluster_idx, &v.node)
-                    .map(|s| s.iter().any(|svc| svc.id == "etcd"))
-                    .unwrap_or(false)
-            })
+            .filter(|(_, v)| self.node_is_controlplane(cluster_idx, &v.node))
             .collect()
     }
 
-    /// Get worker nodes for a cluster (nodes without etcd service)
+    /// Get worker nodes for a cluster (every node that isn't a control plane node)
     fn worker_nodes_for(&self, cluster_idx: usize) -> Vec<(usize, &VersionInfo)> {
         let Some(cluster) = self.clusters.get(cluster_idx) else {
             return Vec::new();
@@ -235,11 +257,7 @@ impl ClusterComponent {
             .versions
             .iter()
             .enumerate()
-            .filter(|(_, v)| {
-                self.get_node_services_for(cluster_idx, &v.node)
-                    .map(|s| !s.iter().any(|svc| svc.id == "etcd"))
-                    .unwrap_or(true)
-            })
+            .filter(|(_, v)| !self.node_is_controlplane(cluster_idx, &v.node))
             .collect()
     }
 
@@ -497,7 +515,7 @@ impl ClusterComponent {
         )
         .await
         {
-            Ok(members) => {
+            Ok(members) if !members.is_empty() => {
                 cluster.node_ips.clear();
                 for member in &members {
                     if let Some(ip) = member.addresses.first() {
@@ -505,6 +523,24 @@ impl ClusterComponent {
                     }
                 }
                 cluster.discovery_members = members;
+                cluster.discovery_warning = None;
+            }
+            Ok(_) => {
+                // Discovery succeeded but returned no members. This usually means
+                // the cluster discovery service is disabled, so only nodes known
+                // via etcd (control plane) can be enumerated.
+                tracing::warn!(
+                    "Discovery returned no members for {} (discovery service likely disabled); \
+                     worker nodes cannot be enumerated",
+                    cluster.name
+                );
+                if cluster.discovery_members.is_empty() {
+                    cluster.discovery_warning = Some(
+                        "Worker nodes unavailable: cluster discovery returned no members \
+                         (the discovery service may be disabled)."
+                            .to_string(),
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -512,7 +548,15 @@ impl ClusterComponent {
                     cluster.name,
                     e
                 );
-                // DO NOT clear - preserve existing data for resilience
+                // DO NOT clear discovery_members - preserve existing data for resilience.
+                // Only warn if we have no discovery data at all (would fall back to
+                // control-plane-only), so the user knows workers may be missing.
+                if cluster.discovery_members.is_empty() {
+                    cluster.discovery_warning = Some(format!(
+                        "Worker nodes may be missing: could not reach the discovery service \
+                         ({e}). Check that talosctl is installed and on PATH."
+                    ));
+                }
             }
         }
 
@@ -878,8 +922,17 @@ impl ClusterComponent {
         }
     }
 
-    /// Determine node role based on services (etcd = controlplane)
+    /// Determine the selected node's role.
+    ///
+    /// The selection already reflects how the node was grouped (which now uses
+    /// discovery machineType with an etcd-service fallback), so read that
+    /// directly; only fall back to the service heuristic for non-node selections.
     fn current_node_role(&self) -> String {
+        match &self.selected_item {
+            NodeListItem::ControlPlaneNode(..) => return "controlplane".to_string(),
+            NodeListItem::WorkerNode(..) => return "worker".to_string(),
+            _ => {}
+        }
         let service_ids = self.current_service_ids();
         if service_ids.iter().any(|s| s == "etcd") {
             "controlplane".to_string()
@@ -1746,6 +1799,17 @@ impl ClusterComponent {
                         }
                     }
                 }
+
+                // Discovery warning: worker enumeration failed, so the list
+                // above may be control-plane-only. Surface it instead of
+                // silently hiding workers.
+                if let Some(warning) = &cluster.discovery_warning {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
+                        Span::styled(warning.clone(), Style::default().fg(Color::Yellow)),
+                    ]));
+                }
             }
 
             frame.render_widget(Paragraph::new(lines), pane_layout[0]);
@@ -2188,5 +2252,117 @@ impl ClusterComponent {
 
             frame.render_widget(Paragraph::new(svc_lines), panel_layout[1]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use talos_rs::{DiscoveryMember, NodeServices, ServiceInfo, VersionInfo};
+
+    fn ver(node: &str) -> VersionInfo {
+        VersionInfo {
+            node: node.to_string(),
+            version: String::new(),
+            sha: String::new(),
+            built: String::new(),
+            go_version: String::new(),
+            os: String::new(),
+            arch: String::new(),
+            platform: String::new(),
+        }
+    }
+
+    fn member(hostname: &str, ip: &str, machine_type: &str) -> DiscoveryMember {
+        DiscoveryMember {
+            id: hostname.to_string(),
+            addresses: vec![ip.to_string()],
+            hostname: hostname.to_string(),
+            machine_type: machine_type.to_string(),
+            operating_system: String::new(),
+        }
+    }
+
+    fn services_with(node: &str, ids: &[&str]) -> NodeServices {
+        NodeServices {
+            node: node.to_string(),
+            services: ids
+                .iter()
+                .map(|id| ServiceInfo {
+                    id: id.to_string(),
+                    state: "Running".to_string(),
+                    health: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn names(nodes: &[(usize, &VersionInfo)]) -> Vec<String> {
+        nodes.iter().map(|(_, v)| v.node.clone()).collect()
+    }
+
+    /// Discovery machineType is authoritative: a discovered worker is classified
+    /// as a worker even when no per-node service data is available. This is the
+    /// regression guard for "workers missing / shown only as control plane"
+    /// (the "worker nodes missing" reports) — workers must land in the worker group.
+    #[test]
+    fn classifies_by_discovery_machine_type() {
+        let mut comp = ClusterComponent::default();
+        comp.clusters.push(ClusterData {
+            name: "test".to_string(),
+            versions: vec![ver("cp1"), ver("worker1")],
+            discovery_members: vec![
+                member("cp1", "10.0.0.1", "controlplane"),
+                member("worker1", "10.0.0.2", "worker"),
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(names(&comp.controlplane_nodes_for(0)), vec!["cp1"]);
+        assert_eq!(names(&comp.worker_nodes_for(0)), vec!["worker1"]);
+    }
+
+    /// When discovery is unavailable (empty members), fall back to the
+    /// etcd-service heuristic so control plane nodes are still identified.
+    #[test]
+    fn falls_back_to_etcd_service_without_discovery() {
+        let mut comp = ClusterComponent::default();
+        comp.clusters.push(ClusterData {
+            name: "test".to_string(),
+            versions: vec![ver("n1"), ver("n2")],
+            services: vec![
+                services_with("n1", &["etcd", "kubelet"]),
+                services_with("n2", &["kubelet"]),
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(names(&comp.controlplane_nodes_for(0)), vec!["n1"]);
+        assert_eq!(names(&comp.worker_nodes_for(0)), vec!["n2"]);
+    }
+
+    /// Control-plane and worker groups must partition the node set: every node
+    /// lands in exactly one group, never both or neither.
+    #[test]
+    fn groups_are_complementary() {
+        let mut comp = ClusterComponent::default();
+        comp.clusters.push(ClusterData {
+            name: "test".to_string(),
+            versions: vec![ver("a"), ver("b"), ver("c")],
+            discovery_members: vec![
+                member("a", "10.0.0.1", "controlplane"),
+                member("b", "10.0.0.2", "worker"),
+                // "c" is intentionally absent from discovery and has no services
+            ],
+            ..Default::default()
+        });
+
+        let cp = names(&comp.controlplane_nodes_for(0));
+        let workers = names(&comp.worker_nodes_for(0));
+        assert_eq!(cp.len() + workers.len(), 3, "every node classified once");
+        // Unknown node "c" defaults to worker (safe default, still visible).
+        assert!(workers.contains(&"c".to_string()));
+        assert!(cp.contains(&"a".to_string()));
+        assert!(workers.contains(&"b".to_string()));
     }
 }

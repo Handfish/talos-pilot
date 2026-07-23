@@ -533,39 +533,47 @@ pub async fn get_discovery_members_for_context(
         return Err(TalosError::NoEndpoints(context.to_string()));
     }
 
-    let output = exec_talosctl_async(&[
-        "--context",
-        context,
-        "-n",
-        &node_ip,
-        "get",
-        "members",
-        "-o",
-        "yaml",
-    ])
-    .await?;
-    parse_discovery_members_yaml(&output)
+    get_discovery_members_for_node_async(context, &node_ip, config_path).await
 }
 
 /// Get discovery members for a specific node IP using context certificates (async).
 ///
 /// This allows querying a specific control plane node directly instead of going through the VIP.
+///
+/// Executes: talosctl --context <context> [--talosconfig <path>] -n <node> get members -o yaml
+///
+/// The `--talosconfig` flag is essential for users who run with `--config <path>`:
+/// without it talosctl reads the default `~/.talos/config`, where the context
+/// (and its certs) may not exist, so discovery fails and the node list silently
+/// degrades to control-plane-only (the "worker nodes missing" reports).
 async fn get_discovery_members_for_node_async(
     context: &str,
     node_ip: &str,
+    config_path: Option<&str>,
 ) -> Result<Vec<DiscoveryMember>, TalosError> {
-    let output = exec_talosctl_async(&[
-        "--context",
-        context,
-        "-n",
-        node_ip,
-        "get",
-        "members",
-        "-o",
-        "yaml",
-    ])
-    .await?;
+    let args = members_command_args(context, node_ip, config_path);
+    let output = exec_talosctl_async(&args).await?;
     parse_discovery_members_yaml(&output)
+}
+
+/// Build the `talosctl ... get members` argument list.
+///
+/// Extracted as a pure function so the `--talosconfig` handling can be
+/// unit-tested: omitting it made talosctl read the default `~/.talos/config`,
+/// which breaks `--config <path>` users (their context isn't there) and
+/// silently degraded the node list to control-plane-only (workers missing).
+fn members_command_args<'a>(
+    context: &'a str,
+    node_ip: &'a str,
+    config_path: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args = vec!["--context", context];
+    if let Some(path) = config_path {
+        args.push("--talosconfig");
+        args.push(path);
+    }
+    args.extend_from_slice(&["-n", node_ip, "get", "members", "-o", "yaml"]);
+    args
 }
 
 /// Get discovery members with automatic retry and fallback to specific nodes.
@@ -617,7 +625,7 @@ pub async fn get_discovery_members_with_retry(
         fastrand::shuffle(&mut shuffled_ips);
 
         for node_ip in shuffled_ips {
-            match get_discovery_members_for_node_async(context, node_ip).await {
+            match get_discovery_members_for_node_async(context, node_ip, config_path).await {
                 Ok(members) => {
                     tracing::debug!(
                         "Successfully fetched discovery members from fallback node {}",
@@ -1360,6 +1368,33 @@ spec:
         let yaml = "";
         let members = parse_discovery_members_yaml(yaml).unwrap();
         assert!(members.is_empty());
+    }
+
+    #[test]
+    fn members_args_include_talosconfig_when_config_path_set() {
+        let args = members_command_args("mycluster", "10.0.0.1", Some("/etc/talos/config"));
+        assert_eq!(
+            args,
+            vec![
+                "--context",
+                "mycluster",
+                "--talosconfig",
+                "/etc/talos/config",
+                "-n",
+                "10.0.0.1",
+                "get",
+                "members",
+                "-o",
+                "yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn members_args_omit_talosconfig_when_none() {
+        let args = members_command_args("mycluster", "10.0.0.1", None);
+        assert!(!args.contains(&"--talosconfig"));
+        assert_eq!(&args[..2], &["--context", "mycluster"]);
     }
 
     #[test]
