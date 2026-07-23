@@ -5,7 +5,7 @@
 use crate::action::Action;
 use crate::components::Component;
 use crate::components::diagnostics::k8s::{
-    DrainOptions, PdbHealthInfo, check_pdb_health, create_k8s_client,
+    DrainOptions, PdbHealthInfo, check_pdb_health, create_k8s_client_with_source,
 };
 use crate::ui_ext::SafetyStatusExt;
 use color_eyre::Result;
@@ -486,6 +486,10 @@ pub struct NodeOperationsComponent {
     client: Option<TalosClient>,
     /// K8s client for PDB checks
     k8s_client: Option<Client>,
+    /// Why the K8s client couldn't be created, if it couldn't. Surfaced when an
+    /// operation that needs it (drain/reboot) is attempted, instead of a
+    /// generic "No K8s client available".
+    k8s_error: Option<String>,
 
     /// Async state for loaded data
     state: AsyncState<NodeOperationsData>,
@@ -519,6 +523,7 @@ impl NodeOperationsComponent {
             is_controlplane,
             client: None,
             k8s_client: None,
+            k8s_error: None,
             state: AsyncState::new(),
             selected_op: 0,
             operation_state: OperationState::Ready,
@@ -593,6 +598,26 @@ impl NodeOperationsComponent {
 
     /// Start a background operation
     pub fn start_operation(&mut self, op_type: OperationType) {
+        // Both drain and reboot require a Kubernetes client (to cordon/drain the
+        // node). If we couldn't create one, fail fast with the *specific* reason
+        // instead of spawning a task that reports a generic "No K8s client
+        // available".
+        if self.k8s_client.is_none() {
+            let reason = self.k8s_error.clone().unwrap_or_else(|| {
+                "could not reach a control plane node for the kubeconfig, and no \
+                 usable KUBECONFIG was found"
+                    .to_string()
+            });
+            let message = format!(
+                "Cannot {}: no Kubernetes client — {}",
+                op_type.name().to_lowercase(),
+                reason
+            );
+            tracing::error!("{}", message);
+            self.operation_state = OperationState::Completed(op_type, false, message);
+            return;
+        }
+
         // Reset progress
         {
             let mut progress = self.operation_progress.lock().unwrap();
@@ -743,14 +768,31 @@ impl NodeOperationsComponent {
 
     /// Fetch PDB information
     async fn fetch_pdb_info(&mut self, client: &TalosClient) {
-        // Initialize K8s client if needed
+        // Initialize K8s client if needed.
+        //
+        // Target a control plane node for the kubeconfig fetch (via etcd member
+        // IPs). This mirrors the diagnostics/lifecycle path and matters because
+        // the environment kubeconfig can be unusable here — kube-rs is built
+        // without the exec/oidc auth features, so an EKS/OIDC kubeconfig that
+        // `kubectl` accepts fails — whereas the Talos-served kubeconfig uses
+        // client-cert auth that always works. Without a CP target the fetch
+        // fell back to the VIP and failed, leaving no client (and a later
+        // drain/reboot reporting the generic "No K8s client available").
         if self.k8s_client.is_none() {
-            match create_k8s_client(client).await {
-                Ok(k8s) => {
+            let cp_node_ip = match client.etcd_members().await {
+                Ok(members) => members.first().and_then(|m| m.ip_address()),
+                Err(_) => None,
+            };
+
+            match create_k8s_client_with_source(client, cp_node_ip.as_deref(), None).await {
+                Ok((k8s, source)) => {
+                    tracing::info!("K8s client created from: {:?}", source);
                     self.k8s_client = Some(k8s);
+                    self.k8s_error = None;
                 }
                 Err(e) => {
                     tracing::warn!("Failed to create K8s client: {}", e);
+                    self.k8s_error = Some(e.to_string());
                     return;
                 }
             }
@@ -1343,5 +1385,57 @@ impl Component for NodeOperationsComponent {
 
         self.draw_overlay(frame, area);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When no K8s client could be created, starting an operation must fail with
+    /// the *specific* reason (captured during refresh), not the old generic
+    /// "No K8s client available". Regression guard for the reboot/drain report.
+    #[test]
+    fn start_operation_without_k8s_surfaces_specific_reason() {
+        let mut comp =
+            NodeOperationsComponent::new("node1".to_string(), "10.0.0.1:50000".to_string(), false);
+        comp.k8s_error = Some("kubeconfig fetch failed: exec plugin not supported".to_string());
+
+        comp.start_operation(OperationType::Reboot);
+
+        match &comp.operation_state {
+            OperationState::Completed(op, success, msg) => {
+                assert_eq!(*op, OperationType::Reboot);
+                assert!(!success);
+                assert!(msg.contains("Cannot reboot"), "msg: {msg}");
+                assert!(msg.contains("exec plugin not supported"), "msg: {msg}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        // Must not have spawned a background task.
+        assert!(comp.operation_task.is_none());
+    }
+
+    /// With no captured error, still fail fast with an actionable default reason
+    /// rather than spawning a doomed task.
+    #[test]
+    fn start_operation_without_k8s_uses_default_reason() {
+        let mut comp =
+            NodeOperationsComponent::new("node1".to_string(), "10.0.0.1:50000".to_string(), true);
+
+        comp.start_operation(OperationType::Drain);
+
+        match &comp.operation_state {
+            OperationState::Completed(op, success, msg) => {
+                assert_eq!(*op, OperationType::Drain);
+                assert!(!success);
+                assert!(msg.contains("Cannot drain"), "msg: {msg}");
+                assert!(
+                    msg.contains("control plane") || msg.to_lowercase().contains("kubeconfig"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 }
