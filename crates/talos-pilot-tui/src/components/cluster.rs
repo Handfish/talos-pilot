@@ -119,6 +119,8 @@ struct ClusterData {
     connected: bool,
     /// Error message if connection failed
     error: Option<String>,
+    /// Configured endpoints for this context (shown in connection-error details)
+    endpoints: Vec<String>,
     /// Version info from nodes
     versions: Vec<VersionInfo>,
     /// Services from nodes
@@ -175,6 +177,19 @@ impl Default for ClusterComponent {
     fn default() -> Self {
         Self::new(None, None)
     }
+}
+
+/// Extract the deepest, most actionable message from an error chain.
+///
+/// tonic's transport-error `Display` is just "transport error"; the real cause
+/// (e.g. "Connection refused", "i/o timeout") lives at the bottom of the
+/// `source()` chain.
+fn root_cause(e: &dyn std::error::Error) -> String {
+    let mut deepest: &dyn std::error::Error = e;
+    while let Some(src) = deepest.source() {
+        deepest = src;
+    }
+    deepest.to_string()
 }
 
 impl ClusterComponent {
@@ -391,16 +406,20 @@ impl ClusterComponent {
 
             // Try to connect to each cluster using the loaded config
             match config.get_context(name) {
-                Ok(ctx) => match TalosClient::from_context(ctx).await {
-                    Ok(client) => {
-                        cluster.client = Some(client);
-                        cluster.connected = true;
+                Ok(ctx) => {
+                    cluster.endpoints = ctx.endpoints.clone();
+                    match TalosClient::from_context(ctx).await {
+                        Ok(client) => {
+                            cluster.client = Some(client);
+                            cluster.connected = true;
+                            cluster.error = None;
+                        }
+                        Err(e) => {
+                            cluster.error = Some(format!("Could not connect — {}", root_cause(&e)));
+                            cluster.connected = false;
+                        }
                     }
-                    Err(e) => {
-                        cluster.error = Some(e.to_string());
-                        cluster.connected = false;
-                    }
-                },
+                }
                 Err(e) => {
                     cluster.error = Some(e.to_string());
                     cluster.connected = false;
@@ -620,6 +639,27 @@ impl ClusterComponent {
                         });
                     }
                 }
+            }
+        }
+
+        // Reflect real reachability so the UI shows a clear error instead of an
+        // empty/blank cluster when no endpoint can be reached. Healthy clusters
+        // have versions/etcd/discovery data; a transient failure keeps the
+        // previously cached data, so this only trips when there is nothing at all.
+        if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
+            let has_any_data = !cluster.versions.is_empty()
+                || !cluster.etcd_members.is_empty()
+                || !cluster.discovery_members.is_empty();
+            if has_any_data {
+                cluster.connected = true;
+                cluster.error = None;
+            } else {
+                cluster.connected = false;
+                cluster.error = Some(
+                    "Unable to reach any configured Talos endpoint. Check network \
+                     connectivity and the endpoints in your talosconfig."
+                        .to_string(),
+                );
             }
         }
     }
@@ -1513,6 +1553,16 @@ impl ClusterComponent {
                 cluster_line.extend(etcd_spans);
                 lines.push(Line::from(cluster_line));
 
+                // Show a connection error under the cluster header (always, even
+                // when collapsed) so failures are visible instead of a blank list.
+                if let Some(err) = &cluster.error {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled("⚠ ", Style::default().fg(Color::Red)),
+                        Span::styled(err.as_str(), Style::default().fg(Color::Red)),
+                    ]));
+                }
+
                 // Skip if cluster is collapsed
                 if !cluster.expanded {
                     continue;
@@ -1794,6 +1844,77 @@ impl ClusterComponent {
         // Get active cluster data
         let cluster_idx = self.active_cluster;
         let cluster = self.clusters.get(cluster_idx);
+
+        // A disconnected cluster that failed to connect has no nodes to select,
+        // so show the failure details here (endpoints tried + cause + hint).
+        if let Some(c) = cluster
+            && !c.connected
+            && let Some(err) = &c.error
+        {
+            let block = Block::default()
+                .title(" Connection Error ")
+                .title_style(Style::default().fg(Color::Red))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color));
+
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  Cluster:  "),
+                    Span::styled(
+                        c.name.clone(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw("  Status:   "),
+                    Span::styled("Disconnected", Style::default().fg(Color::Red)),
+                ]),
+            ];
+
+            if !c.endpoints.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Endpoints tried:",
+                    Style::default().fg(Color::Yellow),
+                )));
+                for ep in &c.endpoints {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled("- ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(ep.clone(), Style::default().fg(Color::White)),
+                    ]));
+                }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Error:",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(err.clone(), Style::default().fg(Color::Red)),
+            ]));
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Verify the endpoint(s) are reachable from this",
+                Style::default().dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  machine and that your talosconfig is correct.",
+                Style::default().dim(),
+            )));
+
+            let msg = Paragraph::new(lines)
+                .block(block)
+                .wrap(ratatui::widgets::Wrap { trim: false });
+            frame.render_widget(msg, area);
+            return;
+        }
 
         // Check if cluster is connected but has no etcd members (not bootstrapped)
         let needs_bootstrap = cluster

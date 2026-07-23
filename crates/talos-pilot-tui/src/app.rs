@@ -10,7 +10,7 @@ use crate::components::{
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -91,6 +91,40 @@ impl Default for App {
     fn default() -> Self {
         Self::new(None, None, 500, false, None)
     }
+}
+
+/// Draw the animated, cancellable startup "connecting" screen.
+fn draw_connecting(frame: &mut ratatui::Frame, spinner: usize) {
+    use ratatui::layout::Alignment;
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph};
+
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    let spin = FRAMES[spinner % FRAMES.len()];
+
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let para = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{}  Connecting to Talos cluster...", spin),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(Span::styled(
+            "Trying configured endpoints   (press q or Ctrl-C to cancel)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" talos-pilot "),
+    )
+    .alignment(Alignment::Center);
+    frame.render_widget(para, area);
 }
 
 impl App {
@@ -482,13 +516,49 @@ impl App {
 
     /// Main event loop
     async fn main_loop(&mut self, terminal: &mut Tui) -> Result<()> {
-        // Connect on startup
-        self.cluster.connect().await?;
+        // Connect on startup while showing an animated, cancellable "connecting"
+        // screen. connect() dials all configured endpoints concurrently and the
+        // first reachable one wins; we drive it alongside an input poll so the
+        // UI never looks frozen and the user can bail out with q / Esc / Ctrl-C
+        // instead of feeling like the terminal is stuck.
+        let connect_result = {
+            let mut connect_fut = Box::pin(self.cluster.connect());
+            let mut spinner: usize = 0;
+            loop {
+                terminal.draw(|frame| draw_connecting(frame, spinner))?;
+                spinner = spinner.wrapping_add(1);
+
+                tokio::select! {
+                    res = &mut connect_fut => break res,
+                    _ = tokio::time::sleep(Duration::from_millis(120)) => {
+                        // Non-blocking drain of pending input; abort keys exit cleanly.
+                        while event::poll(Duration::from_millis(0))? {
+                            if let Event::Key(key) = event::read()?
+                                && key.kind == KeyEventKind::Press
+                            {
+                                let abort = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                                    || (key.code == KeyCode::Char('c')
+                                        && key.modifiers.contains(KeyModifiers::CONTROL));
+                                if abort {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        connect_result?;
 
         loop {
             // Draw current view
             terminal.draw(|frame| {
                 let area = frame.area();
+                // Skip drawing into a zero-sized area (e.g. a 0x0 terminal or a
+                // momentary 0-height during resize) — ratatui panics otherwise.
+                if area.width == 0 || area.height == 0 {
+                    return;
+                }
                 match self.view {
                     View::Cluster => {
                         let _ = self.cluster.draw(frame, area);

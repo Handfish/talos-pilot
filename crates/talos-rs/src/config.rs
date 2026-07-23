@@ -109,29 +109,19 @@ impl Context {
 
     /// Get the first endpoint URL
     pub fn endpoint_url(&self) -> Option<String> {
-        self.endpoints.first().map(|e| {
-            if e.starts_with("https://") || e.starts_with("http://") {
-                e.clone()
-            } else if e.starts_with('[') {
-                // IPv6 address with brackets - check if port is specified
-                if e.contains("]:") {
-                    // Has port specified: [::1]:50000
-                    format!("https://{}", e)
-                } else {
-                    // No port: [::1] -> add default port
-                    format!("https://{}:50000", e)
-                }
-            } else if e.contains("::") || e.matches(':').count() > 1 {
-                // Raw IPv6 address without brackets - add brackets and default port
-                format!("https://[{}]:50000", e)
-            } else if e.contains(':') {
-                // IPv4 or hostname with port specified
-                format!("https://{}", e)
-            } else {
-                // IPv4 or hostname without port - add default Talos API port
-                format!("https://{}:50000", e)
-            }
-        })
+        self.endpoints.first().map(|e| normalize_endpoint(e))
+    }
+
+    /// Get all endpoint URLs (normalized).
+    ///
+    /// Used to build a load-balanced channel that fails over across every
+    /// configured endpoint, mirroring `talosctl`, which load balances and fails
+    /// over between the endpoints in a context.
+    pub fn endpoint_urls(&self) -> Vec<String> {
+        self.endpoints
+            .iter()
+            .map(|e| normalize_endpoint(e))
+            .collect()
     }
 
     /// Get target nodes, falling back to endpoints if not specified
@@ -141,6 +131,34 @@ impl Context {
         } else {
             &self.nodes
         }
+    }
+}
+
+/// Normalize an endpoint string into a full `https://host:port` URL.
+///
+/// Handles bare IPv4/hostname (adds the default Talos API port 50000), IPv6
+/// with or without brackets, an existing `http(s)://` scheme, and explicit ports.
+fn normalize_endpoint(e: &str) -> String {
+    if e.starts_with("https://") || e.starts_with("http://") {
+        e.to_string()
+    } else if e.starts_with('[') {
+        // IPv6 address with brackets - check if port is specified
+        if e.contains("]:") {
+            // Has port specified: [::1]:50000
+            format!("https://{}", e)
+        } else {
+            // No port: [::1] -> add default port
+            format!("https://{}:50000", e)
+        }
+    } else if e.contains("::") || e.matches(':').count() > 1 {
+        // Raw IPv6 address without brackets - add brackets and default port
+        format!("https://[{}]:50000", e)
+    } else if e.contains(':') {
+        // IPv4 or hostname with port specified
+        format!("https://{}", e)
+    } else {
+        // IPv4 or hostname without port - add default Talos API port
+        format!("https://{}:50000", e)
     }
 }
 
@@ -228,6 +246,44 @@ contexts:
             ctx3.endpoint_url(),
             Some("https://192.168.1.100:50000".to_string())
         );
+    }
+
+    #[test]
+    fn test_endpoint_urls_multiple() {
+        // Multiple endpoints in mixed formats should all be normalized and returned.
+        let ctx = Context {
+            endpoints: vec![
+                "100.64.0.9".to_string(),
+                "192.168.178.216:50000".to_string(),
+                "https://talos.example.com:6443".to_string(),
+            ],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert_eq!(
+            ctx.endpoint_urls(),
+            vec![
+                "https://100.64.0.9:50000".to_string(),
+                "https://192.168.178.216:50000".to_string(),
+                "https://talos.example.com:6443".to_string(),
+            ]
+        );
+        // endpoint_url() still returns just the first, matching endpoint_urls[0].
+        assert_eq!(ctx.endpoint_url(), Some(ctx.endpoint_urls()[0].clone()));
+    }
+
+    #[test]
+    fn test_endpoint_urls_empty() {
+        let ctx = Context {
+            endpoints: vec![],
+            nodes: vec![],
+            ca: "YQ==".to_string(),
+            crt: "Yg==".to_string(),
+            key: "Yw==".to_string(),
+        };
+        assert!(ctx.endpoint_urls().is_empty());
     }
 
     #[test]
