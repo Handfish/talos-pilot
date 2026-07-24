@@ -2,6 +2,7 @@
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::components::diagnostics::k8s;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -193,6 +194,58 @@ fn root_cause(e: &dyn std::error::Error) -> String {
         deepest = src;
     }
     deepest.to_string()
+}
+
+/// Enumerate all cluster nodes (control plane and workers) through the
+/// Kubernetes API and present them as [`DiscoveryMember`]s.
+///
+/// This is the fallback for when the Talos discovery service is disabled and
+/// `talosctl get members` returns nothing. Every node registers with the
+/// Kubernetes API independently of Talos discovery, so — unlike etcd
+/// membership, which only ever lists control plane nodes — it can reveal
+/// workers. Without this, a discovery-disabled cluster silently collapses to
+/// control-plane-only.
+///
+/// The kubeconfig is fetched straight from `cp_ip` (a control plane node) so we
+/// always query the correct cluster's API server, never an unrelated one an
+/// ambient `KUBECONFIG` might point at.
+async fn discovery_members_via_k8s(
+    client: &TalosClient,
+    cp_ip: &str,
+) -> Result<Vec<DiscoveryMember>, String> {
+    let k8s_client = k8s::create_k8s_client_from_node(client, cp_ip)
+        .await
+        .map_err(|e| e.to_string())?;
+    let nodes = k8s::list_cluster_nodes(&k8s_client)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(k8s_nodes_to_discovery_members(nodes))
+}
+
+/// Map Kubernetes node roster entries onto [`DiscoveryMember`]s.
+///
+/// Nodes without an internal IP are dropped: a node's Talos API is reached by
+/// IP, so an IP-less node can neither be queried nor displayed. The
+/// control-plane role label maps to the `controlplane`/`worker` machine type
+/// that the rest of the UI classifies on (see [`ClusterComponent::node_is_controlplane`]).
+fn k8s_nodes_to_discovery_members(nodes: Vec<k8s::K8sNodeInfo>) -> Vec<DiscoveryMember> {
+    nodes
+        .into_iter()
+        .filter_map(|n| {
+            let ip = n.internal_ip?;
+            Some(DiscoveryMember {
+                id: n.name.clone(),
+                addresses: vec![ip],
+                hostname: n.name,
+                machine_type: if n.is_control_plane {
+                    "controlplane".to_string()
+                } else {
+                    "worker".to_string()
+                },
+                operating_system: String::new(),
+            })
+        })
+        .collect()
 }
 
 impl ClusterComponent {
@@ -525,37 +578,90 @@ impl ClusterComponent {
                 cluster.discovery_members = members;
                 cluster.discovery_warning = None;
             }
-            Ok(_) => {
-                // Discovery succeeded but returned no members. This usually means
-                // the cluster discovery service is disabled, so only nodes known
-                // via etcd (control plane) can be enumerated.
-                tracing::warn!(
-                    "Discovery returned no members for {} (discovery service likely disabled); \
-                     worker nodes cannot be enumerated",
-                    cluster.name
-                );
-                if cluster.discovery_members.is_empty() {
-                    cluster.discovery_warning = Some(
-                        "Worker nodes unavailable: cluster discovery returned no members \
-                         (the discovery service may be disabled)."
-                            .to_string(),
-                    );
+            outcome => {
+                // Talos discovery gave us nothing usable. It's an optional service
+                // and commonly disabled, so this is not fatal — log the reason.
+                match &outcome {
+                    Ok(_) => tracing::warn!(
+                        "Discovery returned no members for {} (discovery service likely disabled)",
+                        cluster.name
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Failed to fetch discovery members for {} after retries: {}",
+                        cluster.name,
+                        e
+                    ),
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to fetch discovery members for {} after retries: {} (using cached data)",
-                    cluster.name,
-                    e
-                );
-                // DO NOT clear discovery_members - preserve existing data for resilience.
-                // Only warn if we have no discovery data at all (would fall back to
-                // control-plane-only), so the user knows workers may be missing.
+
+                // Only rebuild the roster when we have none cached. If discovery
+                // succeeded on an earlier refresh, keep those members for
+                // resilience rather than dropping workers on a transient failure.
                 if cluster.discovery_members.is_empty() {
-                    cluster.discovery_warning = Some(format!(
-                        "Worker nodes may be missing: could not reach the discovery service \
-                         ({e}). Check that talosctl is installed and on PATH."
-                    ));
+                    // Fall back to the Kubernetes API, which knows every node —
+                    // control plane AND worker — independently of Talos discovery.
+                    // This is what makes workers show up when discovery is disabled;
+                    // etcd membership alone would leave the list control-plane-only.
+                    // Prefer an etcd member IP (a real control plane node) for the
+                    // kubeconfig fetch; fall back to the configured endpoint IP.
+                    let cp_ip = cluster
+                        .etcd_members
+                        .iter()
+                        .find_map(|m| m.ip_address())
+                        .or_else(|| {
+                            cluster
+                                .endpoints
+                                .first()
+                                .map(|e| e.split(':').next().unwrap_or(e).to_string())
+                        });
+
+                    match cp_ip {
+                        Some(cp_ip) => match discovery_members_via_k8s(&client, &cp_ip).await {
+                            Ok(members) if !members.is_empty() => {
+                                cluster.node_ips.clear();
+                                for member in &members {
+                                    if let Some(ip) = member.addresses.first() {
+                                        cluster
+                                            .node_ips
+                                            .insert(member.hostname.clone(), ip.clone());
+                                    }
+                                }
+                                let count = members.len();
+                                cluster.discovery_members = members;
+                                cluster.discovery_warning = None;
+                                tracing::info!(
+                                    "Enumerated {} node(s) via the Kubernetes API for {} \
+                                     (Talos discovery unavailable)",
+                                    count,
+                                    cluster.name
+                                );
+                            }
+                            Ok(_) => {
+                                cluster.discovery_warning = Some(
+                                    "Worker nodes unavailable: Talos discovery returned no \
+                                     members and the Kubernetes API reported no nodes."
+                                        .to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Kubernetes node enumeration failed for {}: {}",
+                                    cluster.name,
+                                    e
+                                );
+                                cluster.discovery_warning = Some(format!(
+                                    "Worker nodes may be missing: Talos discovery is unavailable \
+                                     and the Kubernetes API could not be reached ({e})."
+                                ));
+                            }
+                        },
+                        None => {
+                            cluster.discovery_warning = Some(
+                                "Worker nodes unavailable: cluster discovery returned no members \
+                                 (the discovery service may be disabled)."
+                                    .to_string(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2364,5 +2470,71 @@ mod tests {
         assert!(workers.contains(&"c".to_string()));
         assert!(cp.contains(&"a".to_string()));
         assert!(workers.contains(&"b".to_string()));
+    }
+
+    /// Kubernetes roster entries map onto discovery members, and IP-less nodes
+    /// are dropped (they can't be reached over the Talos API to be queried).
+    #[test]
+    fn k8s_nodes_map_to_discovery_members_dropping_ipless() {
+        use crate::components::diagnostics::k8s::K8sNodeInfo;
+        let members = k8s_nodes_to_discovery_members(vec![
+            K8sNodeInfo {
+                name: "cp1".into(),
+                internal_ip: Some("10.0.0.1".into()),
+                is_control_plane: true,
+            },
+            K8sNodeInfo {
+                name: "w1".into(),
+                internal_ip: Some("10.0.0.2".into()),
+                is_control_plane: false,
+            },
+            // No InternalIP -> unreachable over the Talos API -> dropped.
+            K8sNodeInfo {
+                name: "ghost".into(),
+                internal_ip: None,
+                is_control_plane: false,
+            },
+        ]);
+        assert_eq!(members.len(), 2, "IP-less node dropped");
+        assert_eq!(members[0].hostname, "cp1");
+        assert_eq!(members[0].machine_type, "controlplane");
+        assert_eq!(members[0].addresses, vec!["10.0.0.1".to_string()]);
+        assert_eq!(members[1].hostname, "w1");
+        assert_eq!(members[1].machine_type, "worker");
+    }
+
+    /// End-to-end for the discovery-disabled path: nodes enumerated via the
+    /// Kubernetes API classify into the right groups, so workers appear even
+    /// when Talos discovery is off. Regression guard for the "workers missing
+    /// when discovery disabled" bug.
+    #[test]
+    fn k8s_derived_members_populate_worker_group() {
+        use crate::components::diagnostics::k8s::K8sNodeInfo;
+        let members = k8s_nodes_to_discovery_members(vec![
+            K8sNodeInfo {
+                name: "cp1".into(),
+                internal_ip: Some("10.0.0.1".into()),
+                is_control_plane: true,
+            },
+            K8sNodeInfo {
+                name: "w1".into(),
+                internal_ip: Some("10.0.0.2".into()),
+                is_control_plane: false,
+            },
+            K8sNodeInfo {
+                name: "w2".into(),
+                internal_ip: Some("10.0.0.3".into()),
+                is_control_plane: false,
+            },
+        ]);
+        let mut comp = ClusterComponent::default();
+        comp.clusters.push(ClusterData {
+            name: "test".to_string(),
+            versions: vec![ver("cp1"), ver("w1"), ver("w2")],
+            discovery_members: members,
+            ..Default::default()
+        });
+        assert_eq!(names(&comp.controlplane_nodes_for(0)), vec!["cp1"]);
+        assert_eq!(names(&comp.worker_nodes_for(0)), vec!["w1", "w2"]);
     }
 }
