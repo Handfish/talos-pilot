@@ -2,7 +2,7 @@
 
 ## 0.1.11
 
-Reliability release: node enumeration no longer depends on the Talos discovery service.
+Reliability release: node enumeration no longer depends on the Talos discovery service, and Kubernetes views always target the launched cluster.
 
 ### Bug Fixes
 
@@ -22,6 +22,12 @@ Reproduced on a discovery-disabled Docker cluster (1 control plane + 2 workers):
 **Lifecycle "Config" and "Time Sync" columns were always blank**
 
 The Lifecycle node table showed `-` for every node's config version and time-sync status. Two causes: `talosctl get machineconfig` returns multiple YAML documents (the `persistent` and `v1alpha1` configs), but the parser tried to decode the whole blob as a single document and always errored; and per-node time-sync info was only fetched for the endpoint. Both are fixed — machineconfig parsing now splits documents and prefers the canonical `v1alpha1` config (tolerating a numeric `version`), and version + time-sync are queried per node — so the table is fully populated for control-plane and worker nodes alike. Regression tests added.
+
+**Kubernetes views could target the wrong cluster when `KUBECONFIG` was set**
+
+The workloads view and the drain/cordon operations build a Kubernetes client that preferred an ambient `KUBECONFIG` over the launched Talos context. If your shell's `KUBECONFIG` pointed at a *different* cluster than `--context`, read views silently showed the wrong cluster's data and — more seriously — drain/cordon could act on the wrong nodes.
+
+These clients now pin to the launched cluster: the kubeconfig is fetched from a control-plane node over the Talos API, so it always identifies the cluster you asked for. An ambient `KUBECONFIG` is still honored when it names the **same** cluster (matched by cluster CA, so a VIP/load-balancer endpoint isn't mistaken for a different cluster) — preserving your configured, possibly more reachable endpoint — but is ignored when it names a different one. When it's ignored, a wrapped warning on the cluster view explains why, so nothing is silently overridden. Verified end-to-end against a cluster with a mismatched `KUBECONFIG`; regression tests added.
 
 ## 0.1.10
 

@@ -149,6 +149,72 @@ struct ClusterData {
     /// Non-fatal warning when worker discovery is unavailable, so the node list
     /// (control-plane-only in that case) isn't silently misleading.
     discovery_warning: Option<String>,
+    /// Non-fatal warning when an ambient `KUBECONFIG` names a different cluster
+    /// than this Talos context (so Kubernetes views ignore it and pin to a
+    /// control plane node). Explains why `KUBECONFIG` is being disregarded.
+    kubeconfig_warning: Option<String>,
+}
+
+impl ClusterData {
+    /// Best control plane node IP for fetching a cluster-correct kubeconfig.
+    /// Prefers an etcd member (etcd runs only on control planes), then a roster
+    /// `controlplane` member, then the configured endpoint.
+    fn control_plane_ip(&self) -> Option<String> {
+        self.etcd_members
+            .iter()
+            .find_map(|m| m.ip_address())
+            .or_else(|| {
+                self.discovery_members
+                    .iter()
+                    .find(|m| m.machine_type == "controlplane")
+                    .and_then(|m| m.addresses.first().cloned())
+            })
+            .or_else(|| {
+                self.endpoints
+                    .first()
+                    .map(|e| e.split(':').next().unwrap_or(e).to_string())
+            })
+    }
+}
+
+/// Wrap a cluster warning into indented lines so it reads as part of the
+/// cluster's expanded tray rather than a detached block clipped at the pane
+/// edge. The ⚠ sits on the first line, aligned under the group rows (Control
+/// Plane / Workers); continuations hang-indent under the text.
+fn warning_lines(text: &str, pane_width: u16) -> Vec<Line<'static>> {
+    const INDENT: &str = "    "; // aligns ⚠ under the "▼ Control Plane" group rows
+    const HANG: &str = "      "; // continuations align under the wrapped text
+    let avail = (pane_width as usize).saturating_sub(HANG.len()).max(12);
+
+    let mut wrapped: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let sep = usize::from(!cur.is_empty());
+        if !cur.is_empty() && cur.chars().count() + sep + word.chars().count() > avail {
+            wrapped.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        wrapped.push(cur);
+    }
+
+    let style = Style::default().fg(Color::Yellow);
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let rendered = if i == 0 {
+                format!("{INDENT}⚠ {line}")
+            } else {
+                format!("{HANG}{line}")
+            };
+            Line::from(Span::styled(rendered, style))
+        })
+        .collect()
 }
 
 /// Cluster component showing overview with node list
@@ -762,6 +828,23 @@ impl ClusterComponent {
                 );
             }
         }
+
+        // Warn if an ambient KUBECONFIG names a *different* cluster than this
+        // Talos context. Kubernetes views ignore it and pin to a control plane
+        // node (see k8s::create_k8s_client_with_source), so this only explains
+        // why KUBECONFIG is being disregarded — it never blocks anything. The
+        // helper reads the local kubeconfig first and returns None when unset,
+        // so there's no extra Talos round-trip in the common case.
+        let cp_ip = self
+            .clusters
+            .get(cluster_idx)
+            .and_then(ClusterData::control_plane_ip);
+        if let Some(cp_ip) = cp_ip {
+            let warning = k8s::kubeconfig_mismatch_warning(&client, &cp_ip).await;
+            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
+                cluster.kubeconfig_warning = warning;
+            }
+        }
     }
 
     /// Refresh only the selected node's stats (memory, load, services)
@@ -919,24 +1002,7 @@ impl ClusterComponent {
     /// tagged `controlplane`, then the configured endpoint. `None` only when the
     /// cluster has no known address at all.
     pub fn control_plane_ip(&self) -> Option<String> {
-        let cluster = self.clusters.get(self.active_cluster)?;
-        cluster
-            .etcd_members
-            .iter()
-            .find_map(|m| m.ip_address())
-            .or_else(|| {
-                cluster
-                    .discovery_members
-                    .iter()
-                    .find(|m| m.machine_type == "controlplane")
-                    .and_then(|m| m.addresses.first().cloned())
-            })
-            .or_else(|| {
-                cluster
-                    .endpoints
-                    .first()
-                    .map(|e| e.split(':').next().unwrap_or(e).to_string())
-            })
+        self.clusters.get(self.active_cluster)?.control_plane_ip()
     }
 
     /// Get context name for active cluster
@@ -1886,13 +1952,17 @@ impl ClusterComponent {
 
                 // Discovery warning: worker enumeration failed, so the list
                 // above may be control-plane-only. Surface it instead of
-                // silently hiding workers.
+                // silently hiding workers. Indented + wrapped so it reads as
+                // part of this cluster's tray rather than a clipped stray line.
                 if let Some(warning) = &cluster.discovery_warning {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
-                        Span::styled(warning.clone(), Style::default().fg(Color::Yellow)),
-                    ]));
+                    lines.extend(warning_lines(warning, pane_layout[0].width));
+                }
+
+                // KUBECONFIG points at a different cluster than this context, so
+                // Kubernetes views ignore it and pin to a control plane node.
+                // Explain that rather than let it be a silent surprise.
+                if let Some(warning) = &cluster.kubeconfig_warning {
+                    lines.extend(warning_lines(warning, pane_layout[0].width));
                 }
             }
 
