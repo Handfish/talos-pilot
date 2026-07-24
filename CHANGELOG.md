@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.11
+
+Follow-up reliability fix for node discovery.
+
+### Bug Fixes
+
+**Worker nodes still missing when cluster discovery is disabled ([#25](https://github.com/Handfish/talos-pilot/issues/25), [#22](https://github.com/Handfish/talos-pilot/issues/22))**
+
+0.1.10 fixed workers vanishing when `--config` broke context resolution, but they still disappeared whenever the Talos discovery service itself is turned off. talos-pilot builds its node list from `talosctl get members`, and when `cluster.discovery.enabled: false` (common in hardened/airgapped clusters) that returns nothing — so it fell back to etcd membership, which only ever contains control-plane nodes, and the workers dropped out (leaving the "cluster discovery returned no members" warning). It now falls back to the Kubernetes API: every node — control plane and worker — registers with the API server independently of Talos discovery, so pilot enumerates the full roster there when discovery is empty, reading each node's internal IP and control-plane role label. The kubeconfig for that lookup is fetched directly from a control-plane node over the Talos API (certificate auth), so it always targets the correct cluster and doesn't depend on your local kubeconfig. Reproduced on a discovery-disabled Docker cluster (1 control plane + 2 workers): before, only the control plane showed with the warning; after, all three nodes appear, correctly split into Control Plane and Workers. Verified end-to-end + regression tests added. (commit 0d4c797)
+
 ## 0.1.10
 
 Reliability release focused on connectivity, node discovery, and node operations.
