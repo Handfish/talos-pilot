@@ -886,29 +886,83 @@ fn parse_disks_yaml(yaml_str: &str) -> Result<Vec<DiskInfo>, TalosError> {
     Ok(disks)
 }
 
-/// Parse machine config YAML output from talosctl
+/// Parse machine config YAML output from talosctl.
+///
+/// `talosctl get machineconfig -o yaml` emits MULTIPLE documents (typically the
+/// `persistent` on-disk config and the active `v1alpha1` config), so we must
+/// parse each document separately — a single `from_str` over the whole blob
+/// fails with "deserializing from YAML containing more than one document is not
+/// supported", leaving the config-drift column blank. We prefer the canonical
+/// `v1alpha1` document and fall back to the first document that carries a
+/// version.
 fn parse_machine_config_yaml(yaml_str: &str) -> Result<MachineConfigInfo, TalosError> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(yaml_str)
-        .map_err(|e| TalosError::Connection(format!("Failed to parse YAML: {}", e)))?;
+    let mut fallback: Option<MachineConfigInfo> = None;
 
-    let version = doc
-        .get("metadata")
-        .and_then(|m| m.get("version"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    for doc_str in yaml_str.split("\n---") {
+        let doc_str = doc_str.trim();
+        if doc_str.is_empty() {
+            continue;
+        }
 
-    let machine_type = doc
-        .get("spec")
-        .and_then(|s| s.get("machine"))
-        .and_then(|m| m.get("type"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        let doc: serde_yaml::Value = match serde_yaml::from_str(doc_str) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
-    Ok(MachineConfigInfo {
-        version,
-        machine_type,
+        let metadata = doc.get("metadata");
+
+        // `version` is a resource revision — usually a number, occasionally a
+        // string — so accept either scalar form.
+        let version = metadata
+            .and_then(|m| m.get("version"))
+            .and_then(scalar_to_string)
+            .filter(|s| !s.is_empty());
+        let Some(version) = version else {
+            continue;
+        };
+
+        let id = metadata
+            .and_then(|m| m.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // The real config puts `spec` as a serialized string, so `machine.type`
+        // is only reachable when `spec` is a mapping (as in tests); otherwise it
+        // stays `None`, which is fine — callers only rely on `version` here.
+        let machine_type = doc
+            .get("spec")
+            .and_then(|s| s.get("machine"))
+            .and_then(|m| m.get("type"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let info = MachineConfigInfo {
+            version,
+            machine_type,
+        };
+
+        if id == "v1alpha1" {
+            return Ok(info);
+        }
+        fallback.get_or_insert(info);
+    }
+
+    fallback.ok_or_else(|| {
+        TalosError::Connection("no machineconfig document with a version found".to_string())
     })
+}
+
+/// Render a YAML scalar (`version` may be a number or a string) as a String.
+fn scalar_to_string(v: &serde_yaml::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        Some(s.to_string())
+    } else if let Some(n) = v.as_u64() {
+        Some(n.to_string())
+    } else if let Some(n) = v.as_i64() {
+        Some(n.to_string())
+    } else {
+        v.as_f64().map(|n| n.to_string())
+    }
 }
 
 /// Parse KubeSpan peer status YAML output from talosctl
@@ -1232,6 +1286,39 @@ spec:
         let config = parse_machine_config_yaml(yaml).unwrap();
         assert_eq!(config.version, "5");
         assert_eq!(config.machine_type, Some("controlplane".to_string()));
+    }
+
+    /// Regression: real `talosctl get machineconfig -o yaml` returns MULTIPLE
+    /// documents (persistent + v1alpha1) with a numeric `version` and a
+    /// serialized-string `spec`. The old single-document parse failed outright
+    /// ("more than one document is not supported"), blanking the config column.
+    /// We must parse each document, handle a numeric version, and prefer the
+    /// canonical v1alpha1 config over persistent.
+    #[test]
+    fn test_parse_machine_config_multi_document() {
+        let yaml = r#"node: 10.6.0.2
+metadata:
+    namespace: config
+    type: MachineConfigs.config.talos.dev
+    id: persistent
+    version: 7
+spec: "version: v1alpha1\nmachine:\n    type: controlplane\n"
+---
+node: 10.6.0.2
+metadata:
+    namespace: config
+    type: MachineConfigs.config.talos.dev
+    id: v1alpha1
+    version: 3
+spec: "version: v1alpha1\nmachine:\n    type: controlplane\n"
+"#;
+
+        let config = parse_machine_config_yaml(yaml).unwrap();
+        // Numeric version rendered as a string, taken from the canonical
+        // v1alpha1 document (not persistent's 7).
+        assert_eq!(config.version, "3");
+        // spec is a serialized string here, so machine.type is not a mapping.
+        assert_eq!(config.machine_type, None);
     }
 
     #[test]
