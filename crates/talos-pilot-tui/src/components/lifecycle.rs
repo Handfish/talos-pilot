@@ -6,7 +6,7 @@ use crate::action::Action;
 use crate::components::Component;
 use crate::components::diagnostics::k8s::{
     KubeconfigSource, PdbHealthInfo, PodHealthInfo, check_pdb_health, check_pod_health,
-    create_k8s_client_with_source,
+    create_k8s_client_with_source, discovery_members_via_k8s,
 };
 use crate::ui_ext::HealthIndicatorExt;
 use color_eyre::Result;
@@ -28,6 +28,59 @@ use talos_rs::{
 
 /// Auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 30;
+
+/// Query Talos version and time-sync info for every roster node individually.
+///
+/// The base client's single `version()` / `time()` only cover the endpoint it
+/// targets, so this fans out across the whole roster (control plane and
+/// workers) to build complete lists for the version / config-drift table. Each
+/// entry is keyed by the node hostname (falling back to its IP) so versions and
+/// time-sync rows line up. Returns empty vecs if nothing could be queried,
+/// letting callers keep whatever they already had.
+async fn enumerate_roster_node_info(
+    client: &TalosClient,
+    roster: &[DiscoveryMember],
+) -> (Vec<VersionInfo>, Vec<NodeTimeInfo>) {
+    let mut versions = Vec::new();
+    let mut times = Vec::new();
+    for member in roster {
+        let Some(ip) = member.addresses.first() else {
+            continue;
+        };
+        let name = if member.hostname.is_empty() {
+            ip.clone()
+        } else {
+            member.hostname.clone()
+        };
+        let node_client = client.with_node(ip);
+        if let Ok(mut vs) = node_client.version().await {
+            for v in &mut vs {
+                v.node = name.clone();
+            }
+            versions.extend(vs);
+        }
+        if let Ok(mut ts) = node_client.time().await {
+            for t in &mut ts {
+                t.node = name.clone();
+            }
+            times.extend(ts);
+        }
+    }
+    (versions, times)
+}
+
+/// Resolve the IP to target for per-node `talosctl` calls (e.g. config-hash).
+///
+/// Prefers the roster address for `node` (matched by hostname or address) so
+/// hostname-named nodes still resolve to a reachable IP; falls back to `node`
+/// itself with any port stripped.
+fn roster_ip_for(roster: &[DiscoveryMember], node: &str) -> String {
+    roster
+        .iter()
+        .find(|m| m.hostname == node || m.addresses.iter().any(|a| a == node))
+        .and_then(|m| m.addresses.first().cloned())
+        .unwrap_or_else(|| node.split(':').next().unwrap_or(node).to_string())
+}
 
 /// Node lifecycle status
 #[derive(Debug, Clone)]
@@ -306,16 +359,60 @@ impl LifecycleComponent {
             )
             .await
             {
-                Ok(members) => {
+                Ok(members) if !members.is_empty() => {
                     data.discovery_members = members;
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        "Failed to get discovery members after retries: {} (preserving cached)",
-                        e
-                    );
-                    // DO NOT clear - preserve existing data
+                outcome => {
+                    match &outcome {
+                        Ok(_) => tracing::debug!(
+                            "Talos discovery returned no members (trying the Kubernetes API)"
+                        ),
+                        Err(e) => tracing::debug!(
+                            "Discovery fetch failed after retries: {} (trying the Kubernetes API)",
+                            e
+                        ),
+                    }
+                    // Discovery is disabled or unreachable. Fall back to the
+                    // Kubernetes API, which knows every node independently of
+                    // Talos discovery, so the version / config-drift table covers
+                    // workers too — not just the endpoint. Mirrors the cluster
+                    // node-list fallback.
+                    if data.discovery_members.is_empty() {
+                        let cp_ip = client
+                            .etcd_members()
+                            .await
+                            .ok()
+                            .and_then(|ms| ms.iter().find_map(|m| m.ip_address()))
+                            .or_else(|| fallback_ips.first().cloned());
+                        if let Some(cp_ip) = cp_ip {
+                            match discovery_members_via_k8s(&client, &cp_ip).await {
+                                Ok(members) if !members.is_empty() => {
+                                    tracing::info!(
+                                        "Enumerated {} node(s) via the Kubernetes API for \
+                                         lifecycle (Talos discovery unavailable)",
+                                        members.len()
+                                    );
+                                    data.discovery_members = members;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::debug!("Kubernetes node enumeration failed: {}", e)
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+
+            // Enumerate version + time-sync info for every roster node so the
+            // table covers workers, not just the endpoint the base client
+            // targets. Keep the previously fetched data if the roster query
+            // yields nothing (graceful degradation).
+            let (roster_versions, roster_times) =
+                enumerate_roster_node_info(&client, &data.discovery_members).await;
+            if !roster_versions.is_empty() {
+                data.versions = roster_versions;
+                data.time_info = roster_times;
             }
         }
 
@@ -332,9 +429,11 @@ impl LifecycleComponent {
                     .find(|t| t.node == v.node)
                     .map(|t| t.synced);
 
-                // Get config hash for this specific node
-                let node_addr = v.node.split(':').next().unwrap_or(&v.node);
-                let node_config_hash = match talos_rs::get_machine_config(node_addr) {
+                // Get config hash for this specific node. Resolve the IP from
+                // the roster so this still works when the node is named by
+                // hostname (e.g. workers enumerated via the Kubernetes API).
+                let node_addr = roster_ip_for(&data.discovery_members, &v.node);
+                let node_config_hash = match talos_rs::get_machine_config(&node_addr) {
                     Ok(config) => Some(config.version),
                     Err(_) => None,
                 };
@@ -1067,6 +1166,30 @@ impl Component for LifecycleComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The roster IP resolver maps a hostname- or IP-named node back to a
+    /// reachable IP, so per-node calls (config-hash) work for workers
+    /// enumerated via the Kubernetes API. Unknown nodes fall back to themselves
+    /// with any port stripped. Regression guard for the discovery-disabled
+    /// lifecycle enumeration.
+    #[test]
+    fn roster_ip_for_resolves_hostname_and_falls_back() {
+        let roster = vec![DiscoveryMember {
+            id: "w1".into(),
+            addresses: vec!["10.0.0.2".into()],
+            hostname: "worker-1".into(),
+            machine_type: "worker".into(),
+            operating_system: String::new(),
+        }];
+        // By hostname -> IP.
+        assert_eq!(roster_ip_for(&roster, "worker-1"), "10.0.0.2");
+        // By address -> same IP.
+        assert_eq!(roster_ip_for(&roster, "10.0.0.2"), "10.0.0.2");
+        // Unknown node with a port -> itself, port stripped.
+        assert_eq!(roster_ip_for(&roster, "10.9.9.9:50000"), "10.9.9.9");
+        // Empty roster -> fall back to the node itself.
+        assert_eq!(roster_ip_for(&[], "cp-1"), "cp-1");
+    }
 
     /// A totally empty refresh result (e.g. version RPC failed and no pre-op
     /// check succeeded) must be reported as "nothing gathered" so the caller

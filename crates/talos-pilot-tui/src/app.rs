@@ -1191,11 +1191,19 @@ impl App {
                 // Create workloads component
                 let mut workloads = WorkloadHealthComponent::new();
 
-                // Create K8s client from Talos client
+                // Create K8s client from Talos client. Pin to a control plane
+                // node of the launched context so we read the right cluster's
+                // workloads, not whatever an ambient KUBECONFIG points at.
+                let cp_ip = self.cluster.control_plane_ip();
                 if let Some(talos_client) = self.cluster.client() {
-                    match crate::components::diagnostics::k8s::create_k8s_client(talos_client).await
+                    match crate::components::diagnostics::k8s::create_k8s_client_with_source(
+                        talos_client,
+                        cp_ip.as_deref(),
+                        None,
+                    )
+                    .await
                     {
-                        Ok(k8s_client) => {
+                        Ok((k8s_client, _source)) => {
                             workloads.set_k8s_client(k8s_client);
                         }
                         Err(e) => {
@@ -1285,12 +1293,21 @@ impl App {
                 rolling_ops.set_nodes(node_infos);
 
                 // Set clients
+                let cp_ip = self.cluster.control_plane_ip();
                 if let Some(talos_client) = self.cluster.client() {
                     rolling_ops.set_talos_client(talos_client.clone());
 
-                    // Try to get K8s client
-                    if let Ok(k8s) =
-                        crate::components::diagnostics::k8s::create_k8s_client(talos_client).await
+                    // Pin the K8s client to a control plane node of the launched
+                    // context. Rolling ops cordon/drain by node name through this
+                    // client — targeting the wrong cluster (an ambient KUBECONFIG)
+                    // would drain the wrong nodes.
+                    if let Ok((k8s, _source)) =
+                        crate::components::diagnostics::k8s::create_k8s_client_with_source(
+                            talos_client,
+                            cp_ip.as_deref(),
+                            None,
+                        )
+                        .await
                     {
                         rolling_ops.set_k8s_client(k8s);
                     }

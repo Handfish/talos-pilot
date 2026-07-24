@@ -9,7 +9,7 @@ use kube::{
     Client, Config,
     api::{Api, EvictParams, ListParams, Patch, PatchParams},
 };
-use talos_rs::TalosClient;
+use talos_rs::{DiscoveryMember, TalosClient};
 
 /// Error type for K8s operations
 #[derive(Debug, thiserror::Error)]
@@ -47,9 +47,20 @@ pub async fn create_k8s_client(talos_client: &TalosClient) -> Result<Client, K8s
 /// Create a Kubernetes client and return the source of the kubeconfig
 ///
 /// This function tries sources in this order:
-/// 1. KUBECONFIG environment variable (via Config::infer())
-/// 2. Fetching kubeconfig from a specific control plane node (if cp_node_ip provided)
-/// 3. Fetching kubeconfig from Talos API via VIP (fallback, may fail with multiple nodes)
+/// 1. Fetching kubeconfig from a specific control plane node (if `cp_node_ip` provided)
+/// 2. Fetching kubeconfig from a provided kubeconfig client (if `kubeconfig_client` provided)
+/// 3. KUBECONFIG environment variable (via Config::infer())
+/// 4. Fetching kubeconfig from Talos API via VIP (fallback, may fail with multiple nodes)
+///
+/// A pinned Talos node (steps 1–2) is tried *before* the ambient `KUBECONFIG`.
+/// The kubeconfig a Talos node serves is scoped to *that* node's cluster, so it
+/// always identifies the cluster we launched against (the `--context`). An
+/// environment `KUBECONFIG`, by contrast, can point at an entirely different
+/// cluster — and then read views would show, and drain/cordon would mutate, the
+/// wrong cluster. So when we can pin to a control plane node we prefer it, and
+/// fall back to `KUBECONFIG` only if that node's API server can't be reached.
+/// When no node is available to pin to (both args `None`), we honor the ambient
+/// `KUBECONFIG` per standard tooling conventions.
 ///
 /// # Arguments
 /// * `talos_client` - The main Talos client (connected to VIP or endpoint)
@@ -63,18 +74,9 @@ pub async fn create_k8s_client_with_source(
     cp_node_ip: Option<&str>,
     kubeconfig_client: Option<&TalosClient>,
 ) -> Result<(Client, KubeconfigSource), K8sError> {
-    // Try KUBECONFIG environment variable first (via Config::infer())
-    // This respects standard K8s tooling conventions
-    if let Ok(config) = Config::infer().await
-        && let Ok(client) = Client::try_from(config)
-    {
-        tracing::debug!("Using kubeconfig from environment (KUBECONFIG or default path)");
-        return Ok((client, KubeconfigSource::Environment));
-    }
-
-    tracing::debug!("KUBECONFIG not available, falling back to Talos API");
-
-    // If a specific control plane node IP is provided, target that node
+    // Prefer a pinned control plane node so the client is guaranteed to talk to
+    // the Talos cluster we launched against, never whatever an ambient
+    // KUBECONFIG happens to point at.
     if let Some(node_ip) = cp_node_ip {
         tracing::debug!("Targeting control plane node {} for kubeconfig", node_ip);
         let node_client = talos_client.with_node(node_ip);
@@ -83,13 +85,18 @@ pub async fn create_k8s_client_with_source(
                 return Ok((client, KubeconfigSource::TalosNode(node_ip.to_string())));
             }
             Err(e) => {
-                tracing::warn!("Failed to fetch kubeconfig from node {}: {}", node_ip, e);
+                tracing::warn!(
+                    "Failed to fetch kubeconfig from node {}: {} (falling back)",
+                    node_ip,
+                    e
+                );
                 // Fall through to try other methods
             }
         }
     }
 
-    // Try the provided kubeconfig_client if available
+    // Next, a provided kubeconfig client (e.g. a control plane node used to serve
+    // the kubeconfig while diagnosing a worker) — also cluster-correct.
     if let Some(kc_client) = kubeconfig_client {
         tracing::debug!("Trying provided kubeconfig client");
         match fetch_kubeconfig_from_client(kc_client).await {
@@ -103,6 +110,15 @@ pub async fn create_k8s_client_with_source(
                 tracing::warn!("Failed to fetch kubeconfig from provided client: {}", e);
             }
         }
+    }
+
+    // No control plane node to pin to: honor the ambient KUBECONFIG (env or
+    // default path), respecting standard K8s tooling conventions.
+    if let Ok(config) = Config::infer().await
+        && let Ok(client) = Client::try_from(config)
+    {
+        tracing::debug!("Using kubeconfig from environment (KUBECONFIG or default path)");
+        return Ok((client, KubeconfigSource::Environment));
     }
 
     // Last resort: try the main client (may fail with multiple nodes configured)
@@ -223,6 +239,51 @@ pub async fn list_cluster_nodes(client: &Client) -> Result<Vec<K8sNodeInfo>, K8s
         .await
         .map_err(|e| K8sError::ApiError(format!("Failed to list nodes: {e}")))?;
     Ok(list.items.iter().map(node_info_from).collect())
+}
+
+/// Enumerate all cluster nodes (control plane and workers) through the
+/// Kubernetes API and present them as [`DiscoveryMember`]s.
+///
+/// This is the shared fallback for when the Talos discovery service is disabled
+/// and `talosctl get members` returns nothing. Every node registers with the
+/// Kubernetes API independently of Talos discovery, so — unlike etcd
+/// membership, which only ever lists control plane nodes — it can reveal
+/// workers. The kubeconfig is fetched straight from `cp_ip` (a control plane
+/// node) so we always query the correct cluster's API server, never an
+/// unrelated one an ambient `KUBECONFIG` might point at.
+pub async fn discovery_members_via_k8s(
+    client: &TalosClient,
+    cp_ip: &str,
+) -> Result<Vec<DiscoveryMember>, K8sError> {
+    let k8s_client = create_k8s_client_from_node(client, cp_ip).await?;
+    let nodes = list_cluster_nodes(&k8s_client).await?;
+    Ok(k8s_nodes_to_discovery_members(nodes))
+}
+
+/// Map Kubernetes node roster entries onto [`DiscoveryMember`]s.
+///
+/// Nodes without an internal IP are dropped: a node's Talos API is reached by
+/// IP, so an IP-less node can neither be queried nor displayed. The
+/// control-plane role label maps to the `controlplane`/`worker` machine type
+/// that the node-classification logic keys on.
+pub fn k8s_nodes_to_discovery_members(nodes: Vec<K8sNodeInfo>) -> Vec<DiscoveryMember> {
+    nodes
+        .into_iter()
+        .filter_map(|n| {
+            let ip = n.internal_ip?;
+            Some(DiscoveryMember {
+                id: n.name.clone(),
+                addresses: vec![ip],
+                hostname: n.name,
+                machine_type: if n.is_control_plane {
+                    "controlplane".to_string()
+                } else {
+                    "worker".to_string()
+                },
+                operating_system: String::new(),
+            })
+        })
+        .collect()
 }
 
 /// Detected CNI information from K8s
@@ -1367,5 +1428,36 @@ users:
         let info = node_info_from(&legacy);
         assert!(info.is_control_plane);
         assert_eq!(info.internal_ip, None);
+    }
+
+    /// Kubernetes roster entries map onto discovery members, dropping IP-less
+    /// nodes (unreachable over the Talos API) and mapping the control-plane flag
+    /// to the machine type the UI classifies on.
+    #[test]
+    fn k8s_nodes_map_to_discovery_members_dropping_ipless() {
+        let members = k8s_nodes_to_discovery_members(vec![
+            K8sNodeInfo {
+                name: "cp1".into(),
+                internal_ip: Some("10.0.0.1".into()),
+                is_control_plane: true,
+            },
+            K8sNodeInfo {
+                name: "w1".into(),
+                internal_ip: Some("10.0.0.2".into()),
+                is_control_plane: false,
+            },
+            // No InternalIP -> unreachable over the Talos API -> dropped.
+            K8sNodeInfo {
+                name: "ghost".into(),
+                internal_ip: None,
+                is_control_plane: false,
+            },
+        ]);
+        assert_eq!(members.len(), 2, "IP-less node dropped");
+        assert_eq!(members[0].hostname, "cp1");
+        assert_eq!(members[0].machine_type, "controlplane");
+        assert_eq!(members[0].addresses, vec!["10.0.0.1".to_string()]);
+        assert_eq!(members[1].hostname, "w1");
+        assert_eq!(members[1].machine_type, "worker");
     }
 }
