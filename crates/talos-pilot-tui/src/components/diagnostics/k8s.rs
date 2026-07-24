@@ -113,6 +113,23 @@ pub async fn create_k8s_client_with_source(
     }
 }
 
+/// Create a Kubernetes client by fetching the kubeconfig directly from a
+/// specific Talos control plane node, bypassing the environment `KUBECONFIG`.
+///
+/// Unlike [`create_k8s_client_with_source`], this never consults the ambient
+/// `KUBECONFIG`. That matters for node enumeration: we must talk to *this*
+/// cluster's API server, and an environment kubeconfig can point at a
+/// different cluster entirely — listing another cluster's nodes here would be
+/// a silent false positive. The Talos-served kubeconfig is scoped to the node
+/// we ask, so it always identifies the correct cluster.
+pub async fn create_k8s_client_from_node(
+    talos_client: &TalosClient,
+    cp_node_ip: &str,
+) -> Result<Client, K8sError> {
+    let node_client = talos_client.with_node(cp_node_ip);
+    fetch_kubeconfig_from_client(&node_client).await
+}
+
 /// Fetch kubeconfig from a specific Talos client and create a K8s client
 async fn fetch_kubeconfig_from_client(client: &TalosClient) -> Result<Client, K8sError> {
     // Get kubeconfig from Talos
@@ -145,6 +162,67 @@ pub async fn create_k8s_client_with_kubeconfig_source(
     let (client, _source) =
         create_k8s_client_with_source(talos_client, None, kubeconfig_client).await?;
     Ok(client)
+}
+
+/// A cluster node as seen by the Kubernetes API.
+///
+/// Every node — control plane and worker — registers a `Node` object with the
+/// API server independently of the Talos discovery service, which makes this
+/// the reliable source of truth for the full roster when discovery is disabled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct K8sNodeInfo {
+    /// Node name (matches the Talos hostname).
+    pub name: String,
+    /// Primary internal IP, used to reach the node's Talos API. `None` if the
+    /// node has no `InternalIP` address (then it cannot be queried).
+    pub internal_ip: Option<String>,
+    /// Whether the node carries a control-plane role label.
+    pub is_control_plane: bool,
+}
+
+/// Extract roster info from a single Kubernetes `Node`.
+///
+/// Prefers the `InternalIP` address (the kubelet node IP, which is also the
+/// Talos API address) and reads the role from the standard control-plane role
+/// labels (`node-role.kubernetes.io/control-plane`, or the legacy `master`).
+fn node_info_from(node: &Node) -> K8sNodeInfo {
+    let name = node.metadata.name.clone().unwrap_or_default();
+
+    let internal_ip = node
+        .status
+        .as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .and_then(|addrs| {
+            addrs
+                .iter()
+                .find(|a| a.type_ == "InternalIP")
+                .map(|a| a.address.clone())
+        });
+
+    let is_control_plane = node.metadata.labels.as_ref().is_some_and(|labels| {
+        labels.contains_key("node-role.kubernetes.io/control-plane")
+            || labels.contains_key("node-role.kubernetes.io/master")
+    });
+
+    K8sNodeInfo {
+        name,
+        internal_ip,
+        is_control_plane,
+    }
+}
+
+/// List all cluster nodes via the Kubernetes API.
+///
+/// This is the discovery-independent fallback for enumerating nodes (including
+/// workers) when the Talos discovery service is disabled and
+/// `talosctl get members` returns nothing.
+pub async fn list_cluster_nodes(client: &Client) -> Result<Vec<K8sNodeInfo>, K8sError> {
+    let nodes: Api<Node> = Api::all(client.clone());
+    let list = nodes
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| K8sError::ApiError(format!("Failed to list nodes: {e}")))?;
+    Ok(list.items.iter().map(node_info_from).collect())
 }
 
 /// Detected CNI information from K8s
@@ -1243,5 +1321,51 @@ users:
             config_result.is_err(),
             "Config::infer() should fail with non-existent kubeconfig"
         );
+    }
+
+    /// `node_info_from` must pick the `InternalIP` (the Talos API address) and
+    /// read the control-plane role from the standard role labels. This is the
+    /// extraction the discovery-disabled worker fallback relies on.
+    #[test]
+    fn node_info_extracts_internal_ip_and_control_plane_role() {
+        // Control plane node: role label present; InternalIP chosen even when
+        // other address types precede it.
+        let cp: Node = k8s_openapi::serde_json::from_value(k8s_openapi::serde_json::json!({
+            "metadata": {
+                "name": "cp-1",
+                "labels": { "node-role.kubernetes.io/control-plane": "" }
+            },
+            "status": {
+                "addresses": [
+                    { "type": "Hostname", "address": "cp-1" },
+                    { "type": "InternalIP", "address": "10.0.0.1" }
+                ]
+            }
+        }))
+        .unwrap();
+        let info = node_info_from(&cp);
+        assert_eq!(info.name, "cp-1");
+        assert_eq!(info.internal_ip.as_deref(), Some("10.0.0.1"));
+        assert!(info.is_control_plane);
+
+        // Worker node: no role label -> not control plane.
+        let worker: Node = k8s_openapi::serde_json::from_value(k8s_openapi::serde_json::json!({
+            "metadata": { "name": "worker-1", "labels": {} },
+            "status": { "addresses": [ { "type": "InternalIP", "address": "10.0.0.2" } ] }
+        }))
+        .unwrap();
+        let info = node_info_from(&worker);
+        assert!(!info.is_control_plane);
+        assert_eq!(info.internal_ip.as_deref(), Some("10.0.0.2"));
+
+        // Legacy `master` label also counts as control plane; no InternalIP -> None.
+        let legacy: Node = k8s_openapi::serde_json::from_value(k8s_openapi::serde_json::json!({
+            "metadata": { "name": "old-cp", "labels": { "node-role.kubernetes.io/master": "" } },
+            "status": { "addresses": [] }
+        }))
+        .unwrap();
+        let info = node_info_from(&legacy);
+        assert!(info.is_control_plane);
+        assert_eq!(info.internal_ip, None);
     }
 }
