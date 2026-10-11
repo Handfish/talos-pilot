@@ -8,6 +8,7 @@ pub mod app;
 pub mod audit;
 pub mod clipboard;
 pub mod components;
+pub mod reachability;
 pub mod tui;
 pub mod ui_ext;
 

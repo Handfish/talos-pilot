@@ -3,6 +3,7 @@
 use crate::action::Action;
 use crate::components::Component;
 use crate::components::diagnostics::k8s;
+use crate::reachability::prefer_reachable_addresses;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -156,6 +157,21 @@ struct ClusterData {
 }
 
 impl ClusterData {
+    /// Addresses known to reach their node: etcd member IPs (etcd peers talk
+    /// over them) and the addresses chosen on the previous refresh. Tried first
+    /// so a healthy refresh needs a single probe per node.
+    fn known_good_ips(&self) -> Vec<String> {
+        self.etcd_members
+            .iter()
+            .filter_map(|m| m.ip_address())
+            .chain(
+                self.discovery_members
+                    .iter()
+                    .filter_map(|m| m.addresses.first().cloned()),
+            )
+            .collect()
+    }
+
     /// Best control plane node IP for fetching a cluster-correct kubeconfig.
     /// Prefers an etcd member (etcd runs only on control planes), then a roster
     /// `controlplane` member, then the configured endpoint.
@@ -582,7 +598,8 @@ impl ClusterComponent {
         )
         .await
         {
-            Ok(members) if !members.is_empty() => {
+            Ok(mut members) if !members.is_empty() => {
+                prefer_reachable_addresses(&client, &mut members, &cluster.known_good_ips()).await;
                 cluster.node_ips.clear();
                 for member in &members {
                     if let Some(ip) = member.addresses.first() {
@@ -631,7 +648,13 @@ impl ClusterComponent {
                     match cp_ip {
                         Some(cp_ip) => {
                             match k8s::discovery_members_via_k8s(&client, &cp_ip).await {
-                                Ok(members) if !members.is_empty() => {
+                                Ok(mut members) if !members.is_empty() => {
+                                    prefer_reachable_addresses(
+                                        &client,
+                                        &mut members,
+                                        &cluster.known_good_ips(),
+                                    )
+                                    .await;
                                     cluster.node_ips.clear();
                                     for member in &members {
                                         if let Some(ip) = member.addresses.first() {

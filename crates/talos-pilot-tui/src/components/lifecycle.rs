@@ -8,6 +8,7 @@ use crate::components::diagnostics::k8s::{
     KubeconfigSource, PdbHealthInfo, PodHealthInfo, check_pdb_health, check_pod_health,
     create_k8s_client_with_source, discovery_members_via_k8s,
 };
+use crate::reachability::prefer_reachable_addresses;
 use crate::ui_ext::HealthIndicatorExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -408,6 +409,12 @@ impl LifecycleComponent {
             // table covers workers, not just the endpoint the base client
             // targets. Keep the previously fetched data if the roster query
             // yields nothing (graceful degradation).
+            let hints: Vec<String> = client
+                .etcd_members()
+                .await
+                .map(|ms| ms.iter().filter_map(|m| m.ip_address()).collect())
+                .unwrap_or_default();
+            prefer_reachable_addresses(&client, &mut data.discovery_members, &hints).await;
             let (roster_versions, roster_times) =
                 enumerate_roster_node_info(&client, &data.discovery_members).await;
             if !roster_versions.is_empty() {
