@@ -3616,7 +3616,22 @@ impl NetworkStatsComponent {
         let path = std::path::Path::new("/tmp").join(&filename);
 
         let bytes_saved = self.capture.data.len();
-        match std::fs::write(&path, &self.capture.data) {
+        // /tmp is shared: create exclusively (never follows a planted symlink)
+        // and owner-only, since packet captures can carry credentials.
+        let write_result = {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(&path)
+                .and_then(|mut file| file.write_all(&self.capture.data))
+        };
+        match write_result {
             Ok(_) => {
                 let size_str = if bytes_saved >= 1_048_576 {
                     format!("{:.1} MB", bytes_saved as f64 / 1_048_576.0)

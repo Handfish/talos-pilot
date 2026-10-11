@@ -104,6 +104,8 @@ pub struct DiagnosticsComponent {
     controlplane_endpoint: Option<String>,
     /// Custom config file path (from --config flag)
     config_path: Option<String>,
+    /// Talosconfig context of the active cluster (for talosctl commands)
+    talos_context: Option<String>,
 }
 
 impl Default for DiagnosticsComponent {
@@ -152,6 +154,7 @@ impl DiagnosticsComponent {
             client: None,
             controlplane_endpoint: None,
             config_path,
+            talos_context: None,
         }
     }
 
@@ -173,6 +176,11 @@ impl DiagnosticsComponent {
     /// Set the control plane endpoint for fetching kubeconfig (used for worker nodes)
     pub fn set_controlplane_endpoint(&mut self, endpoint: Option<String>) {
         self.controlplane_endpoint = endpoint;
+    }
+
+    /// Set the talosconfig context used for talosctl commands
+    pub fn set_talos_context(&mut self, context: Option<String>) {
+        self.talos_context = context;
     }
 
     /// Set an error message
@@ -326,42 +334,31 @@ impl DiagnosticsComponent {
                 let patch_yaml =
                     format!("machine:\n  kernel:\n    modules:\n      - name: {}", name);
 
-                let patch_file = "/tmp/talos-pilot-patch.yaml";
-                if let Err(e) = std::fs::write(patch_file, &patch_yaml) {
-                    tracing::error!("Failed to write patch file: {}", e);
-                    self.apply_result = Some(Err(format!("Failed to write patch file: {}", e)));
-                } else {
-                    let output = std::process::Command::new("talosctl")
-                        .args([
-                            "-n",
-                            &address,
-                            "patch",
-                            "machineconfig",
-                            "--mode=reboot",
-                            "-p",
-                            &format!("@{}", patch_file),
-                        ])
-                        .output();
+                // Without a context talosctl would fall back to its default
+                // context, which may be a different cluster than the one shown.
+                let Some(context) = self.talos_context.as_deref() else {
+                    tracing::error!("No talosconfig context for patch");
+                    self.apply_result = Some(Err("No talosconfig context available".to_string()));
+                    self.applying_fix = false;
+                    return Ok(());
+                };
 
-                    match output {
-                        Ok(result) => {
-                            if result.status.success() {
-                                let stdout = String::from_utf8_lossy(&result.stdout);
-                                tracing::info!("Patch succeeded: {}", stdout);
-                                self.apply_result = Some(Ok(vec![]));
-                            } else {
-                                let stderr = String::from_utf8_lossy(&result.stderr);
-                                tracing::error!("Patch failed: {}", stderr);
-                                self.apply_result = Some(Err(stderr.to_string()));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to run talosctl: {}", e);
-                            self.apply_result = Some(Err(format!("Failed to run talosctl: {}", e)));
-                        }
+                match talos_rs::patch_machineconfig_for_node(
+                    context,
+                    &address,
+                    self.config_path.as_deref(),
+                    &patch_yaml,
+                )
+                .await
+                {
+                    Ok(stdout) => {
+                        tracing::info!("Patch succeeded: {}", stdout);
+                        self.apply_result = Some(Ok(vec![]));
                     }
-
-                    let _ = std::fs::remove_file(patch_file);
+                    Err(e) => {
+                        tracing::error!("Patch failed: {}", e);
+                        self.apply_result = Some(Err(e.to_string()));
+                    }
                 }
             }
             FixAction::ApplyConfigPatch {

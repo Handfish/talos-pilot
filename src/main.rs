@@ -2,8 +2,8 @@
 
 use clap::Parser;
 use color_eyre::Result;
-use std::fs::File;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use talos_pilot_tui::App;
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -51,8 +51,10 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
 
     // Initialize logging to file (not stdout, which would corrupt TUI)
-    let log_path = resolve_log_path(cli.log_file);
-    let log_file = File::create(&log_path)?;
+    let log_file = match cli.log_file {
+        Some(path) => File::create(path)?,
+        None => create_private_file(&resolve_log_path(None))?,
+    };
 
     // Build filter: set base level, but quiet down noisy HTTP/gRPC libraries
     let filter = if cli.debug {
@@ -122,6 +124,29 @@ fn resolve_log_path(log_file: Option<String>) -> PathBuf {
     }
 }
 
+/// Create a fresh log file readable only by the current user.
+///
+/// The temp dir may be shared (`/tmp` on Linux), so a fixed name there could be
+/// pre-created by another user as a symlink or as a file they can read. Remove
+/// any previous file, then create exclusively: `create_new` (O_EXCL) never
+/// follows a symlink and fails if someone re-creates the path in between.
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +166,38 @@ mod tests {
             "default log path parent directory does not exist: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn private_file_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("talos-pilot.log");
+        std::fs::write(&path, "old").unwrap();
+
+        create_private_file(&path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_does_not_follow_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("victim");
+        std::fs::write(&target, "keep").unwrap();
+        let link = dir.path().join("talos-pilot.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        create_private_file(&link).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
     }
 
     #[test]

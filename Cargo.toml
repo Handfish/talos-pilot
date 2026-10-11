@@ -94,6 +94,9 @@ color-eyre.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+tempfile = "3"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

@@ -1046,6 +1046,8 @@ impl App {
 
                 // Set the control plane endpoint for worker nodes to fetch kubeconfig
                 diagnostics.set_controlplane_endpoint(cp_endpoint);
+                diagnostics
+                    .set_talos_context(self.cluster.current_context_name().map(|s| s.to_string()));
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {

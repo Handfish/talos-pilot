@@ -1013,10 +1013,10 @@ pub async fn drain_node_with_progress(
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => {
-                    let err_str = e.to_string();
+                    let outcome = classify_eviction_error(&e);
 
                     // Pod already gone - count as success
-                    if err_str.contains("404") || err_str.contains("not found") {
+                    if outcome == EvictionErrorKind::PodGone {
                         evicted += 1;
                         success = true;
                         if let Some(ref cb) = progress_callback {
@@ -1029,12 +1029,7 @@ pub async fn drain_node_with_progress(
                     }
 
                     // PDB blocking eviction - retry after delay
-                    // Error codes: 429 (Too Many Requests) or message about disruption budget
-                    if err_str.contains("429")
-                        || err_str.contains("disruption budget")
-                        || err_str.contains("PodDisruptionBudget")
-                        || err_str.contains("Cannot evict")
-                    {
+                    if outcome == EvictionErrorKind::BlockedByPdb {
                         attempts += 1;
                         tracing::debug!(
                             "PDB blocking eviction of {}/{}, attempt {}/{}",
@@ -1360,8 +1355,59 @@ pub async fn wait_for_node_ready(
     }
 }
 
+/// How a failed pod eviction should be handled
+#[derive(Debug, PartialEq, Eq)]
+enum EvictionErrorKind {
+    /// Pod no longer exists - nothing left to evict
+    PodGone,
+    /// A PodDisruptionBudget denied the eviction for now - retry later
+    BlockedByPdb,
+    /// Any other failure
+    Other,
+}
+
+/// Classify an eviction error by its API status code rather than its message
+/// text. The Eviction API answers 429 when a PodDisruptionBudget denies the
+/// eviction and 404 when the pod is already gone.
+fn classify_eviction_error(err: &kube::Error) -> EvictionErrorKind {
+    match err {
+        kube::Error::Api(resp) if resp.code == 404 => EvictionErrorKind::PodGone,
+        kube::Error::Api(resp) if resp.code == 429 => EvictionErrorKind::BlockedByPdb,
+        _ => EvictionErrorKind::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn api_error(code: u16, message: &str) -> kube::Error {
+        kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: message.to_string(),
+            reason: String::new(),
+            code,
+        })
+    }
+
+    #[test]
+    fn eviction_errors_classified_by_status_code() {
+        assert_eq!(
+            classify_eviction_error(&api_error(404, "pods \"web\" not found")),
+            EvictionErrorKind::PodGone
+        );
+        assert_eq!(
+            classify_eviction_error(&api_error(
+                429,
+                "Cannot evict pod as it would violate the pod's disruption budget."
+            )),
+            EvictionErrorKind::BlockedByPdb
+        );
+        // Message text alone must not drive the decision
+        assert_eq!(
+            classify_eviction_error(&api_error(403, "user cannot evict: 404 in name")),
+            EvictionErrorKind::Other
+        );
+    }
+
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;

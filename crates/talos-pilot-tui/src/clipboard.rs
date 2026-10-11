@@ -4,7 +4,6 @@
 //! This module provides a helper that keeps the clipboard alive in a background thread.
 
 use std::thread;
-use std::time::Duration;
 
 /// Copy text to clipboard, handling Linux quirks
 ///
@@ -16,14 +15,13 @@ pub fn copy_to_clipboard(text: String) -> Result<(), String> {
     thread::spawn(move || {
         match arboard::Clipboard::new() {
             Ok(mut clipboard) => {
-                if let Err(e) = clipboard.set_text(&text) {
-                    tracing::warn!("Failed to copy to clipboard: {}", e);
-                    return;
-                }
-                // On Linux, keep clipboard alive for clipboard managers to grab contents
-                #[cfg(target_os = "linux")]
-                {
-                    thread::sleep(Duration::from_secs(2));
+                match clipboard.set_text(&text) {
+                    Err(e) => tracing::warn!("Failed to copy to clipboard: {}", e),
+                    Ok(()) => {
+                        // On Linux, keep clipboard alive for clipboard managers to grab contents
+                        #[cfg(target_os = "linux")]
+                        thread::sleep(std::time::Duration::from_secs(2));
+                    }
                 }
             }
             Err(e) => {

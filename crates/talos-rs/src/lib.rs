@@ -113,5 +113,6 @@ pub use talosctl::{
     get_discovery_members, get_discovery_members_for_context, get_discovery_members_with_retry,
     get_disks, get_disks_for_context, get_disks_for_node, get_disks_insecure, get_kubespan_peers,
     get_machine_config, get_version_insecure, get_volume_status, get_volume_status_for_node,
-    get_volume_status_insecure, is_kubespan_enabled, reboot_insecure, shutdown_insecure,
+    get_volume_status_insecure, is_kubespan_enabled, patch_machineconfig_for_node, reboot_insecure,
+    shutdown_insecure,
 };

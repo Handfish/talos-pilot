@@ -2784,6 +2784,7 @@ dependencies = [
  "color-eyre",
  "talos-pilot-tui",
  "talos-rs",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

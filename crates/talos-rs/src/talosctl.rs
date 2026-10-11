@@ -454,6 +454,41 @@ pub async fn apply_config_insecure(
     }
 }
 
+/// Patch a node's machine config using context authentication, rebooting to apply
+///
+/// Executes: talosctl --context <context> [--talosconfig <path>] -n <node> patch machineconfig --mode=reboot -p <patch>
+///
+/// The patch is passed inline rather than via `@file`, so there is no temp file
+/// another local user could swap out before talosctl reads it.
+pub async fn patch_machineconfig_for_node(
+    context: &str,
+    node_ip: &str,
+    config_path: Option<&str>,
+    patch: &str,
+) -> Result<String, TalosError> {
+    let mut args = vec!["--context", context];
+
+    // Add talosconfig path if provided
+    let config_path_string;
+    if let Some(path) = config_path {
+        config_path_string = path.to_string();
+        args.push("--talosconfig");
+        args.push(&config_path_string);
+    }
+
+    args.extend_from_slice(&[
+        "-n",
+        node_ip,
+        "patch",
+        "machineconfig",
+        "--mode=reboot",
+        "-p",
+        patch,
+    ]);
+
+    exec_talosctl_async(&args).await
+}
+
 /// Reboot a node in insecure mode
 ///
 /// Executes: talosctl reboot --insecure -n <endpoint>
