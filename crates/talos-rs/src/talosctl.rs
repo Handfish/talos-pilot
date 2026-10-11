@@ -29,6 +29,7 @@ fn exec_talosctl(args: &[&str]) -> Result<String, TalosError> {
 async fn exec_talosctl_async(args: &[&str]) -> Result<String, TalosError> {
     let output = tokio::process::Command::new("talosctl")
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(TalosError::Io)?;
@@ -527,21 +528,38 @@ pub fn get_discovery_members(node: &str) -> Result<Vec<DiscoveryMember>, TalosEr
     parse_discovery_members_yaml(&output)
 }
 
+/// Upper bound for one `talosctl get members` run. A request that apid has to
+/// forward to an unreachable node otherwise hangs for its ~20s dial timeout,
+/// which stalls startup since the first refresh runs behind the connect screen.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Host part of a talosconfig endpoint (`host`, `host:port`, `[v6]` or `[v6]:port`).
+fn endpoint_host(endpoint: &str) -> &str {
+    if let Some(rest) = endpoint.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match endpoint.split_once(':') {
+        // A bare IPv6 address has several colons and no port
+        Some((host, port)) if !port.contains(':') => host,
+        _ => endpoint,
+    }
+}
+
 /// Get discovery members for a context (async, non-blocking)
 ///
-/// Executes: talosctl --context <context> -n <node> get members -o yaml
+/// Executes, for each configured endpoint until one succeeds:
+/// talosctl --context <context> -e <endpoint> -n <endpoint> get members -o yaml
 ///
-/// This version uses the context name to get the correct certificates and endpoint,
-/// and uses tokio async process to avoid blocking the runtime.
-/// It extracts a node IP from the context's endpoints to target the query.
+/// Pinning `-e` to the same node as `-n` makes each endpoint answer for itself.
+/// Without it talosctl picks any endpoint, which then has to forward the
+/// request to `-n` — and nodes frequently cannot reach each other's public
+/// endpoint IPs, so that hop hangs until apid's dial timeout.
 ///
 /// If `config_path` is provided, loads config from that path instead of the default.
 pub async fn get_discovery_members_for_context(
     context: &str,
     config_path: Option<&str>,
 ) -> Result<Vec<DiscoveryMember>, TalosError> {
-    // Load config to get an endpoint IP to use as the node target
-    // talosctl requires -n flag if nodes: is not set in the config
     let config = match config_path {
         Some(path) => {
             let path_buf = std::path::PathBuf::from(path);
@@ -554,28 +572,29 @@ pub async fn get_discovery_members_for_context(
         .get(context)
         .ok_or_else(|| TalosError::ContextNotFound(context.to_string()))?;
 
-    // Get the first endpoint and extract the IP (remove port if present)
-    let node_ip = ctx
-        .endpoints
-        .first()
-        .ok_or_else(|| TalosError::NoEndpoints(context.to_string()))?
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_string();
-
-    if node_ip.is_empty() {
-        return Err(TalosError::NoEndpoints(context.to_string()));
+    let mut last_error = TalosError::NoEndpoints(context.to_string());
+    for endpoint in &ctx.endpoints {
+        let host = endpoint_host(endpoint);
+        if host.is_empty() {
+            continue;
+        }
+        match get_discovery_members_for_node_async(context, Some(endpoint), host, config_path).await
+        {
+            Ok(members) => return Ok(members),
+            Err(e) => {
+                tracing::debug!("Discovery via endpoint {} failed: {}", endpoint, e);
+                last_error = e;
+            }
+        }
     }
-
-    get_discovery_members_for_node_async(context, &node_ip, config_path).await
+    Err(last_error)
 }
 
 /// Get discovery members for a specific node IP using context certificates (async).
 ///
 /// This allows querying a specific control plane node directly instead of going through the VIP.
 ///
-/// Executes: talosctl --context <context> [--talosconfig <path>] -n <node> get members -o yaml
+/// Executes: talosctl --context <context> [--talosconfig <path>] [-e <endpoint>] -n <node> get members -o yaml
 ///
 /// The `--talosconfig` flag is essential for users who run with `--config <path>`:
 /// without it talosctl reads the default `~/.talos/config`, where the context
@@ -583,11 +602,20 @@ pub async fn get_discovery_members_for_context(
 /// degrades to control-plane-only (the "worker nodes missing" reports).
 async fn get_discovery_members_for_node_async(
     context: &str,
+    endpoint: Option<&str>,
     node_ip: &str,
     config_path: Option<&str>,
 ) -> Result<Vec<DiscoveryMember>, TalosError> {
-    let args = members_command_args(context, node_ip, config_path);
-    let output = exec_talosctl_async(&args).await?;
+    let args = members_command_args(context, endpoint, node_ip, config_path);
+    let output = tokio::time::timeout(DISCOVERY_TIMEOUT, exec_talosctl_async(&args))
+        .await
+        .map_err(|_| {
+            TalosError::Connection(format!(
+                "talosctl get members for {} timed out after {}s",
+                node_ip,
+                DISCOVERY_TIMEOUT.as_secs()
+            ))
+        })??;
     parse_discovery_members_yaml(&output)
 }
 
@@ -599,6 +627,7 @@ async fn get_discovery_members_for_node_async(
 /// silently degraded the node list to control-plane-only (workers missing).
 fn members_command_args<'a>(
     context: &'a str,
+    endpoint: Option<&'a str>,
     node_ip: &'a str,
     config_path: Option<&'a str>,
 ) -> Vec<&'a str> {
@@ -606,6 +635,10 @@ fn members_command_args<'a>(
     if let Some(path) = config_path {
         args.push("--talosconfig");
         args.push(path);
+    }
+    if let Some(endpoint) = endpoint {
+        args.push("-e");
+        args.push(endpoint);
     }
     args.extend_from_slice(&["-n", node_ip, "get", "members", "-o", "yaml"]);
     args
@@ -660,7 +693,7 @@ pub async fn get_discovery_members_with_retry(
         fastrand::shuffle(&mut shuffled_ips);
 
         for node_ip in shuffled_ips {
-            match get_discovery_members_for_node_async(context, node_ip, config_path).await {
+            match get_discovery_members_for_node_async(context, None, node_ip, config_path).await {
                 Ok(members) => {
                     tracing::debug!(
                         "Successfully fetched discovery members from fallback node {}",
@@ -1494,7 +1527,7 @@ spec:
 
     #[test]
     fn members_args_include_talosconfig_when_config_path_set() {
-        let args = members_command_args("mycluster", "10.0.0.1", Some("/etc/talos/config"));
+        let args = members_command_args("mycluster", None, "10.0.0.1", Some("/etc/talos/config"));
         assert_eq!(
             args,
             vec![
@@ -1513,8 +1546,38 @@ spec:
     }
 
     #[test]
+    fn members_args_pin_endpoint_to_node() {
+        let args = members_command_args("kprod", Some("5.9.183.236"), "5.9.183.236", None);
+        assert_eq!(
+            args,
+            vec![
+                "--context",
+                "kprod",
+                "-e",
+                "5.9.183.236",
+                "-n",
+                "5.9.183.236",
+                "get",
+                "members",
+                "-o",
+                "yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_host_strips_port_and_brackets() {
+        assert_eq!(endpoint_host("10.0.0.1"), "10.0.0.1");
+        assert_eq!(endpoint_host("10.0.0.1:50000"), "10.0.0.1");
+        assert_eq!(endpoint_host("talos.example.com:443"), "talos.example.com");
+        assert_eq!(endpoint_host("[2a01::1]:50000"), "2a01::1");
+        assert_eq!(endpoint_host("[2a01::1]"), "2a01::1");
+        assert_eq!(endpoint_host("2a01::1"), "2a01::1");
+    }
+
+    #[test]
     fn members_args_omit_talosconfig_when_none() {
-        let args = members_command_args("mycluster", "10.0.0.1", None);
+        let args = members_command_args("mycluster", None, "10.0.0.1", None);
         assert!(!args.contains(&"--talosconfig"));
         assert_eq!(&args[..2], &["--context", "mycluster"]);
     }
