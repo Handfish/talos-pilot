@@ -810,6 +810,10 @@ impl App {
                         if let Some(next_action) = self.cluster.update(Action::Tick)? {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
+                        // Rebuild the node list in the background so nodes that
+                        // went away (e.g. rebooted) come back without pressing r
+                        self.cluster.apply_background_refresh();
+                        self.cluster.start_background_refresh();
                         // Auto-refresh selected node stats every 5 seconds
                         if self.cluster.should_auto_refresh() {
                             let _ = self.cluster.refresh_selected_node().await;
