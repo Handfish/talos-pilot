@@ -10,7 +10,9 @@ use crate::components::{
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -629,87 +631,12 @@ impl App {
             if event::poll(self.tick_rate)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        let action = match self.view {
-                            View::Cluster => self.cluster.handle_key_event(key)?,
-                            View::MultiLogs => {
-                                if let Some(multi_logs) = &mut self.multi_logs {
-                                    multi_logs.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Etcd => {
-                                if let Some(etcd) = &mut self.etcd {
-                                    etcd.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Processes => {
-                                if let Some(processes) = &mut self.processes {
-                                    processes.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Network => {
-                                if let Some(network) = &mut self.network {
-                                    network.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Diagnostics => {
-                                if let Some(diagnostics) = &mut self.diagnostics {
-                                    diagnostics.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Security => {
-                                if let Some(security) = &mut self.security {
-                                    security.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Lifecycle => {
-                                if let Some(lifecycle) = &mut self.lifecycle {
-                                    lifecycle.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Workloads => {
-                                if let Some(workloads) = &mut self.workloads {
-                                    workloads.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Storage => {
-                                if let Some(storage) = &mut self.storage {
-                                    storage.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::NodeOperations => {
-                                if let Some(node_ops) = &mut self.node_operations {
-                                    node_ops.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::RollingOperations => {
-                                if let Some(rolling_ops) = &mut self.rolling_operations {
-                                    rolling_ops.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                        };
-                        if let Some(action) = action {
+                        if let Some(action) = self.dispatch_key(key)? {
+                            self.handle_action(action).await?;
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        if let Some(action) = self.dispatch_mouse(mouse)? {
                             self.handle_action(action).await?;
                         }
                     }
@@ -754,6 +681,105 @@ impl App {
     }
 
     /// Handle an action
+    /// Route a key press to the component for the current view
+    fn dispatch_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        Ok(match self.view {
+            View::Cluster => self.cluster.handle_key_event(key)?,
+            View::MultiLogs => {
+                if let Some(multi_logs) = &mut self.multi_logs {
+                    multi_logs.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Etcd => {
+                if let Some(etcd) = &mut self.etcd {
+                    etcd.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Processes => {
+                if let Some(processes) = &mut self.processes {
+                    processes.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Network => {
+                if let Some(network) = &mut self.network {
+                    network.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Diagnostics => {
+                if let Some(diagnostics) = &mut self.diagnostics {
+                    diagnostics.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Security => {
+                if let Some(security) = &mut self.security {
+                    security.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Lifecycle => {
+                if let Some(lifecycle) = &mut self.lifecycle {
+                    lifecycle.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Workloads => {
+                if let Some(workloads) = &mut self.workloads {
+                    workloads.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Storage => {
+                if let Some(storage) = &mut self.storage {
+                    storage.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::NodeOperations => {
+                if let Some(node_ops) = &mut self.node_operations {
+                    node_ops.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::RollingOperations => {
+                if let Some(rolling_ops) = &mut self.rolling_operations {
+                    rolling_ops.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+        })
+    }
+
+    /// Route a mouse event: the cluster view handles clicks and the wheel
+    /// itself; other views get the wheel as Up/Down key presses so lists and
+    /// logs scroll without per-component mouse code.
+    fn dispatch_mouse(&mut self, mouse: MouseEvent) -> Result<Option<Action>> {
+        if self.view == View::Cluster {
+            return self.cluster.handle_mouse_event(mouse);
+        }
+        let code = match mouse.kind {
+            MouseEventKind::ScrollUp => KeyCode::Up,
+            MouseEventKind::ScrollDown => KeyCode::Down,
+            _ => return Ok(None),
+        };
+        self.dispatch_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
     async fn handle_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Quit => {

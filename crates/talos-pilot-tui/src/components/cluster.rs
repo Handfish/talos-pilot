@@ -5,7 +5,7 @@ use crate::components::Component;
 use crate::components::diagnostics::k8s;
 use crate::reachability::prefer_reachable_addresses;
 use color_eyre::Result;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -584,6 +584,28 @@ pub struct ClusterComponent {
     network_info: HashMap<(String, String), (std::time::Instant, Option<NodeNetworkInfo>)>,
     /// In-flight network summary fetch for the selected node(s) (see `poll_network_info`)
     network_fetch: Option<NetworkFetch>,
+    /// Screen regions from the last draw, for mapping mouse clicks
+    hits: std::cell::RefCell<HitMap>,
+}
+
+/// Where clickable things were drawn on the last frame
+#[derive(Default)]
+struct HitMap {
+    /// Node list area and the item drawn on each of its rows (`None` for
+    /// error/warning lines)
+    node_list: Rect,
+    node_rows: Vec<Option<NodeListItem>>,
+    /// Navigation menu area; row 0 is the separator, row `i` is item `i`
+    menu: Rect,
+    /// Details pane area
+    details: Rect,
+    /// Services list area in the node details (row 0 is its heading) and the
+    /// number of services drawn
+    services: Option<(Rect, usize)>,
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.x + area.width && row >= area.y && row < area.y + area.height
 }
 
 /// Background `get_node_network_info` calls, keyed by (context, node name)
@@ -726,6 +748,7 @@ impl ClusterComponent {
             background_refresh: None,
             network_info: HashMap::new(),
             network_fetch: None,
+            hits: std::cell::RefCell::new(HitMap::default()),
         }
     }
 
@@ -1550,6 +1573,92 @@ impl ClusterComponent {
 }
 
 impl Component for ClusterComponent {
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<Option<Action>> {
+        let (column, row) = (mouse.column, mouse.row);
+        let (in_nodes, in_menu, in_details) = {
+            let hits = self.hits.borrow();
+            (
+                contains(hits.node_list, column, row),
+                contains(hits.menu, column, row),
+                contains(hits.details, column, row),
+            )
+        };
+
+        match mouse.kind {
+            // Wheel scrolls the pane under the pointer
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let pane = if in_details {
+                    FocusedPane::Services
+                } else if in_menu {
+                    FocusedPane::Menu
+                } else if in_nodes {
+                    FocusedPane::Nodes
+                } else {
+                    return Ok(None);
+                };
+                self.focused_pane = pane;
+                if pane == FocusedPane::Menu && self.selected_menu_item == 0 {
+                    self.selected_menu_item = 1;
+                }
+                let code = if mouse.kind == MouseEventKind::ScrollUp {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                };
+                self.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_nodes {
+                    self.focused_pane = FocusedPane::Nodes;
+                    let item = {
+                        let hits = self.hits.borrow();
+                        let idx = (row - hits.node_list.y) as usize;
+                        hits.node_rows.get(idx).cloned().flatten()
+                    };
+                    if let Some(item) = item {
+                        let is_header = matches!(
+                            item,
+                            NodeListItem::ClusterHeader(_)
+                                | NodeListItem::ControlPlaneHeader(_)
+                                | NodeListItem::WorkersHeader(_)
+                        );
+                        // Clicking the already-selected header folds/unfolds it
+                        if is_header && item == self.selected_item {
+                            self.toggle_expand();
+                        } else {
+                            self.selected_item = item;
+                            if let Some(idx) = self.selected_cluster_index() {
+                                self.active_cluster = idx;
+                            }
+                        }
+                    }
+                    Ok(None)
+                } else if in_menu {
+                    let idx = (row - self.hits.borrow().menu.y) as usize;
+                    if (1..=NavMenuItem::ALL.len()).contains(&idx) {
+                        self.focused_pane = FocusedPane::Menu;
+                        self.selected_menu_item = idx;
+                        return self.navigate_to_selected_menu();
+                    }
+                    Ok(None)
+                } else if in_details {
+                    self.focused_pane = FocusedPane::Services;
+                    let service = self.hits.borrow().services.and_then(|(area, count)| {
+                        let idx = row.checked_sub(area.y + 1)? as usize;
+                        (contains(area, column, row) && idx < count).then_some(idx)
+                    });
+                    if let Some(idx) = service {
+                        self.selected_service = idx;
+                    }
+                    Ok(None)
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Ok(Some(Action::Quit)),
@@ -1914,6 +2023,11 @@ impl Component for ClusterComponent {
             Span::raw("  "),
             Span::styled("[q]", Style::default().fg(Color::Yellow)),
             Span::styled(" quit", Style::default().dim()),
+            Span::raw("  "),
+            // Mouse capture is on for click navigation, so the terminal's own
+            // selection needs a modifier (Option in iTerm2, Shift elsewhere)
+            Span::styled("[⌥/⇧+drag]", Style::default().fg(Color::Yellow)),
+            Span::styled(" select text", Style::default().dim()),
         ]);
         let footer = Paragraph::new(footer_line).block(
             Block::default()
@@ -2053,6 +2167,12 @@ impl ClusterComponent {
         } else {
             // Build multi-cluster accordion-style node list
             let mut lines = Vec::new();
+            let mut row_items: Vec<Option<NodeListItem>> = Vec::new();
+            // Record which item the line just pushed belongs to
+            let mut mark = |lines: &Vec<Line>, item: NodeListItem| {
+                row_items.resize(lines.len() - 1, None);
+                row_items.push(Some(item));
+            };
             let nodes_focused = self.focused_pane == FocusedPane::Nodes;
 
             for (cluster_idx, cluster) in self.clusters.iter().enumerate() {
@@ -2114,6 +2234,7 @@ impl ClusterComponent {
                 ];
                 cluster_line.extend(etcd_spans);
                 lines.push(Line::from(cluster_line));
+                mark(&lines, NodeListItem::ClusterHeader(cluster_idx));
 
                 // Show a connection error under the cluster header (always, even
                 // when collapsed) so failures are visible instead of a blank list.
@@ -2160,6 +2281,7 @@ impl ClusterComponent {
                         Span::styled(format!("{} {} ", selector, expand_icon), header_style),
                         Span::styled(format!("Control Plane ({})", cp_nodes.len()), header_style),
                     ]));
+                    mark(&lines, NodeListItem::ControlPlaneHeader(cluster_idx));
 
                     // Show control plane nodes if expanded
                     if cluster.controlplane_expanded {
@@ -2215,6 +2337,7 @@ impl ClusterComponent {
                                 ),
                                 Span::styled(node_name, name_style),
                             ]));
+                            mark(&lines, NodeListItem::ControlPlaneNode(cluster_idx, idx));
                         }
                     }
                 }
@@ -2246,6 +2369,7 @@ impl ClusterComponent {
                         Span::styled(format!("{} {} ", selector, expand_icon), header_style),
                         Span::styled(format!("Workers ({})", worker_nodes.len()), header_style),
                     ]));
+                    mark(&lines, NodeListItem::WorkersHeader(cluster_idx));
 
                     // Show worker nodes if expanded
                     if cluster.workers_expanded {
@@ -2301,6 +2425,7 @@ impl ClusterComponent {
                                 ),
                                 Span::styled(node_name, name_style),
                             ]));
+                            mark(&lines, NodeListItem::WorkerNode(cluster_idx, idx));
                         }
                     }
                 }
@@ -2322,7 +2447,11 @@ impl ClusterComponent {
             }
 
             frame.render_widget(Paragraph::new(lines), pane_layout[0]);
+            let mut hits = self.hits.borrow_mut();
+            hits.node_list = pane_layout[0];
+            hits.node_rows = row_items;
         }
+        self.hits.borrow_mut().menu = pane_layout[1];
 
         // Draw navigation menu
         self.draw_nav_menu(frame, pane_layout[1]);
@@ -2662,6 +2791,11 @@ impl ClusterComponent {
     }
 
     fn draw_details_pane(&self, frame: &mut Frame, area: Rect) {
+        {
+            let mut hits = self.hits.borrow_mut();
+            hits.details = area;
+            hits.services = None;
+        }
         // Focus indication - cyan border when focused
         let border_color = if self.focused_pane == FocusedPane::Services {
             Color::Cyan
@@ -2998,6 +3132,7 @@ impl ClusterComponent {
             }
 
             frame.render_widget(Paragraph::new(svc_lines), panel_layout[1]);
+            self.hits.borrow_mut().services = Some((panel_layout[1], services.len()));
         }
     }
 }
