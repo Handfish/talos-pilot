@@ -712,6 +712,135 @@ pub async fn get_discovery_members_with_retry(
     Err(last_error.unwrap_or_else(|| TalosError::NoEndpoints(context.to_string())))
 }
 
+/// Network summary for a node, as shown by the Talos dashboard
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeNetworkInfo {
+    /// Node addresses with prefix length, excluding Kubernetes pod addresses
+    pub addresses: Vec<String>,
+    /// Default-route gateways
+    pub gateways: Vec<String>,
+    /// Configured DNS servers
+    pub dns_servers: Vec<String>,
+    /// `NetworkStatus.connectivityReady`, `None` if it could not be read
+    pub connectivity_ready: Option<bool>,
+}
+
+/// Upper bound for each `talosctl get` issued by [`get_node_network_info`]
+const NETWORK_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `talosctl get <resource> [id] -o yaml` against one node, with a timeout
+async fn get_resource_yaml(
+    context: &str,
+    node_ip: &str,
+    config_path: Option<&str>,
+    resource: &[&str],
+) -> Result<String, TalosError> {
+    let mut args = vec!["--context", context];
+    if let Some(path) = config_path {
+        args.extend_from_slice(&["--talosconfig", path]);
+    }
+    args.extend_from_slice(&["-n", node_ip, "get"]);
+    args.extend_from_slice(resource);
+    args.extend_from_slice(&["-o", "yaml"]);
+
+    tokio::time::timeout(NETWORK_INFO_TIMEOUT, exec_talosctl_async(&args))
+        .await
+        .map_err(|_| {
+            TalosError::Connection(format!(
+                "talosctl get {} timed out after {}s",
+                resource.join(" "),
+                NETWORK_INFO_TIMEOUT.as_secs()
+            ))
+        })?
+}
+
+/// Get the node's addresses, gateways, DNS servers and connectivity status
+///
+/// Executes (concurrently) against `node_ip`:
+/// `get nodeaddress current-no-k8s`, `get routestatus`, `get resolvers`,
+/// `get networkstatus`. Fields whose query fails are left empty / `None`;
+/// an error is returned only if every query fails.
+pub async fn get_node_network_info(
+    context: &str,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> Result<NodeNetworkInfo, TalosError> {
+    let (addresses, routes, resolvers, status) = tokio::join!(
+        get_resource_yaml(
+            context,
+            node_ip,
+            config_path,
+            &["nodeaddress", "current-no-k8s"]
+        ),
+        get_resource_yaml(context, node_ip, config_path, &["routestatus"]),
+        get_resource_yaml(context, node_ip, config_path, &["resolvers"]),
+        get_resource_yaml(context, node_ip, config_path, &["networkstatus"]),
+    );
+
+    if let (Err(e), Err(_), Err(_), Err(_)) = (&addresses, &routes, &resolvers, &status) {
+        return Err(TalosError::Connection(e.to_string()));
+    }
+
+    Ok(NodeNetworkInfo {
+        addresses: addresses
+            .map(|y| parse_spec_string_list(&y, "addresses"))
+            .unwrap_or_default(),
+        gateways: routes
+            .map(|y| parse_default_gateways(&y))
+            .unwrap_or_default(),
+        dns_servers: resolvers
+            .map(|y| parse_spec_string_list(&y, "dnsServers"))
+            .unwrap_or_default(),
+        connectivity_ready: status.ok().and_then(|y| parse_connectivity_ready(&y)),
+    })
+}
+
+/// Iterate over the `spec` of each document in multi-document talosctl YAML
+fn yaml_specs(yaml_str: &str) -> impl Iterator<Item = serde_yaml::Value> + '_ {
+    yaml_str.split("\n---").filter_map(|doc| {
+        serde_yaml::from_str::<serde_yaml::Value>(doc.trim())
+            .ok()?
+            .get("spec")
+            .cloned()
+    })
+}
+
+/// Collect a string list field from the first document's spec
+fn parse_spec_string_list(yaml_str: &str, field: &str) -> Vec<String> {
+    yaml_specs(yaml_str)
+        .next()
+        .and_then(|spec| {
+            spec.get(field)?.as_sequence().map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Gateways of default routes (empty destination) in the main table
+fn parse_default_gateways(yaml_str: &str) -> Vec<String> {
+    let mut gateways: Vec<String> = Vec::new();
+    for spec in yaml_specs(yaml_str) {
+        let field = |name: &str| spec.get(name).and_then(|v| v.as_str()).unwrap_or("");
+        let gateway = field("gateway");
+        if field("dst").is_empty()
+            && field("table") == "main"
+            && !gateway.is_empty()
+            && !gateways.iter().any(|g| g == gateway)
+        {
+            gateways.push(gateway.to_string());
+        }
+    }
+    gateways
+}
+
+/// `connectivityReady` from the NetworkStatus resource
+fn parse_connectivity_ready(yaml_str: &str) -> Option<bool> {
+    yaml_specs(yaml_str).find_map(|spec| spec.get("connectivityReady").and_then(|v| v.as_bool()))
+}
+
 /// Get address status for a node (for VIP detection)
 ///
 /// Executes: talosctl get addressstatus --nodes <node> -o yaml
@@ -1628,5 +1757,27 @@ spec:
         for ip in &multiple {
             assert!(shuffled.contains(&ip));
         }
+    }
+
+    #[test]
+    fn network_info_parsing() {
+        let addresses = "node: 65.21.17.62\nmetadata:\n    id: current-no-k8s\nspec:\n    addresses:\n        - 65.21.17.62/26\n        - 100.64.0.8/32\n    sortAlgorithm: v1\n";
+        assert_eq!(
+            parse_spec_string_list(addresses, "addresses"),
+            vec!["65.21.17.62/26", "100.64.0.8/32"]
+        );
+
+        let routes = "spec:\n    dst: 10.44.2.0/24\n    gateway: 10.44.2.147\n    table: main\n---\nspec:\n    dst: \"\"\n    gateway: \"\"\n    table: \"180\"\n---\nspec:\n    dst: \"\"\n    gateway: 65.21.17.1\n    table: main\n---\nspec:\n    dst: \"\"\n    gateway: 65.21.17.1\n    table: main\n";
+        assert_eq!(parse_default_gateways(routes), vec!["65.21.17.1"]);
+
+        let resolvers = "spec:\n    dnsServers:\n        - 185.12.64.1\n        - 1.1.1.1\n";
+        assert_eq!(
+            parse_spec_string_list(resolvers, "dnsServers"),
+            vec!["185.12.64.1", "1.1.1.1"]
+        );
+
+        let status = "spec:\n    addressReady: true\n    connectivityReady: false\n";
+        assert_eq!(parse_connectivity_ready(status), Some(false));
+        assert_eq!(parse_connectivity_ready("spec: {}\n"), None);
     }
 }

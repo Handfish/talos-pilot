@@ -15,8 +15,9 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use talos_rs::{
-    DiscoveryMember, EtcdMemberInfo, MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory, NodeServices,
-    ServiceInfo, TalosClient, TalosConfig, VersionInfo, get_discovery_members_with_retry,
+    DiscoveryMember, EtcdMemberInfo, MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory,
+    NodeNetworkInfo, NodeServices, NodeSystemStat, ServiceInfo, TalosClient, TalosConfig,
+    VersionInfo, get_discovery_members_with_retry,
 };
 
 /// Simple etcd status for header display
@@ -133,6 +134,8 @@ struct ClusterData {
     load_avg: Vec<NodeLoadAvg>,
     /// CPU info from nodes
     cpu_info: Vec<NodeCpuInfo>,
+    /// System stats (boot time) from nodes
+    system_stat: Vec<NodeSystemStat>,
     /// Etcd members (control plane nodes only)
     etcd_members: Vec<EtcdMemberInfo>,
     /// Discovery members (ALL cluster nodes)
@@ -365,6 +368,7 @@ impl ClusterData {
             let mut memory = Vec::new();
             let mut load_avg = Vec::new();
             let mut cpu_info = Vec::new();
+            let mut system_stat = Vec::new();
 
             for (node_name, ip) in &nodes_to_query {
                 let node_client = client.with_node(ip);
@@ -399,6 +403,12 @@ impl ClusterData {
                     }
                     cpu_info.extend(nc);
                 }
+                if let Ok(mut ns) = node_client.system_stat().await {
+                    for s in &mut ns {
+                        s.node = node_name.clone();
+                    }
+                    system_stat.extend(ns);
+                }
             }
 
             // Need to re-borrow cluster mutably after async calls
@@ -408,6 +418,7 @@ impl ClusterData {
                 cluster.memory = memory;
                 cluster.load_avg = load_avg;
                 cluster.cpu_info = cpu_info;
+                cluster.system_stat = system_stat;
 
                 // Fetch etcd status for header summary (target all control planes)
                 if let Some(client) = &cluster.client {
@@ -569,12 +580,62 @@ pub struct ClusterComponent {
     context_filter: Option<String>,
     /// In-flight background refresh of every cluster (see `start_background_refresh`)
     background_refresh: Option<tokio::task::JoinHandle<Vec<ClusterData>>>,
+    /// Network summary per (context, node name), with the time of the last fetch attempt
+    network_info: HashMap<(String, String), (std::time::Instant, Option<NodeNetworkInfo>)>,
+    /// In-flight network summary fetch for the selected node (see `poll_network_info`)
+    network_fetch: Option<NetworkFetch>,
 }
+
+/// A background `get_node_network_info` call for one node
+struct NetworkFetch {
+    key: (String, String),
+    handle: tokio::task::JoinHandle<Result<NodeNetworkInfo, talos_rs::TalosError>>,
+}
+
+/// How often the selected node's network summary is re-fetched. It changes
+/// rarely and costs four talosctl invocations, so this is much slower than
+/// the stats auto-refresh.
+const NETWORK_INFO_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Default for ClusterComponent {
     fn default() -> Self {
         Self::new(None, None)
     }
+}
+
+/// Render `label` followed by `items` joined with ", ", breaking only between
+/// items so an address is never split. Continuation lines are indented to
+/// align with the first item. Returns no lines when `items` is empty.
+fn wrap_list(label: &str, items: &[String], width: usize, style: Style) -> Vec<Line<'static>> {
+    let indent = label.chars().count();
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for (i, item) in items.iter().enumerate() {
+        let sep = if i + 1 < items.len() { "," } else { "" };
+        let piece = format!("{item}{sep}");
+        if !row.is_empty() && indent + row.chars().count() + 1 + piece.chars().count() > width {
+            rows.push(std::mem::take(&mut row));
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str(&piece);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let prefix = if i == 0 {
+                Span::styled(label.to_string(), Style::default().dim())
+            } else {
+                Span::raw(" ".repeat(indent))
+            };
+            Line::from(vec![prefix, Span::styled(row, style)])
+        })
+        .collect()
 }
 
 /// Extract the deepest, most actionable message from an error chain.
@@ -605,6 +666,8 @@ impl ClusterComponent {
             config_path,
             context_filter,
             background_refresh: None,
+            network_info: HashMap::new(),
+            network_fetch: None,
         }
     }
 
@@ -941,6 +1004,73 @@ impl ClusterComponent {
         self.ensure_selection_visible();
     }
 
+    /// Collect a finished network summary fetch and start one for the selected
+    /// node when it has none or it is older than `NETWORK_INFO_REFRESH`.
+    ///
+    /// Runs in a spawned task so slow talosctl calls never block drawing.
+    pub fn poll_network_info(&mut self) {
+        use futures::FutureExt;
+
+        if self
+            .network_fetch
+            .as_ref()
+            .is_some_and(|f| f.handle.is_finished())
+            && let Some(fetch) = self.network_fetch.take()
+        {
+            let previous = self
+                .network_info
+                .remove(&fetch.key)
+                .and_then(|(_, info)| info);
+            let info = match fetch.handle.now_or_never() {
+                Some(Ok(Ok(info))) => Some(info),
+                Some(Ok(Err(e))) => {
+                    tracing::debug!("Network info for {:?} failed: {}", fetch.key, e);
+                    previous
+                }
+                _ => previous,
+            };
+            self.network_info
+                .insert(fetch.key, (std::time::Instant::now(), info));
+        }
+
+        if !self.auto_refresh || self.network_fetch.is_some() {
+            return;
+        }
+        let Some(node_name) = self.current_node_name() else {
+            return;
+        };
+        let Some(cluster) = self.clusters.get(self.active_cluster) else {
+            return;
+        };
+        let Some(node_ip) = cluster.node_ips.get(&node_name).cloned() else {
+            return;
+        };
+        let key = (cluster.name.clone(), node_name);
+        let fresh = self
+            .network_info
+            .get(&key)
+            .is_some_and(|(at, _)| at.elapsed() < NETWORK_INFO_REFRESH);
+        if fresh {
+            return;
+        }
+
+        let context = cluster.name.clone();
+        let config_path = self.config_path.clone();
+        let handle = tokio::spawn(async move {
+            talos_rs::get_node_network_info(&context, &node_ip, config_path.as_deref()).await
+        });
+        self.network_fetch = Some(NetworkFetch { key, handle });
+    }
+
+    /// Network summary for a node in the active cluster, if fetched
+    fn get_node_network_info(&self, node_name: &str) -> Option<&NodeNetworkInfo> {
+        let cluster = self.clusters.get(self.active_cluster)?;
+        self.network_info
+            .get(&(cluster.name.clone(), node_name.to_string()))?
+            .1
+            .as_ref()
+    }
+
     /// Reset the selection to its cluster header if a refresh removed the
     /// selected node (e.g. it went down), so the cursor never points at nothing.
     fn ensure_selection_visible(&mut self) {
@@ -1006,6 +1136,16 @@ impl ClusterComponent {
             }
         }
 
+        if let Ok(mut node_stat) = node_client.system_stat().await {
+            for s in &mut node_stat {
+                s.node = node_name.clone();
+            }
+            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
+                cluster.system_stat.retain(|s| s.node != node_name);
+                cluster.system_stat.extend(node_stat);
+            }
+        }
+
         self.last_auto_refresh = Some(std::time::Instant::now());
         Ok(())
     }
@@ -1067,6 +1207,15 @@ impl ClusterComponent {
     /// Get load average for a node in the active cluster
     fn get_node_load_avg(&self, node_name: &str) -> Option<&NodeLoadAvg> {
         self.get_node_load_avg_for(self.active_cluster, node_name)
+    }
+
+    /// Get system stats for a node in the active cluster
+    fn get_node_system_stat(&self, node_name: &str) -> Option<&NodeSystemStat> {
+        self.clusters
+            .get(self.active_cluster)?
+            .system_stat
+            .iter()
+            .find(|s| s.node == node_name || (s.node.is_empty() && node_name.is_empty()))
     }
 
     /// Get CPU info for a node in a specific cluster
@@ -2392,13 +2541,6 @@ impl ClusterComponent {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Split into resources and services
-        let panel_layout = Layout::vertical([
-            Constraint::Length(5), // Resources
-            Constraint::Min(4),    // Services
-        ])
-        .split(inner);
-
         // Resources section
         let mut resource_lines = vec![Line::from(vec![
             Span::styled(" IP: ", Style::default().dim()),
@@ -2458,6 +2600,53 @@ impl ClusterComponent {
                 Span::styled(format!(" @ {:.0}MHz", cpu.mhz), Style::default().dim()),
             ]));
         }
+
+        // Uptime (computed at draw time so it keeps ticking between refreshes)
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(uptime) = self
+            .get_node_system_stat(&node_name)
+            .and_then(|s| s.uptime_secs(now_secs))
+        {
+            resource_lines.push(Line::from(vec![
+                Span::styled(" Uptime: ", Style::default().dim()),
+                Span::styled(
+                    talos_pilot_core::format_duration_detailed(chrono::Duration::seconds(
+                        uptime as i64,
+                    )),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+
+        // Network summary (same fields as the Talos dashboard)
+        if let Some(net) = self.get_node_network_info(&node_name) {
+            let width = inner.width as usize;
+            let value = Style::default().fg(Color::White);
+            resource_lines.extend(wrap_list(" Addrs:  ", &net.addresses, width, value));
+            resource_lines.extend(wrap_list(" GW:     ", &net.gateways, width, value));
+            if let Some(ready) = net.connectivity_ready {
+                let (text, color) = if ready {
+                    ("✓ OK", Color::Green)
+                } else {
+                    ("✗ Not ready", Color::Red)
+                };
+                resource_lines.push(Line::from(vec![
+                    Span::styled(" Conn:   ", Style::default().dim()),
+                    Span::styled(text, Style::default().fg(color)),
+                ]));
+            }
+            resource_lines.extend(wrap_list(" DNS:    ", &net.dns_servers, width, value));
+        }
+
+        // Split into resources (sized to its lines plus a spacer) and services
+        let panel_layout = Layout::vertical([
+            Constraint::Length(resource_lines.len() as u16 + 1), // Resources
+            Constraint::Min(4),                                  // Services
+        ])
+        .split(inner);
 
         frame.render_widget(Paragraph::new(resource_lines), panel_layout[0]);
 
@@ -2707,5 +2896,32 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(comp.control_plane_ip().as_deref(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn wrap_list_breaks_between_items() {
+        let text = |lines: Vec<Line>| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let items: Vec<String> = ["100.64.0.8/32", "65.21.17.62/26", "fd7a:115c:a1e0::8/128"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            text(wrap_list(" IP: ", &items, 200, Style::default())),
+            vec![" IP: 100.64.0.8/32, 65.21.17.62/26, fd7a:115c:a1e0::8/128"]
+        );
+        assert_eq!(
+            text(wrap_list(" IP: ", &items, 40, Style::default())),
+            vec![
+                " IP: 100.64.0.8/32, 65.21.17.62/26,",
+                "     fd7a:115c:a1e0::8/128"
+            ]
+        );
+        assert!(wrap_list(" IP: ", &[], 40, Style::default()).is_empty());
     }
 }

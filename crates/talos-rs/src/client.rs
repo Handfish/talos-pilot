@@ -496,6 +496,7 @@ impl TalosClient {
 
                 NodeSystemStat {
                     node: self.node_from_metadata(msg.metadata.as_ref(), 0),
+                    boot_time: msg.boot_time,
                     cpu_total,
                     process_running: msg.process_running,
                     process_blocked: msg.process_blocked,
@@ -1795,6 +1796,8 @@ pub struct NodeCpuInfo {
 #[derive(Debug, Clone)]
 pub struct NodeSystemStat {
     pub node: String,
+    /// Boot time in seconds since the Unix epoch
+    pub boot_time: u64,
     pub cpu_total: CpuStat,
     pub process_running: u64,
     pub process_blocked: u64,
@@ -1811,6 +1814,15 @@ pub struct CpuStat {
     pub irq: f64,
     pub soft_irq: f64,
     pub steal: f64,
+}
+
+impl NodeSystemStat {
+    /// Time since boot as of `now_secs` (seconds since the Unix epoch).
+    ///
+    /// Returns `None` if the node did not report a boot time.
+    pub fn uptime_secs(&self, now_secs: u64) -> Option<u64> {
+        (self.boot_time > 0).then(|| now_secs.saturating_sub(self.boot_time))
+    }
 }
 
 impl CpuStat {
@@ -2592,6 +2604,26 @@ mod tests {
                 last_message: String::new(),
             }),
         }
+    }
+
+    #[test]
+    fn uptime_from_boot_time() {
+        let stat = NodeSystemStat {
+            node: String::new(),
+            boot_time: 1_000,
+            cpu_total: CpuStat::default(),
+            process_running: 0,
+            process_blocked: 0,
+        };
+        assert_eq!(stat.uptime_secs(4_600), Some(3_600));
+        // Clock skew: never underflow
+        assert_eq!(stat.uptime_secs(500), Some(0));
+        // No boot time reported
+        let unknown = NodeSystemStat {
+            boot_time: 0,
+            ..stat
+        };
+        assert_eq!(unknown.uptime_secs(4_600), None);
     }
 
     #[test]
