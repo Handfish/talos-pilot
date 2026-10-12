@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 use std::collections::HashMap;
 use talos_rs::{
@@ -582,15 +582,17 @@ pub struct ClusterComponent {
     background_refresh: Option<tokio::task::JoinHandle<Vec<ClusterData>>>,
     /// Network summary per (context, node name), with the time of the last fetch attempt
     network_info: HashMap<(String, String), (std::time::Instant, Option<NodeNetworkInfo>)>,
-    /// In-flight network summary fetch for the selected node (see `poll_network_info`)
+    /// In-flight network summary fetch for the selected node(s) (see `poll_network_info`)
     network_fetch: Option<NetworkFetch>,
 }
 
-/// A background `get_node_network_info` call for one node
-struct NetworkFetch {
-    key: (String, String),
-    handle: tokio::task::JoinHandle<Result<NodeNetworkInfo, talos_rs::TalosError>>,
-}
+/// Background `get_node_network_info` calls, keyed by (context, node name)
+type NetworkFetch = tokio::task::JoinHandle<
+    Vec<(
+        (String, String),
+        Result<NodeNetworkInfo, talos_rs::TalosError>,
+    )>,
+>;
 
 /// How often the selected node's network summary is re-fetched. It changes
 /// rarely and costs four talosctl invocations, so this is much slower than
@@ -600,6 +602,62 @@ const NETWORK_INFO_REFRESH: std::time::Duration = std::time::Duration::from_secs
 impl Default for ClusterComponent {
     fn default() -> Self {
         Self::new(None, None)
+    }
+}
+
+/// Whether a service is in a good state: running and not failing its health
+/// check, or a one-shot service that finished (e.g. `ext-nvidia-cdi-gen`).
+fn service_ok(s: &ServiceInfo) -> bool {
+    match s.state.as_str() {
+        "Running" => s.is_healthy() != Some(false),
+        "Finished" => true,
+        _ => false,
+    }
+}
+
+/// Matrix symbol and style for one service on one node
+fn service_symbol(s: &ServiceInfo) -> (&'static str, Style) {
+    match (s.state.as_str(), s.is_healthy()) {
+        ("Running", Some(true)) => ("●", Style::default().fg(Color::Green)),
+        ("Running", None) => ("●", Style::default().fg(Color::DarkGray)),
+        ("Running", Some(false)) => ("○", Style::default().fg(Color::Red)),
+        ("Finished", _) => ("✓", Style::default().fg(Color::Green)),
+        _ => ("✗", Style::default().fg(Color::Red)),
+    }
+}
+
+/// Current time in seconds since the Unix epoch
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Format an uptime in seconds, e.g. "5d 17h"
+fn format_uptime(secs: u64) -> String {
+    talos_pilot_core::format_duration_detailed(chrono::Duration::seconds(secs as i64))
+}
+
+/// Color for a memory usage percentage
+fn memory_color(pct: f32) -> Color {
+    if pct > 90.0 {
+        Color::Red
+    } else if pct > 70.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// Color for a 1-minute load average
+fn load_color(load1: f64) -> Color {
+    if load1 > 4.0 {
+        Color::Red
+    } else if load1 > 2.0 {
+        Color::Yellow
+    } else {
+        Color::Green
     }
 }
 
@@ -1004,71 +1062,112 @@ impl ClusterComponent {
         self.ensure_selection_visible();
     }
 
+    /// Node names covered by the current selection: the selected node, or
+    /// every node under the selected cluster / control plane / workers header.
+    fn selected_nodes(&self) -> Option<(usize, Vec<String>)> {
+        let names = |nodes: Vec<(usize, &VersionInfo)>| -> Vec<String> {
+            nodes.into_iter().map(|(_, v)| v.node.clone()).collect()
+        };
+        match &self.selected_item {
+            NodeListItem::ClusterHeader(idx) => {
+                let mut nodes = names(self.controlplane_nodes_for(*idx));
+                nodes.extend(names(self.worker_nodes_for(*idx)));
+                Some((*idx, nodes))
+            }
+            NodeListItem::ControlPlaneHeader(idx) => {
+                Some((*idx, names(self.controlplane_nodes_for(*idx))))
+            }
+            NodeListItem::WorkersHeader(idx) => Some((*idx, names(self.worker_nodes_for(*idx)))),
+            NodeListItem::ControlPlaneNode(idx, _) | NodeListItem::WorkerNode(idx, _) => {
+                Some((*idx, vec![self.current_node_name()?]))
+            }
+        }
+    }
+
     /// Collect a finished network summary fetch and start one for the selected
-    /// node when it has none or it is older than `NETWORK_INFO_REFRESH`.
+    /// node(s) whose summary is missing or older than `NETWORK_INFO_REFRESH`.
     ///
     /// Runs in a spawned task so slow talosctl calls never block drawing.
     pub fn poll_network_info(&mut self) {
         use futures::FutureExt;
 
-        if self
-            .network_fetch
-            .as_ref()
-            .is_some_and(|f| f.handle.is_finished())
+        if self.network_fetch.as_ref().is_some_and(|f| f.is_finished())
             && let Some(fetch) = self.network_fetch.take()
         {
-            let previous = self
-                .network_info
-                .remove(&fetch.key)
-                .and_then(|(_, info)| info);
-            let info = match fetch.handle.now_or_never() {
-                Some(Ok(Ok(info))) => Some(info),
-                Some(Ok(Err(e))) => {
-                    tracing::debug!("Network info for {:?} failed: {}", fetch.key, e);
-                    previous
-                }
-                _ => previous,
+            let now = std::time::Instant::now();
+            let results = match fetch.now_or_never() {
+                Some(Ok(results)) => results,
+                _ => Vec::new(),
             };
-            self.network_info
-                .insert(fetch.key, (std::time::Instant::now(), info));
+            for (key, result) in results {
+                let previous = self.network_info.remove(&key).and_then(|(_, info)| info);
+                let info = match result {
+                    Ok(info) => Some(info),
+                    Err(e) => {
+                        tracing::debug!("Network info for {:?} failed: {}", key, e);
+                        previous
+                    }
+                };
+                self.network_info.insert(key, (now, info));
+            }
         }
 
         if !self.auto_refresh || self.network_fetch.is_some() {
             return;
         }
-        let Some(node_name) = self.current_node_name() else {
+        let Some((cluster_idx, nodes)) = self.selected_nodes() else {
             return;
         };
-        let Some(cluster) = self.clusters.get(self.active_cluster) else {
+        let Some(cluster) = self.clusters.get(cluster_idx) else {
             return;
         };
-        let Some(node_ip) = cluster.node_ips.get(&node_name).cloned() else {
-            return;
-        };
-        let key = (cluster.name.clone(), node_name);
-        let fresh = self
-            .network_info
-            .get(&key)
-            .is_some_and(|(at, _)| at.elapsed() < NETWORK_INFO_REFRESH);
-        if fresh {
+        let targets: Vec<((String, String), String)> = nodes
+            .into_iter()
+            .filter_map(|node| {
+                let ip = cluster.node_ips.get(&node)?.clone();
+                let key = (cluster.name.clone(), node);
+                let fresh = self
+                    .network_info
+                    .get(&key)
+                    .is_some_and(|(at, _)| at.elapsed() < NETWORK_INFO_REFRESH);
+                (!fresh).then_some((key, ip))
+            })
+            .collect();
+        if targets.is_empty() {
             return;
         }
 
         let context = cluster.name.clone();
         let config_path = self.config_path.clone();
-        let handle = tokio::spawn(async move {
-            talos_rs::get_node_network_info(&context, &node_ip, config_path.as_deref()).await
-        });
-        self.network_fetch = Some(NetworkFetch { key, handle });
+        self.network_fetch = Some(tokio::spawn(async move {
+            let fetches = targets.into_iter().map(|(key, ip)| {
+                let context = &context;
+                let config_path = config_path.as_deref();
+                async move {
+                    let result = talos_rs::get_node_network_info(context, &ip, config_path).await;
+                    (key, result)
+                }
+            });
+            futures::future::join_all(fetches).await
+        }));
     }
 
-    /// Network summary for a node in the active cluster, if fetched
-    fn get_node_network_info(&self, node_name: &str) -> Option<&NodeNetworkInfo> {
-        let cluster = self.clusters.get(self.active_cluster)?;
+    /// Network summary for a node in a cluster, if fetched
+    fn get_node_network_info_for(
+        &self,
+        cluster_idx: usize,
+        node_name: &str,
+    ) -> Option<&NodeNetworkInfo> {
+        let cluster = self.clusters.get(cluster_idx)?;
         self.network_info
             .get(&(cluster.name.clone(), node_name.to_string()))?
             .1
             .as_ref()
+    }
+
+    /// Network summary for a node in the active cluster, if fetched
+    fn get_node_network_info(&self, node_name: &str) -> Option<&NodeNetworkInfo> {
+        self.get_node_network_info_for(self.active_cluster, node_name)
     }
 
     /// Reset the selection to its cluster header if a refresh removed the
@@ -1211,8 +1310,17 @@ impl ClusterComponent {
 
     /// Get system stats for a node in the active cluster
     fn get_node_system_stat(&self, node_name: &str) -> Option<&NodeSystemStat> {
+        self.get_node_system_stat_for(self.active_cluster, node_name)
+    }
+
+    /// Get system stats for a node in a specific cluster
+    fn get_node_system_stat_for(
+        &self,
+        cluster_idx: usize,
+        node_name: &str,
+    ) -> Option<&NodeSystemStat> {
         self.clusters
-            .get(self.active_cluster)?
+            .get(cluster_idx)?
             .system_stat
             .iter()
             .find(|s| s.node == node_name || (s.node.is_empty() && node_name.is_empty()))
@@ -2298,6 +2406,261 @@ impl ClusterComponent {
     }
 
     /// Draw the details pane (right column)
+    /// Table of every node under the selected cluster / control plane /
+    /// workers header: memory, load, cores, uptime, gateway, connectivity
+    /// and service health side by side.
+    fn draw_group_table(&self, frame: &mut Frame, area: Rect, border_color: Color) {
+        let Some((cluster_idx, nodes)) = self.selected_nodes() else {
+            return;
+        };
+        let group = match &self.selected_item {
+            NodeListItem::ControlPlaneHeader(_) => "Control Plane".to_string(),
+            NodeListItem::WorkersHeader(_) => "Workers".to_string(),
+            _ => self
+                .clusters
+                .get(cluster_idx)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "Cluster".to_string()),
+        };
+        let block = Block::default()
+            .title(format!(" {} · {} nodes ", group, nodes.len()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let dim = Style::default().dim();
+        let pending = || Cell::from(Span::styled("…", dim));
+        let now = unix_now_secs();
+        // Drop the least important columns on narrow panes rather than truncate
+        let wide = inner.width >= 90;
+
+        let rows: Vec<Row> = nodes
+            .iter()
+            .map(|node| {
+                let role = if self.node_is_controlplane(cluster_idx, node) {
+                    "cp"
+                } else {
+                    "worker"
+                };
+
+                let mem = match self.get_node_memory_for(cluster_idx, node) {
+                    Some(m) => {
+                        let pct = m.usage_percent();
+                        let total_gb = m.mem_total as f64 / 1024.0 / 1024.0 / 1024.0;
+                        Cell::from(Line::from(vec![
+                            Span::styled(
+                                format!("{:>3.0}%", pct),
+                                Style::default().fg(memory_color(pct)),
+                            ),
+                            Span::styled(format!(" {:.0}G", total_gb), dim),
+                        ]))
+                    }
+                    None => pending(),
+                };
+
+                let load = match self.get_node_load_avg_for(cluster_idx, node) {
+                    Some(l) => Cell::from(Span::styled(
+                        format!("{:.2}", l.load1),
+                        Style::default().fg(load_color(l.load1)),
+                    )),
+                    None => pending(),
+                };
+
+                let cores = match self.get_node_cpu_info_for(cluster_idx, node) {
+                    Some(c) => Cell::from(c.cpu_count.to_string()),
+                    None => pending(),
+                };
+
+                let uptime = match self
+                    .get_node_system_stat_for(cluster_idx, node)
+                    .and_then(|s| s.uptime_secs(now))
+                {
+                    Some(secs) => Cell::from(format_uptime(secs)),
+                    None => pending(),
+                };
+
+                let net = self.get_node_network_info_for(cluster_idx, node);
+                let gw = match net {
+                    Some(n) if n.gateways.is_empty() => Cell::from(Span::styled("-", dim)),
+                    Some(n) => Cell::from(n.gateways.join(", ")),
+                    None => pending(),
+                };
+                let conn = match net.and_then(|n| n.connectivity_ready) {
+                    Some(true) => Cell::from(Span::styled("✓", Style::default().fg(Color::Green))),
+                    Some(false) => Cell::from(Span::styled("✗", Style::default().fg(Color::Red))),
+                    None => pending(),
+                };
+
+                let svc = match self.get_node_services_for(cluster_idx, node) {
+                    Some(services) => {
+                        let ok = services.iter().filter(|s| service_ok(s)).count();
+                        let color = if ok == services.len() {
+                            Color::Green
+                        } else {
+                            Color::Red
+                        };
+                        Cell::from(Span::styled(
+                            format!("{}/{}", ok, services.len()),
+                            Style::default().fg(color),
+                        ))
+                    }
+                    None => pending(),
+                };
+
+                let mut cells = vec![
+                    Cell::from(Span::styled(
+                        node.clone(),
+                        Style::default().fg(Color::White),
+                    )),
+                    Cell::from(Span::styled(role, dim)),
+                    mem,
+                    load,
+                ];
+                if wide {
+                    cells.push(cores);
+                }
+                cells.extend([uptime, conn, svc, gw]);
+                Row::new(cells)
+            })
+            .collect();
+
+        let mut header = vec!["Node", "Role", "Mem", "Load"];
+        let name_width = nodes.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+        let mut widths = vec![
+            Constraint::Length(name_width.max(4) as u16),
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Length(5),
+        ];
+        if wide {
+            header.push("Cores");
+            widths.push(Constraint::Length(5));
+        }
+        header.extend(["Uptime", "Conn", "Svc", "GW"]);
+        widths.extend([
+            Constraint::Length(8),
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Fill(1),
+        ]);
+
+        let header = Row::new(header).style(Style::default().fg(Color::Gray).bold());
+        let table = Table::new(rows, widths).header(header).column_spacing(2);
+
+        let [table_area, services_area, hint_area] = Layout::vertical([
+            Constraint::Length(nodes.len() as u16 + 2), // header + rows + spacer
+            Constraint::Min(2),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+        frame.render_widget(table, table_area);
+        self.draw_services_matrix(frame, services_area, cluster_idx, &nodes);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" ●", Style::default().fg(Color::Green)),
+                Span::styled(" healthy  ", dim),
+                Span::styled("●", Style::default().fg(Color::DarkGray)),
+                Span::styled(" no check  ", dim),
+                Span::styled("✓", Style::default().fg(Color::Green)),
+                Span::styled(" finished  ", dim),
+                Span::styled("○", Style::default().fg(Color::Red)),
+                Span::styled(" unhealthy  ", dim),
+                Span::styled("✗", Style::default().fg(Color::Red)),
+                Span::styled(" not running  ", dim),
+                Span::styled("·", dim),
+                Span::styled(" absent", dim),
+            ])),
+            hint_area,
+        );
+    }
+
+    /// Service × node matrix: one row per service seen on any node in the
+    /// group, one column per node. Rows with a problem on any node are listed
+    /// first so they are visible even when the list is cut off.
+    fn draw_services_matrix(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        cluster_idx: usize,
+        nodes: &[String],
+    ) {
+        let per_node: Vec<Option<&Vec<ServiceInfo>>> = nodes
+            .iter()
+            .map(|n| self.get_node_services_for(cluster_idx, n))
+            .collect();
+
+        let mut ids: Vec<&str> = per_node
+            .iter()
+            .flatten()
+            .flat_map(|services| services.iter().map(|s| s.id.as_str()))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+
+        let find = |services: Option<&Vec<ServiceInfo>>, id: &str| -> Option<ServiceInfo> {
+            services?.iter().find(|s| s.id == id).cloned()
+        };
+        // A service is a problem if it is unhealthy anywhere it runs; being
+        // absent from some nodes is normal (control-plane-only services).
+        let has_problem = |id: &str| {
+            per_node
+                .iter()
+                .any(|services| find(*services, id).is_some_and(|s| !service_ok(&s)))
+        };
+        let (mut problems, ok): (Vec<&str>, Vec<&str>) =
+            ids.into_iter().partition(|id| has_problem(id));
+        let problem_count = problems.len();
+        problems.extend(ok);
+
+        let dim = Style::default().dim();
+        let rows: Vec<Row> = problems
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let name_style = if i < problem_count {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let mut cells = vec![Cell::from(Span::styled(id.to_string(), name_style))];
+                cells.extend(per_node.iter().map(|services| {
+                    let (symbol, style) = match services {
+                        None => ("…", dim),
+                        Some(_) => match find(*services, id) {
+                            None => ("·", dim),
+                            Some(s) => service_symbol(&s),
+                        },
+                    };
+                    Cell::from(Span::styled(symbol, style))
+                }));
+                Row::new(cells)
+            })
+            .collect();
+
+        let name_width = problems.iter().map(|id| id.len()).max().unwrap_or(7).max(7);
+        let mut widths = vec![Constraint::Length(name_width as u16)];
+        widths.extend(
+            nodes
+                .iter()
+                .map(|n| Constraint::Length(n.chars().count().max(1) as u16)),
+        );
+        let mut header = vec![Cell::from(format!(
+            "Services ({} with issues)",
+            problem_count
+        ))];
+        if problem_count == 0 {
+            header[0] = Cell::from("Services");
+        }
+        header.extend(nodes.iter().map(|n| Cell::from(n.clone())));
+        let header = Row::new(header).style(Style::default().fg(Color::Gray).bold());
+
+        frame.render_widget(
+            Table::new(rows, widths).header(header).column_spacing(2),
+            area,
+        );
+    }
+
     fn draw_details_pane(&self, frame: &mut Frame, area: Rect) {
         // Focus indication - cyan border when focused
         let border_color = if self.focused_pane == FocusedPane::Services {
@@ -2460,52 +2823,8 @@ impl ClusterComponent {
 
         // Check if we have a node selected (vs a header)
         let Some(node_name_str) = self.current_node_name() else {
-            // Header selected - show group summary
-            let (title, count) = match &self.selected_item {
-                NodeListItem::ClusterHeader(idx) => {
-                    let name = self
-                        .clusters
-                        .get(*idx)
-                        .map(|c| c.name.as_str())
-                        .unwrap_or("Cluster");
-                    let node_count = self
-                        .clusters
-                        .get(*idx)
-                        .map(|c| c.versions.len())
-                        .unwrap_or(0);
-                    (name.to_string(), node_count)
-                }
-                NodeListItem::ControlPlaneHeader(idx) => (
-                    "Control Plane".to_string(),
-                    self.controlplane_nodes_for(*idx).len(),
-                ),
-                NodeListItem::WorkersHeader(idx) => {
-                    ("Workers".to_string(), self.worker_nodes_for(*idx).len())
-                }
-                _ => ("Details".to_string(), 0),
-            };
-            let block = Block::default()
-                .title(format!(" {} ", title))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color));
-            let msg = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  {} nodes in this group", count),
-                    Style::default().dim(),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Press Enter or Space to expand/collapse",
-                    Style::default().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  Navigate down to select a node",
-                    Style::default().dim(),
-                )),
-            ])
-            .block(block);
-            frame.render_widget(msg, area);
+            // Header selected - show a table of every node in the group
+            self.draw_group_table(frame, area, border_color);
             return;
         };
 
@@ -2602,22 +2921,13 @@ impl ClusterComponent {
         }
 
         // Uptime (computed at draw time so it keeps ticking between refreshes)
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         if let Some(uptime) = self
             .get_node_system_stat(&node_name)
-            .and_then(|s| s.uptime_secs(now_secs))
+            .and_then(|s| s.uptime_secs(unix_now_secs()))
         {
             resource_lines.push(Line::from(vec![
                 Span::styled(" Uptime: ", Style::default().dim()),
-                Span::styled(
-                    talos_pilot_core::format_duration_detailed(chrono::Duration::seconds(
-                        uptime as i64,
-                    )),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format_uptime(uptime), Style::default().fg(Color::White)),
             ]));
         }
 
@@ -2923,5 +3233,23 @@ mod tests {
             ]
         );
         assert!(wrap_list(" IP: ", &[], 40, Style::default()).is_empty());
+    }
+
+    #[test]
+    fn finished_one_shot_service_is_ok() {
+        let svc = |state: &str, health: Option<(bool, bool)>| ServiceInfo {
+            id: "svc".to_string(),
+            state: state.to_string(),
+            health: health.map(|(unknown, healthy)| talos_rs::ServiceHealth {
+                unknown,
+                healthy,
+                last_message: String::new(),
+            }),
+        };
+        assert!(service_ok(&svc("Finished", None)));
+        assert!(service_ok(&svc("Running", Some((true, false)))));
+        assert!(service_ok(&svc("Running", Some((false, true)))));
+        assert!(!service_ok(&svc("Running", Some((false, false)))));
+        assert!(!service_ok(&svc("Failed", None)));
     }
 }
