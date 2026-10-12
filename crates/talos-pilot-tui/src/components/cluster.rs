@@ -124,6 +124,10 @@ struct ClusterData {
     error: Option<String>,
     /// Configured endpoints for this context (shown in connection-error details)
     endpoints: Vec<String>,
+    /// talosconfig context, kept so a failed connection can be retried
+    context: Option<talos_rs::Context>,
+    /// True until the first connect + refresh attempt has finished
+    loading: bool,
     /// Version info from nodes
     versions: Vec<VersionInfo>,
     /// Services from nodes
@@ -166,6 +170,24 @@ impl ClusterData {
     /// background task while the UI keeps drawing (see `start_background_refresh`).
     async fn refresh(&mut self, config_path: Option<&str>) {
         let cluster = self;
+        cluster.loading = false;
+
+        // Not connected yet (startup) or the last attempt failed: (re)connect
+        if cluster.client.is_none()
+            && let Some(ctx) = &cluster.context
+        {
+            match TalosClient::from_context(ctx).await {
+                Ok(client) => {
+                    cluster.client = Some(client);
+                    cluster.connected = true;
+                    cluster.error = None;
+                }
+                Err(e) => {
+                    cluster.error = Some(format!("Could not connect — {}", root_cause(&e)));
+                    cluster.connected = false;
+                }
+            }
+        }
 
         let Some(client) = &cluster.client else {
             return;
@@ -578,8 +600,11 @@ pub struct ClusterComponent {
     config_path: Option<String>,
     /// Specific context to use (from --context flag)
     context_filter: Option<String>,
-    /// In-flight background refresh of every cluster (see `start_background_refresh`)
-    background_refresh: Option<tokio::task::JoinHandle<Vec<ClusterData>>>,
+    /// In-flight background refresh per cluster, same order as `clusters`
+    /// (see `start_background_refresh`)
+    background_refresh: Vec<Option<tokio::task::JoinHandle<ClusterData>>>,
+    /// When each cluster's last background refresh finished
+    cluster_refreshed_at: Vec<Option<std::time::Instant>>,
     /// Network summary per (context, node name), with the time of the last fetch attempt
     network_info: HashMap<(String, String), (std::time::Instant, Option<NodeNetworkInfo>)>,
     /// In-flight network summary fetch for the selected node(s) (see `poll_network_info`)
@@ -745,7 +770,8 @@ impl ClusterComponent {
             selected_item: NodeListItem::ClusterHeader(0),
             config_path,
             context_filter,
-            background_refresh: None,
+            background_refresh: Vec::new(),
+            cluster_refreshed_at: Vec::new(),
             network_info: HashMap::new(),
             network_fetch: None,
             hits: std::cell::RefCell::new(HitMap::default()),
@@ -948,10 +974,20 @@ impl ClusterComponent {
                     return Ok(());
                 }
             }
-            None => config.contexts.keys().cloned().collect(),
+            None => {
+                // talosconfig contexts are a map, so their order is arbitrary:
+                // list the current context first, then the rest by name
+                let mut names: Vec<String> = config.contexts.keys().cloned().collect();
+                names.sort_by_key(|name| (*name != config.context, name.clone()));
+                names
+            }
         };
 
-        // Create ClusterData for each context
+        // Create ClusterData for each context. Nothing is dialled here: every
+        // cluster connects and loads in its own background task (see
+        // `start_background_refresh`), so the UI shows up immediately and a
+        // reachable cluster never waits behind an unreachable one.
+        self.abort_background_refresh();
         self.clusters.clear();
         for (idx, name) in context_names.iter().enumerate() {
             let mut cluster = ClusterData {
@@ -959,36 +995,24 @@ impl ClusterComponent {
                 expanded: idx == 0, // Expand first cluster by default
                 controlplane_expanded: true,
                 workers_expanded: true,
+                loading: true,
                 ..Default::default()
             };
-
-            // Try to connect to each cluster using the loaded config
             match config.get_context(name) {
                 Ok(ctx) => {
                     cluster.endpoints = ctx.endpoints.clone();
-                    match TalosClient::from_context(ctx).await {
-                        Ok(client) => {
-                            cluster.client = Some(client);
-                            cluster.connected = true;
-                            cluster.error = None;
-                        }
-                        Err(e) => {
-                            cluster.error = Some(format!("Could not connect — {}", root_cause(&e)));
-                            cluster.connected = false;
-                        }
-                    }
+                    cluster.context = Some(ctx.clone());
                 }
                 Err(e) => {
                     cluster.error = Some(e.to_string());
-                    cluster.connected = false;
+                    cluster.loading = false;
                 }
             }
-
             self.clusters.push(cluster);
         }
-
-        // Refresh all connected clusters
-        self.refresh().await?;
+        self.background_refresh = self.clusters.iter().map(|_| None).collect();
+        self.cluster_refreshed_at = self.clusters.iter().map(|_| None).collect();
+        self.start_background_refresh();
 
         // Set initial selection
         if !self.clusters.is_empty() {
@@ -999,81 +1023,92 @@ impl ClusterComponent {
         Ok(())
     }
 
-    /// Refresh all cluster data
+    /// Refresh all cluster data now (`r`): restart every cluster's
+    /// background refresh. Returns immediately; results land as each cluster
+    /// finishes.
     pub async fn refresh(&mut self) -> Result<()> {
-        // A foreground refresh supersedes any background one, whose older
-        // snapshot would otherwise overwrite these results when it lands.
-        if let Some(handle) = self.background_refresh.take() {
-            handle.abort();
+        // Older in-flight snapshots would overwrite the fresh results
+        self.abort_background_refresh();
+        for at in &mut self.cluster_refreshed_at {
+            *at = None;
         }
-
-        // Clusters are independent, so refresh them concurrently
-        let config_path = self.config_path.as_deref();
-        futures::future::join_all(self.clusters.iter_mut().map(|c| c.refresh(config_path))).await;
-
-        self.last_refresh = Some(std::time::Instant::now());
-        self.ensure_selection_visible();
+        self.start_background_refresh();
         Ok(())
     }
 
-    /// Start a background refresh of every cluster when one is due.
-    ///
-    /// The selected-node auto-refresh only updates that node's stats, so
-    /// without this the node list is only rebuilt on startup or `r`: a node
-    /// that dropped out while rebooting would never reappear. The refresh runs
-    /// on a clone in a spawned task so the UI keeps drawing while slow or
-    /// unreachable nodes time out; `apply_background_refresh` merges it back.
-    pub fn start_background_refresh(&mut self) {
-        if !self.auto_refresh || self.background_refresh.is_some() {
-            return;
+    fn abort_background_refresh(&mut self) {
+        for handle in self.background_refresh.iter_mut().filter_map(Option::take) {
+            handle.abort();
         }
-        let due = self.last_refresh.is_none_or(|last| {
-            last.elapsed().as_secs() >= talos_pilot_core::constants::refresh_intervals::SLOW
-        });
-        if !due {
-            return;
-        }
-
-        let mut clusters = self.clusters.clone();
-        let config_path = self.config_path.clone();
-        self.background_refresh = Some(tokio::spawn(async move {
-            let config_path = config_path.as_deref();
-            futures::future::join_all(clusters.iter_mut().map(|c| c.refresh(config_path))).await;
-            clusters
-        }));
     }
 
-    /// Merge a finished background refresh, keeping UI state (expand/collapse)
-    /// that the user may have changed while it ran.
+    /// Start a background refresh for each cluster that is due and has none
+    /// in flight.
+    ///
+    /// Each cluster connects (if needed) and refreshes on a clone in its own
+    /// spawned task, so the UI keeps drawing and a slow or unreachable cluster
+    /// never delays the others. This also rebuilds node lists periodically,
+    /// so a node that dropped out while rebooting reappears, and retries
+    /// clusters that could not be reached. `apply_background_refresh` merges
+    /// the results back.
+    pub fn start_background_refresh(&mut self) {
+        if self.background_refresh.len() != self.clusters.len() {
+            return;
+        }
+        let interval =
+            std::time::Duration::from_secs(talos_pilot_core::constants::refresh_intervals::SLOW);
+        for (idx, cluster) in self.clusters.iter().enumerate() {
+            if self.background_refresh[idx].is_some() || cluster.context.is_none() {
+                continue;
+            }
+            // The first load always runs; after that, only with auto-refresh on
+            let due = match self.cluster_refreshed_at[idx] {
+                None => true,
+                Some(at) => self.auto_refresh && at.elapsed() >= interval,
+            };
+            if !due {
+                continue;
+            }
+            let mut cluster = cluster.clone();
+            let config_path = self.config_path.clone();
+            self.background_refresh[idx] = Some(tokio::spawn(async move {
+                cluster.refresh(config_path.as_deref()).await;
+                cluster
+            }));
+        }
+    }
+
+    /// Merge finished background refreshes, keeping UI state (expand/collapse)
+    /// that the user may have changed while they ran.
     pub fn apply_background_refresh(&mut self) {
         use futures::FutureExt;
 
-        if !self
-            .background_refresh
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished())
-        {
-            return;
-        }
-        let Some(handle) = self.background_refresh.take() else {
-            return;
-        };
-        // Always mark the attempt so a failing refresh is retried on schedule,
-        // not on every tick.
-        self.last_refresh = Some(std::time::Instant::now());
-
-        let refreshed = match handle.now_or_never() {
-            Some(Ok(refreshed)) => refreshed,
-            Some(Err(e)) => {
-                tracing::warn!("Background cluster refresh failed: {}", e);
-                return;
+        let mut changed = false;
+        for idx in 0..self.background_refresh.len() {
+            if !self.background_refresh[idx]
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+            {
+                continue;
             }
-            None => return,
-        };
-        if refreshed.len() != self.clusters.len() {
-            return;
-        }
-        for (current, mut fresh) in self.clusters.iter_mut().zip(refreshed) {
+            let Some(handle) = self.background_refresh[idx].take() else {
+                continue;
+            };
+            // Always mark the attempt so a failing refresh is retried on
+            // schedule, not on every tick.
+            self.cluster_refreshed_at[idx] = Some(std::time::Instant::now());
+
+            let mut fresh = match handle.now_or_never() {
+                Some(Ok(fresh)) => fresh,
+                Some(Err(e)) => {
+                    tracing::warn!("Background cluster refresh failed: {}", e);
+                    continue;
+                }
+                None => continue,
+            };
+            let Some(current) = self.clusters.get_mut(idx) else {
+                continue;
+            };
             if current.name != fresh.name {
                 continue;
             }
@@ -1081,8 +1116,12 @@ impl ClusterComponent {
             fresh.controlplane_expanded = current.controlplane_expanded;
             fresh.workers_expanded = current.workers_expanded;
             *current = fresh;
+            changed = true;
         }
-        self.ensure_selection_visible();
+        if changed {
+            self.last_refresh = Some(std::time::Instant::now());
+            self.ensure_selection_visible();
+        }
     }
 
     /// Node names covered by the current selection: the selected node, or
@@ -2047,7 +2086,14 @@ impl ClusterComponent {
         let connected_count = self.clusters.iter().filter(|c| c.connected).count();
         let total_count = self.clusters.len();
 
-        let (status_indicator, status_text) = if connected_count == total_count && total_count > 0 {
+        let loading_count = self.clusters.iter().filter(|c| c.loading).count();
+
+        let (status_indicator, status_text) = if loading_count > 0 {
+            (
+                Span::styled(" ◌ ", Style::default().fg(Color::Yellow)),
+                "Connecting",
+            )
+        } else if connected_count == total_count && total_count > 0 {
             (
                 Span::styled(" ● ", Style::default().fg(Color::Green)),
                 "Connected",
@@ -2187,11 +2233,12 @@ impl ClusterComponent {
                 };
 
                 // Status indicator
-                let status_symbol = if cluster.connected { "●" } else { "○" };
-                let status_color = if cluster.connected {
-                    Color::Green
+                let (status_symbol, status_color) = if cluster.loading {
+                    ("◌", Color::Yellow)
+                } else if cluster.connected {
+                    ("●", Color::Green)
                 } else {
-                    Color::Red
+                    ("○", Color::Red)
                 };
 
                 let header_style = if is_cluster_selected {
@@ -2230,11 +2277,25 @@ impl ClusterComponent {
                     Span::styled(status_symbol, Style::default().fg(status_color)),
                     Span::raw(" "),
                     Span::styled(&cluster.name, header_style),
-                    Span::styled(format!(" ({})", node_count), Style::default().dim()),
+                    Span::styled(
+                        if cluster.loading {
+                            " (…)".to_string()
+                        } else {
+                            format!(" ({})", node_count)
+                        },
+                        Style::default().dim(),
+                    ),
                 ];
                 cluster_line.extend(etcd_spans);
                 lines.push(Line::from(cluster_line));
                 mark(&lines, NodeListItem::ClusterHeader(cluster_idx));
+
+                if cluster.loading {
+                    lines.push(Line::from(Span::styled(
+                        "    connecting…",
+                        Style::default().fg(Color::Yellow).dim(),
+                    )));
+                }
 
                 // Show a connection error under the cluster header (always, even
                 // when collapsed) so failures are visible instead of a blank list.
@@ -2807,6 +2868,41 @@ impl ClusterComponent {
         let cluster_idx = self.active_cluster;
         let cluster = self.clusters.get(cluster_idx);
 
+        // Still connecting: say so instead of an empty or error pane
+        if let Some(c) = cluster
+            && c.loading
+        {
+            let block = Block::default()
+                .title(format!(" {} ", c.name))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color));
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Connecting…",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+            ];
+            if !c.endpoints.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("  Endpoints: ", Style::default().dim()),
+                    Span::raw(c.endpoints.join(", ")),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "  Other clusters stay usable while this one connects.",
+                Style::default().dim(),
+            )));
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
+
         // A disconnected cluster that failed to connect has no nodes to select,
         // so show the failure details here (endpoints tried + cause + hint).
         if let Some(c) = cluster
@@ -2870,6 +2966,16 @@ impl ClusterComponent {
                 "  machine and that your talosconfig is correct.",
                 Style::default().dim(),
             )));
+            let retry = if self.auto_refresh {
+                format!(
+                    "  Retrying every {}s — press r to retry now.",
+                    talos_pilot_core::constants::refresh_intervals::SLOW
+                )
+            } else {
+                "  Press r to retry.".to_string()
+            };
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(retry, Style::default().dim())));
 
             let msg = Paragraph::new(lines)
                 .block(block)
