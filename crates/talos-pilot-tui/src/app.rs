@@ -1,6 +1,7 @@
 //! Application state and main loop
 
 use crate::action::Action;
+use crate::components::BackgroundRefresh;
 use crate::components::rolling_operations::RollingNodeInfo;
 use crate::components::wizard::{WizardComponent, WizardState};
 use crate::components::{
@@ -15,6 +16,53 @@ use crossterm::event::{
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// A view refresh running on a clone of the view's component
+enum RefreshJob {
+    Diagnostics(JoinHandle<DiagnosticsComponent>),
+    Security(JoinHandle<SecurityComponent>),
+    Lifecycle(JoinHandle<LifecycleComponent>),
+    Workloads(JoinHandle<WorkloadHealthComponent>),
+    Storage(JoinHandle<StorageComponent>),
+}
+
+impl RefreshJob {
+    fn is_finished(&self) -> bool {
+        match self {
+            RefreshJob::Diagnostics(h) => h.is_finished(),
+            RefreshJob::Security(h) => h.is_finished(),
+            RefreshJob::Lifecycle(h) => h.is_finished(),
+            RefreshJob::Workloads(h) => h.is_finished(),
+            RefreshJob::Storage(h) => h.is_finished(),
+        }
+    }
+
+    fn abort(&self) {
+        match self {
+            RefreshJob::Diagnostics(h) => h.abort(),
+            RefreshJob::Security(h) => h.abort(),
+            RefreshJob::Lifecycle(h) => h.abort(),
+            RefreshJob::Workloads(h) => h.abort(),
+            RefreshJob::Storage(h) => h.abort(),
+        }
+    }
+}
+
+/// Run `refresh()` on a clone of a component in a spawned task, recording a
+/// failure as the clone's error, and evaluate to the task's handle. (A macro
+/// because each component's `refresh` is an inherent async method.)
+macro_rules! spawn_refresh {
+    ($component:expr) => {{
+        let mut component = $component.clone();
+        tokio::spawn(async move {
+            if let Err(e) = component.refresh().await {
+                component.set_error(e.to_string());
+            }
+            component
+        })
+    }};
+}
 
 /// Current view in the application
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +121,8 @@ pub struct App {
     action_tx: mpsc::UnboundedSender<AsyncResult>,
     /// Custom config file path (from --config flag)
     config_path: Option<String>,
+    /// In-flight background refresh of the current view (see `start_refresh_job`)
+    refresh_job: Option<RefreshJob>,
     /// Whether running in insecure mode (no TLS)
     insecure: bool,
     /// Endpoint for insecure mode
@@ -158,6 +208,7 @@ impl App {
             action_rx,
             action_tx,
             config_path,
+            refresh_job: None,
             insecure,
             insecure_endpoint,
         }
@@ -651,6 +702,8 @@ impl App {
             }
 
             // Check async results (non-blocking)
+            self.poll_refresh_job();
+
             while let Ok(result) = self.action_rx.try_recv() {
                 match result {
                     AsyncResult::Connected => {
@@ -681,6 +734,54 @@ impl App {
     }
 
     /// Handle an action
+    /// Hand a finished background refresh back to its component
+    fn poll_refresh_job(&mut self) {
+        use futures::FutureExt;
+
+        if !self.refresh_job.as_ref().is_some_and(|j| j.is_finished()) {
+            return;
+        }
+        let Some(job) = self.refresh_job.take() else {
+            return;
+        };
+        // A panicked or aborted task yields nothing; the next auto-refresh retries
+        match job {
+            RefreshJob::Diagnostics(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.diagnostics, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Security(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.security, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Lifecycle(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.lifecycle, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Workloads(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.workloads, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Storage(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.storage, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+        }
+    }
+
+    /// Drop an in-flight background refresh, e.g. because its view is being
+    /// replaced by one for another node; its result would be stale.
+    fn cancel_refresh_job(&mut self) {
+        if let Some(job) = self.refresh_job.take() {
+            job.abort();
+        }
+    }
+
     /// Route a key press to the component for the current view
     fn dispatch_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
         Ok(match self.view {
@@ -929,7 +1030,11 @@ impl App {
                 // Terminal will automatically resize on next draw
             }
             Action::Refresh => {
-                tracing::info!("Refresh requested");
+                // Views ask on every tick while a background refresh is in flight
+                tracing::debug!("Refresh requested");
+                // Refreshes run on the event loop, so their duration is how
+                // long the UI is frozen. Log slow ones to find the culprit.
+                let started = std::time::Instant::now();
                 match self.view {
                     View::Cluster => {
                         self.cluster.refresh().await?;
@@ -971,38 +1076,46 @@ impl App {
                         // Multi-logs handles its own streaming refresh
                     }
                     View::Diagnostics => {
-                        if let Some(diagnostics) = &mut self.diagnostics
-                            && let Err(e) = diagnostics.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(diagnostics) = &self.diagnostics
                         {
-                            diagnostics.set_error(e.to_string());
+                            self.refresh_job =
+                                Some(RefreshJob::Diagnostics(spawn_refresh!(diagnostics)));
                         }
                     }
                     View::Security => {
-                        if let Some(security) = &mut self.security
-                            && let Err(e) = security.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(security) = &self.security
                         {
-                            security.set_error(e.to_string());
+                            self.refresh_job = Some(RefreshJob::Security(spawn_refresh!(security)));
                         }
                     }
                     View::Lifecycle => {
-                        if let Some(lifecycle) = &mut self.lifecycle
-                            && let Err(e) = lifecycle.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(lifecycle) = &self.lifecycle
                         {
-                            lifecycle.set_error(e.to_string());
+                            self.refresh_job =
+                                Some(RefreshJob::Lifecycle(spawn_refresh!(lifecycle)));
                         }
                     }
                     View::Workloads => {
-                        if let Some(workloads) = &mut self.workloads
-                            && let Err(e) = workloads.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(workloads) = &self.workloads
                         {
-                            workloads.set_error(e.to_string());
+                            self.refresh_job =
+                                Some(RefreshJob::Workloads(spawn_refresh!(workloads)));
                         }
                     }
                     View::Storage => {
-                        if let Some(storage) = &mut self.storage
-                            && let Err(e) = storage.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(storage) = &self.storage
                         {
-                            storage.set_error(e.to_string());
+                            self.refresh_job = Some(RefreshJob::Storage(spawn_refresh!(storage)));
                         }
                     }
                     View::NodeOperations => {
@@ -1015,6 +1128,10 @@ impl App {
                     View::RollingOperations => {
                         // Rolling operations doesn't have a refresh method
                     }
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= Duration::from_millis(500) {
+                    tracing::warn!("{:?} refresh blocked the UI for {:?}", self.view, elapsed);
                 }
             }
             Action::ShowMultiLogs(node_ip, node_role, active_services, all_services) => {
@@ -1058,6 +1175,7 @@ impl App {
                 // Legacy - no longer used, we use ShowMultiLogs now
             }
             Action::ShowDiagnostics(hostname, address, role, cp_endpoint) => {
+                self.cancel_refresh_job();
                 // Switch to diagnostics view for a node
                 tracing::info!(
                     "ShowDiagnostics: hostname='{}', address='{}', role='{}', cp_endpoint={:?}",
@@ -1181,6 +1299,7 @@ impl App {
                 self.view = View::Network;
             }
             Action::ShowSecurity => {
+                self.cancel_refresh_job();
                 // Switch to security/certificates view
                 tracing::info!("Viewing security/certificates");
 
@@ -1208,6 +1327,7 @@ impl App {
                 self.view = View::Security;
             }
             Action::ShowLifecycle => {
+                self.cancel_refresh_job();
                 // Switch to lifecycle/version view
                 tracing::info!("Viewing lifecycle/versions");
 
@@ -1234,6 +1354,7 @@ impl App {
                 self.view = View::Lifecycle;
             }
             Action::ShowWorkloads => {
+                self.cancel_refresh_job();
                 // Switch to workload health view
                 tracing::info!("Viewing workload health");
 
@@ -1271,6 +1392,7 @@ impl App {
                 self.view = View::Workloads;
             }
             Action::ShowStorage(hostname, address) => {
+                self.cancel_refresh_job();
                 // Switch to storage view for a node
                 tracing::info!(
                     "ShowStorage: hostname='{}', address='{}'",

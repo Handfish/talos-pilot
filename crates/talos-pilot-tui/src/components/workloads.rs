@@ -176,6 +176,7 @@ pub struct WorkloadsData {
 }
 
 /// Workload Health Component
+#[derive(Clone)]
 pub struct WorkloadHealthComponent {
     /// Async state for loaded data
     state: AsyncState<WorkloadsData>,
@@ -1124,5 +1125,19 @@ impl Component for WorkloadHealthComponent {
         self.draw_footer(frame, chunks[2]);
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for WorkloadHealthComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        self.state = refreshed.state;
+        if self.k8s_client.is_none() {
+            self.k8s_client = refreshed.k8s_client;
+        }
+        let ns_count = self.data().map(|d| d.namespaces.len()).unwrap_or(0);
+        if ns_count > 0 && self.selected_namespace >= ns_count {
+            self.selected_namespace = 0;
+        }
+        self.table_state.select(Some(self.selected_namespace));
     }
 }

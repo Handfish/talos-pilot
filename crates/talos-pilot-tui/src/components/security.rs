@@ -38,6 +38,7 @@ pub struct SecurityData {
 }
 
 /// Security component for viewing PKI, RBAC, and encryption status
+#[derive(Clone)]
 pub struct SecurityComponent {
     /// Async state wrapping all security data
     state: AsyncState<SecurityData>,
@@ -796,6 +797,22 @@ impl SecurityComponent {
                 .collect();
             let content = Paragraph::new(lines);
             frame.render_widget(content, inner);
+        }
+    }
+}
+
+impl crate::components::BackgroundRefresh for SecurityComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        self.state = refreshed.state;
+        // Keep the user's selection if it still points at a selectable row;
+        // otherwise use the one the refresh picked (first non-header item)
+        let still_valid = self.data().is_some_and(|d| {
+            d.items
+                .get(self.selected)
+                .is_some_and(|i| i.kind != SecurityItemKind::SectionHeader)
+        });
+        if !still_valid {
+            self.selected = refreshed.selected;
         }
     }
 }

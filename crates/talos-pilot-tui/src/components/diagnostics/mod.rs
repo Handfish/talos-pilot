@@ -63,6 +63,7 @@ pub struct DiagnosticsData {
 }
 
 /// Diagnostics component for node health checks
+#[derive(Clone)]
 pub struct DiagnosticsComponent {
     /// Async state for loaded data
     state: AsyncState<DiagnosticsData>,
@@ -1108,5 +1109,12 @@ impl Component for DiagnosticsComponent {
         }
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for DiagnosticsComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        self.state = refreshed.state;
+        self.ensure_valid_selection();
     }
 }

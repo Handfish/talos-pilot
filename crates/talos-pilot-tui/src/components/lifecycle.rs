@@ -197,6 +197,7 @@ pub struct LifecycleData {
 }
 
 /// Lifecycle component for viewing version and lifecycle status
+#[derive(Clone)]
 pub struct LifecycleComponent {
     /// Async state wrapping all lifecycle data
     state: AsyncState<LifecycleData>,
@@ -1176,6 +1177,27 @@ impl Component for LifecycleComponent {
         self.draw_footer(frame, chunks[5]);
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for LifecycleComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        // The node selection lives inside the data; carry the live one over
+        let selected = self.data().map(|d| d.node_statuses.selected_index());
+        self.state = refreshed.state;
+        self.k8s_client = refreshed.k8s_client;
+        self.k8s_source = refreshed.k8s_source;
+        let selected = match (self.state.data_mut(), selected) {
+            (Some(data), Some(idx)) => {
+                data.node_statuses.select(idx);
+                Some(data.node_statuses.selected_index())
+            }
+            (Some(data), None) => Some(data.node_statuses.selected_index()),
+            _ => None,
+        };
+        if let Some(idx) = selected {
+            self.table_state.select(Some(idx));
+        }
     }
 }
 

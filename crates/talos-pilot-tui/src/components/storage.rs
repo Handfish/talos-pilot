@@ -60,6 +60,7 @@ pub struct StorageData {
 }
 
 /// Storage component for viewing disk and volume information
+#[derive(Clone)]
 pub struct StorageComponent {
     /// Async state wrapping all storage data
     state: AsyncState<StorageData>,
@@ -630,5 +631,11 @@ impl Component for StorageComponent {
         frame.render_widget(help_paragraph, chunks[2]);
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for StorageComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        self.state = refreshed.state;
     }
 }

@@ -67,3 +67,16 @@ pub trait Component {
     /// Render the component to the frame
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()>;
 }
+
+/// A component whose refresh can run on a clone, off the event loop.
+///
+/// The app clones the component, runs `refresh()` on the clone in a spawned
+/// task, and hands the finished clone back via [`adopt_refresh`] so the UI
+/// keeps drawing and handling keys while slow API calls are in flight.
+///
+/// [`adopt_refresh`]: BackgroundRefresh::adopt_refresh
+pub trait BackgroundRefresh: Clone + Send + 'static {
+    /// Take the data `refreshed` loaded while keeping the UI state (selection,
+    /// dialogs, scroll) the user may have changed during the refresh.
+    fn adopt_refresh(&mut self, refreshed: Self);
+}
