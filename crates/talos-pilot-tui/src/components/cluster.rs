@@ -1923,9 +1923,7 @@ impl ClusterComponent {
                             let svc_healthy = self
                                 .get_node_services_for(cluster_idx, &v.node)
                                 .map(|services| {
-                                    services.iter().all(|s| {
-                                        s.health.as_ref().map(|h| h.healthy).unwrap_or(true)
-                                    })
+                                    services.iter().all(|s| s.is_healthy() != Some(false))
                                 })
                                 .unwrap_or(true);
                             let health_symbol = if svc_healthy && mem_pct < 90.0 {
@@ -2011,9 +2009,7 @@ impl ClusterComponent {
                             let svc_healthy = self
                                 .get_node_services_for(cluster_idx, &v.node)
                                 .map(|services| {
-                                    services.iter().all(|s| {
-                                        s.health.as_ref().map(|h| h.healthy).unwrap_or(true)
-                                    })
+                                    services.iter().all(|s| s.is_healthy() != Some(false))
                                 })
                                 .unwrap_or(true);
                             let health_symbol = if svc_healthy && mem_pct < 90.0 {
@@ -2474,15 +2470,11 @@ impl ClusterComponent {
             )])];
 
             for (i, svc) in services.iter().enumerate() {
-                let health_symbol = svc
-                    .health
-                    .as_ref()
-                    .map(|h| if h.healthy { "●" } else { "○" })
-                    .unwrap_or("●");
-                let health_color = if health_symbol == "●" {
-                    Color::Green
-                } else {
-                    Color::Red
+                let (health_symbol, health_color) = match svc.is_healthy() {
+                    Some(true) => ("●", Color::Green),
+                    Some(false) => ("○", Color::Red),
+                    // No health check defined - not a failure
+                    None => ("●", Color::DarkGray),
                 };
 
                 // Highlight selected service when services pane is focused

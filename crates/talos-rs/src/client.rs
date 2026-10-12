@@ -1717,6 +1717,19 @@ pub struct ServiceInfo {
     pub health: Option<ServiceHealth>,
 }
 
+impl ServiceInfo {
+    /// Health as reported by Talos: `Some(true/false)` when the service has a
+    /// health check, `None` when it has none (talosctl shows `?`), as is
+    /// usual for `dashboard` and system extensions. `None` must not be read as
+    /// unhealthy.
+    pub fn is_healthy(&self) -> Option<bool> {
+        self.health
+            .as_ref()
+            .filter(|h| !h.unknown)
+            .map(|h| h.healthy)
+    }
+}
+
 /// Health status of a service
 #[derive(Debug, Clone)]
 pub struct ServiceHealth {
@@ -2568,6 +2581,27 @@ impl NodeTimeInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn service(health: Option<(bool, bool)>) -> ServiceInfo {
+        ServiceInfo {
+            id: "svc".to_string(),
+            state: "Running".to_string(),
+            health: health.map(|(unknown, healthy)| ServiceHealth {
+                unknown,
+                healthy,
+                last_message: String::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn service_without_health_check_is_not_unhealthy() {
+        // ext-tailscale / dashboard: Talos reports unknown=true, healthy=false
+        assert_eq!(service(Some((true, false))).is_healthy(), None);
+        assert_eq!(service(None).is_healthy(), None);
+        assert_eq!(service(Some((false, true))).is_healthy(), Some(true));
+        assert_eq!(service(Some((false, false))).is_healthy(), Some(false));
+    }
 
     /// Helper to create a TalosClient for testing without a real connection
     fn create_test_client(nodes: Vec<String>, endpoints: Vec<String>) -> TalosClient {

@@ -1690,8 +1690,8 @@ impl NetworkStatsComponent {
                         // Check service health
                         let health_status = services
                             .get(service_name)
-                            .and_then(|s| s.health.as_ref())
-                            .map(|h| if h.healthy { "+" } else { "!" })
+                            .and_then(|s| s.is_healthy())
+                            .map(|healthy| if healthy { "+" } else { "!" })
                             .unwrap_or("?");
 
                         let process_suffix = conn
@@ -1921,9 +1921,9 @@ impl NetworkStatsComponent {
         if let Some(service_name) = port_to_service(conn.local_port) {
             let service_info = services.get(service_name);
             let (health_text, health_color) = service_info
-                .and_then(|s| s.health.as_ref())
-                .map(|h| {
-                    if h.healthy {
+                .and_then(|s| s.is_healthy())
+                .map(|healthy| {
+                    if healthy {
                         ("healthy", Color::Green)
                     } else {
                         ("unhealthy", Color::Red)
