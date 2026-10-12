@@ -181,6 +181,10 @@ pub struct DiagnosticContext {
     pub hostname: String,
     /// Node endpoint (IP address for talosctl commands)
     pub node_endpoint: Option<String>,
+    /// Talos context of the node's cluster (`--context` for talosctl commands)
+    pub talos_context: Option<String>,
+    /// Custom talosconfig path (`--talosconfig` for talosctl commands)
+    pub config_path: Option<String>,
     /// CNI information from K8s API (if available)
     pub cni_info: Option<CniInfo>,
     /// Pod health information from K8s API (if available)
@@ -200,6 +204,8 @@ impl DiagnosticContext {
             node_role: String::new(),
             hostname: String::new(),
             node_endpoint: None,
+            talos_context: None,
+            config_path: None,
             cni_info: None,
             pod_health: None,
             cpu_count: 1,

@@ -19,7 +19,8 @@ use talos_pilot_core::constants::MAX_CAPTURE_SIZE;
 use talos_pilot_core::{AsyncState, format_bytes};
 use talos_rs::{
     ConnectionCounts, ConnectionInfo, ConnectionState, KubeSpanPeerStatus, NetDevRate, NetDevStats,
-    NetstatFilter, ServiceInfo, TalosClient, get_kubespan_peers, is_kubespan_enabled,
+    NetstatFilter, ServiceInfo, TalosClient, get_kubespan_peers_for_node,
+    is_kubespan_enabled_for_node,
 };
 
 /// Well-known Talos/Kubernetes service ports
@@ -29,6 +30,9 @@ fn port_to_service(port: u32) -> Option<&'static str> {
 
 /// Auto-refresh interval in seconds (faster than processes for responsive rates)
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 2;
+
+/// KubeSpan peers are fetched via talosctl, so refresh them less often
+const KUBESPAN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Sort order for device list
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -213,6 +217,14 @@ pub struct NetworkStatsComponent {
     hostname: String,
     /// Node address
     address: String,
+    /// Talos context of the node's cluster, for talosctl calls
+    talos_context: Option<String>,
+    /// Custom talosconfig path (from --config)
+    config_path: Option<String>,
+    /// In-flight KubeSpan fetch: (enabled, peers)
+    kubespan_task: Option<tokio::task::JoinHandle<(Option<bool>, Vec<KubeSpanPeerStatus>)>>,
+    /// When the last KubeSpan fetch started
+    kubespan_started: Option<std::time::Instant>,
 
     /// Async state for loaded data
     state: AsyncState<NetworkData>,
@@ -292,6 +304,10 @@ impl NetworkStatsComponent {
         Self {
             hostname,
             address,
+            talos_context: None,
+            config_path: None,
+            kubespan_task: None,
+            kubespan_started: None,
             state: AsyncState::new(),
             selected: 0,
             table_state,
@@ -337,6 +353,13 @@ impl NetworkStatsComponent {
     /// Set the client for API calls
     pub fn set_client(&mut self, client: TalosClient) {
         self.client = Some(client);
+    }
+
+    /// Set the Talos context (and talosconfig path) the node belongs to, so
+    /// talosctl calls target the right cluster
+    pub fn set_talos_context(&mut self, context: Option<String>, config_path: Option<String>) {
+        self.talos_context = context;
+        self.config_path = config_path;
     }
 
     /// Set error message
@@ -446,8 +469,8 @@ impl NetworkStatsComponent {
         // Update service health based on connection data
         self.update_service_health();
 
-        // Fetch KubeSpan data via talosctl (runs synchronously in blocking task)
-        self.refresh_kubespan_data().await;
+        // KubeSpan data via talosctl, in the background
+        self.poll_kubespan_data();
 
         // Reset selection if needed
         let device_count = self.data().map(|d| d.devices.len()).unwrap_or(0);
@@ -461,45 +484,54 @@ impl NetworkStatsComponent {
         Ok(())
     }
 
-    /// Refresh KubeSpan peer data via talosctl
-    async fn refresh_kubespan_data(&mut self) {
-        let node = self.address.clone();
+    /// Apply a finished KubeSpan fetch and start the next one when due.
+    ///
+    /// KubeSpan data comes from `talosctl get` (two subprocesses), far slower
+    /// than the gRPC stats, so it runs in a spawned task on its own cadence
+    /// instead of holding up every 2s refresh (which blocks the event loop).
+    fn poll_kubespan_data(&mut self) {
+        use futures::FutureExt;
 
-        // Run talosctl commands in a blocking task
-        let result = tokio::task::spawn_blocking(move || {
-            // First check if KubeSpan is enabled
-            let enabled = is_kubespan_enabled(&node);
-            if !enabled {
-                return (Some(false), Vec::new());
+        if self.kubespan_task.as_ref().is_some_and(|t| t.is_finished())
+            && let Some(task) = self.kubespan_task.take()
+            && let Some(Ok((enabled, peers))) = task.now_or_never()
+        {
+            if let Some(data) = self.data_mut() {
+                data.kubespan_enabled = enabled;
+                data.kubespan_peers = peers;
             }
 
-            // Fetch peer status
-            match get_kubespan_peers(&node) {
+            // Reset selection if needed
+            let peer_count = self.data().map(|d| d.kubespan_peers.len()).unwrap_or(0);
+            if peer_count > 0 && self.kubespan_selected >= peer_count {
+                self.kubespan_selected = 0;
+            }
+            self.kubespan_table_state
+                .select(Some(self.kubespan_selected));
+        }
+
+        let due = self
+            .kubespan_started
+            .is_none_or(|at| at.elapsed() >= KUBESPAN_REFRESH_INTERVAL);
+        if self.kubespan_task.is_some() || !due {
+            return;
+        }
+        self.kubespan_started = Some(std::time::Instant::now());
+
+        let node = self.address.clone();
+        let context = self.talos_context.clone();
+        let config_path = self.config_path.clone();
+        self.kubespan_task = Some(tokio::spawn(async move {
+            let context = context.as_deref();
+            let config_path = config_path.as_deref();
+            if !is_kubespan_enabled_for_node(context, &node, config_path).await {
+                return (Some(false), Vec::new());
+            }
+            match get_kubespan_peers_for_node(context, &node, config_path).await {
                 Ok(peers) => (Some(true), peers),
                 Err(_) => (Some(true), Vec::new()), // Enabled but no peers or error
             }
-        })
-        .await;
-
-        match result {
-            Ok((enabled, peers)) => {
-                if let Some(data) = self.data_mut() {
-                    data.kubespan_enabled = enabled;
-                    data.kubespan_peers = peers;
-                }
-
-                // Reset selection if needed
-                let peer_count = self.data().map(|d| d.kubespan_peers.len()).unwrap_or(0);
-                if peer_count > 0 && self.kubespan_selected >= peer_count {
-                    self.kubespan_selected = 0;
-                }
-                self.kubespan_table_state
-                    .select(Some(self.kubespan_selected));
-            }
-            Err(_) => {
-                // Task panicked, leave data as-is
-            }
-        }
+        }));
     }
 
     /// Update connections and calculate counts

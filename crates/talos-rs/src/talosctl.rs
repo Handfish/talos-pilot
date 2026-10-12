@@ -725,17 +725,25 @@ pub struct NodeNetworkInfo {
     pub connectivity_ready: Option<bool>,
 }
 
-/// Upper bound for each `talosctl get` issued by [`get_node_network_info`]
-const NETWORK_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Upper bound for each per-node `talosctl get` (see [`get_resource_yaml`])
+const NODE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Run `talosctl get <resource> [id] -o yaml` against one node, with a timeout
+/// Run `talosctl [--context c] get <resource> [id] -o yaml` against one node,
+/// with a timeout.
+///
+/// Always pass the context of the cluster `node_ip` belongs to: without it
+/// talosctl goes through the *current* context's endpoint, which for a node in
+/// another cluster hangs ~20s on apid's proxy dial before failing.
 async fn get_resource_yaml(
-    context: &str,
+    context: Option<&str>,
     node_ip: &str,
     config_path: Option<&str>,
     resource: &[&str],
 ) -> Result<String, TalosError> {
-    let mut args = vec!["--context", context];
+    let mut args = Vec::new();
+    if let Some(context) = context {
+        args.extend_from_slice(&["--context", context]);
+    }
     if let Some(path) = config_path {
         args.extend_from_slice(&["--talosconfig", path]);
     }
@@ -743,15 +751,47 @@ async fn get_resource_yaml(
     args.extend_from_slice(resource);
     args.extend_from_slice(&["-o", "yaml"]);
 
-    tokio::time::timeout(NETWORK_INFO_TIMEOUT, exec_talosctl_async(&args))
+    tokio::time::timeout(NODE_QUERY_TIMEOUT, exec_talosctl_async(&args))
         .await
         .map_err(|_| {
             TalosError::Connection(format!(
                 "talosctl get {} timed out after {}s",
                 resource.join(" "),
-                NETWORK_INFO_TIMEOUT.as_secs()
+                NODE_QUERY_TIMEOUT.as_secs()
             ))
         })?
+}
+
+/// Get KubeSpan peer status for a node in `context` (async, with timeout)
+pub async fn get_kubespan_peers_for_node(
+    context: Option<&str>,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> Result<Vec<KubeSpanPeerStatus>, TalosError> {
+    let output = get_resource_yaml(context, node_ip, config_path, &["kubespanpeerstatus"]).await?;
+    parse_kubespan_peers_yaml(&output)
+}
+
+/// Whether KubeSpan is enabled on a node in `context` (async, with timeout).
+/// Any failure reads as "not enabled", like [`is_kubespan_enabled`].
+pub async fn is_kubespan_enabled_for_node(
+    context: Option<&str>,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> bool {
+    get_resource_yaml(context, node_ip, config_path, &["kubespanconfig"])
+        .await
+        .is_ok_and(|output| kubespan_enabled_in(&output))
+}
+
+/// Get the machine config resource of a node in `context` (async, with timeout)
+pub async fn get_machine_config_for_node(
+    context: Option<&str>,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> Result<MachineConfigInfo, TalosError> {
+    let output = get_resource_yaml(context, node_ip, config_path, &["machineconfig"]).await?;
+    parse_machine_config_yaml(&output)
 }
 
 /// Get the node's addresses, gateways, DNS servers and connectivity status
@@ -767,14 +807,14 @@ pub async fn get_node_network_info(
 ) -> Result<NodeNetworkInfo, TalosError> {
     let (addresses, routes, resolvers, status) = tokio::join!(
         get_resource_yaml(
-            context,
+            Some(context),
             node_ip,
             config_path,
             &["nodeaddress", "current-no-k8s"]
         ),
-        get_resource_yaml(context, node_ip, config_path, &["routestatus"]),
-        get_resource_yaml(context, node_ip, config_path, &["resolvers"]),
-        get_resource_yaml(context, node_ip, config_path, &["networkstatus"]),
+        get_resource_yaml(Some(context), node_ip, config_path, &["routestatus"]),
+        get_resource_yaml(Some(context), node_ip, config_path, &["resolvers"]),
+        get_resource_yaml(Some(context), node_ip, config_path, &["networkstatus"]),
     );
 
     if let (Err(e), Err(_), Err(_), Err(_)) = (&addresses, &routes, &resolvers, &status) {
@@ -859,15 +899,15 @@ pub fn get_address_status(node: &str) -> Result<Vec<AddressStatus>, TalosError> 
 /// while kubespanidentity may be empty on single-node clusters.
 pub fn is_kubespan_enabled(node: &str) -> bool {
     match exec_talosctl(&["get", "kubespanconfig", "--nodes", node, "-o", "yaml"]) {
-        Ok(output) => {
-            // Check if output contains KubeSpanConfig with enabled: true
-            let trimmed = output.trim();
-            !trimmed.is_empty()
-                && trimmed.contains("KubeSpanConfig")
-                && trimmed.contains("enabled: true")
-        }
+        Ok(output) => kubespan_enabled_in(&output),
         Err(_) => false,
     }
+}
+
+/// Whether `talosctl get kubespanconfig -o yaml` output shows `enabled: true`
+fn kubespan_enabled_in(output: &str) -> bool {
+    let trimmed = output.trim();
+    !trimmed.is_empty() && trimmed.contains("KubeSpanConfig") && trimmed.contains("enabled: true")
 }
 
 /// Parse volume status YAML output from talosctl

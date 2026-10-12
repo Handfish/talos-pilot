@@ -53,6 +53,8 @@ pub struct SecurityComponent {
 
     /// Custom config file path (from --config flag)
     config_path: Option<String>,
+    /// Reachable node to query for node-level state (see `set_query_node`)
+    query_node: Option<String>,
 }
 
 /// A selectable item in the security view
@@ -121,12 +123,19 @@ impl SecurityComponent {
             auto_refresh: true,
             client: None,
             config_path,
+            query_node: None,
         }
     }
 
     /// Set the client for API calls
     pub fn set_client(&mut self, client: TalosClient) {
         self.client = Some(client);
+    }
+
+    /// Set a reachable node address to query for node-level state
+    /// (volume encryption), instead of the first node in talosconfig
+    pub fn set_query_node(&mut self, node: Option<String>) {
+        self.query_node = node;
     }
 
     /// Set error message
@@ -152,7 +161,13 @@ impl SecurityComponent {
         // Load kubeconfig certs and encryption status (if client available)
         if let Some(client) = &self.client {
             Self::load_kubeconfig_certs(&mut data, client).await;
-            Self::load_encryption_status_into(&mut data, self.config_path.as_deref(), client).await;
+            Self::load_encryption_status_into(
+                &mut data,
+                self.config_path.as_deref(),
+                self.query_node.as_deref(),
+                client,
+            )
+            .await;
         }
 
         // Build display items from loaded data
@@ -186,10 +201,12 @@ impl SecurityComponent {
         };
         match config_result {
             Ok(config) => {
-                // Get context name
-                data.context_name = config.context.clone();
+                // Use the selected cluster's context; fall back to talosconfig's current one
+                if data.context_name.is_empty() {
+                    data.context_name = config.context.clone();
+                }
 
-                if let Some(context) = config.current_context() {
+                if let Ok(context) = config.get_context(&data.context_name) {
                     // Parse client certificate
                     if let Ok(pem_data) = context.client_cert_pem()
                         && let Ok(cert_info) = pki::parse_certificate("talosconfig", &pem_data)
@@ -267,9 +284,11 @@ impl SecurityComponent {
     async fn load_encryption_status_into(
         data: &mut SecurityData,
         config_path: Option<&str>,
+        query_node: Option<&str>,
         _client: &TalosClient,
     ) {
-        // Get the first node from talosconfig to query
+        // Query the node the cluster view knows is reachable; fall back to
+        // the first node from talosconfig
         let config_result = match config_path {
             Some(path) => {
                 let path_buf = std::path::PathBuf::from(path);
@@ -279,7 +298,7 @@ impl SecurityComponent {
         };
         let node = match config_result {
             Ok(config) => {
-                config.current_context().and_then(|ctx| {
+                config.get_context(&data.context_name).ok().and_then(|ctx| {
                     // Prefer nodes if set, otherwise use first endpoint
                     if !ctx.nodes.is_empty() {
                         ctx.nodes
@@ -294,6 +313,7 @@ impl SecurityComponent {
             }
             Err(_) => None,
         };
+        let node = query_node.map(str::to_string).or(node);
 
         let Some(node) = node else {
             data.encryption_status = EncryptionStatus {
@@ -312,7 +332,7 @@ impl SecurityComponent {
         };
 
         // Execute talosctl get volumestatus
-        match talos_rs::get_volume_status(&node) {
+        match talos_rs::get_volume_status_for_node(&data.context_name, &node, config_path).await {
             Ok(statuses) => {
                 let mut volumes = Vec::new();
 

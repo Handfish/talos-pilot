@@ -423,27 +423,36 @@ impl LifecycleComponent {
             }
         }
 
+        // Fetch each node's config hash for drift detection, concurrently and
+        // in this cluster's context. Resolve the IP from the roster so this
+        // still works when the node is named by hostname (e.g. workers
+        // enumerated via the Kubernetes API).
+        let talos_context = (!context_name.is_empty()).then_some(context_name.as_str());
+        let config_path = self.config_path.as_deref();
+        let config_hashes: Vec<Option<String>> =
+            futures::future::join_all(data.versions.iter().map(|v| {
+                let node_addr = roster_ip_for(&data.discovery_members, &v.node);
+                async move {
+                    talos_rs::get_machine_config_for_node(talos_context, &node_addr, config_path)
+                        .await
+                        .ok()
+                        .map(|config| config.version)
+                }
+            }))
+            .await;
+
         // Build node statuses combining version and time info
-        // Fetch config hash for each node individually for drift detection
         let statuses: Vec<NodeStatus> = data
             .versions
             .iter()
-            .map(|v| {
+            .zip(config_hashes)
+            .map(|(v, node_config_hash)| {
                 // Look up time sync status for this node
                 let time_synced = data
                     .time_info
                     .iter()
                     .find(|t| t.node == v.node)
                     .map(|t| t.synced);
-
-                // Get config hash for this specific node. Resolve the IP from
-                // the roster so this still works when the node is named by
-                // hostname (e.g. workers enumerated via the Kubernetes API).
-                let node_addr = roster_ip_for(&data.discovery_members, &v.node);
-                let node_config_hash = match talos_rs::get_machine_config(&node_addr) {
-                    Ok(config) => Some(config.version),
-                    Err(_) => None,
-                };
 
                 NodeStatus {
                     hostname: v.node.clone(),

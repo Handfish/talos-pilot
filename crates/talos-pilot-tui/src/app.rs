@@ -1167,6 +1167,10 @@ impl App {
                     let node_client = client.with_node(&address);
                     tracing::info!("Created node client for network: '{}'", address);
                     network.set_client(node_client);
+                    network.set_talos_context(
+                        self.cluster.current_context_name().map(str::to_string),
+                        self.config_path.clone(),
+                    );
                     if let Err(e) = network.refresh().await {
                         tracing::error!("Network refresh error: {:?}", e);
                         network.set_error(e.to_string());
@@ -1181,12 +1185,19 @@ impl App {
                 tracing::info!("Viewing security/certificates");
 
                 // Create security component
-                let mut security = SecurityComponent::new(String::new(), self.config_path.clone());
+                let mut security = SecurityComponent::new(
+                    self.cluster
+                        .current_context_name()
+                        .unwrap_or_default()
+                        .to_string(),
+                    self.config_path.clone(),
+                );
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {
                     security.set_client(client.clone());
                 }
+                security.set_query_node(self.cluster.control_plane_ip());
 
                 if let Err(e) = security.refresh().await {
                     tracing::error!("Security refresh error: {:?}", e);
@@ -1201,8 +1212,13 @@ impl App {
                 tracing::info!("Viewing lifecycle/versions");
 
                 // Create lifecycle component
-                let mut lifecycle =
-                    LifecycleComponent::new(String::new(), self.config_path.clone());
+                let mut lifecycle = LifecycleComponent::new(
+                    self.cluster
+                        .current_context_name()
+                        .unwrap_or_default()
+                        .to_string(),
+                    self.config_path.clone(),
+                );
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {

@@ -128,6 +128,7 @@ impl DiagnosticsComponent {
         context.node_role = node_role.clone();
         context.hostname = hostname.clone();
         context.node_endpoint = Some(address.clone());
+        context.config_path = config_path.clone();
 
         let initial_data = DiagnosticsData {
             hostname,
@@ -180,6 +181,9 @@ impl DiagnosticsComponent {
 
     /// Set the talosconfig context used for talosctl commands
     pub fn set_talos_context(&mut self, context: Option<String>) {
+        if let Some(data) = self.data_mut() {
+            data.context.talos_context = context.clone();
+        }
         self.talos_context = context;
     }
 
