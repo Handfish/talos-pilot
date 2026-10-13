@@ -69,6 +69,19 @@ impl TalosClient {
     ///
     /// This returns a clone of the client with requests directed to the specified node.
     /// Uses gRPC metadata to target the node through the VIP/endpoint.
+    /// Addresses of the machines this client knows about: its target nodes,
+    /// then the configured endpoints, without ports and without duplicates.
+    pub fn known_addresses(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for addr in self.nodes.iter().chain(&self.endpoints) {
+            let host = strip_port(addr).to_string();
+            if !host.is_empty() && !out.contains(&host) {
+                out.push(host);
+            }
+        }
+        out
+    }
+
     pub fn with_node(&self, node: &str) -> Self {
         Self {
             channel: self.channel.clone(),
@@ -1912,6 +1925,17 @@ pub struct CpuStat {
     pub steal: f64,
 }
 
+/// `host:port` or `[v6]:port` → host; bare hosts and IPv6 addresses unchanged
+fn strip_port(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => host,
+        _ => addr,
+    }
+}
+
 impl NodeSystemStat {
     /// Time since boot as of `now_secs` (seconds since the Unix epoch).
     ///
@@ -2740,6 +2764,15 @@ mod tests {
         assert_eq!(disks, ["/var", "/var/mnt/data", "/var/mnt/tank"]);
         assert_eq!(node.var().map(|v| v.size), Some(1000));
         assert_eq!(node.var().and_then(MountUsage::used_pct), Some(50.0));
+    }
+
+    #[test]
+    fn strip_port_handles_v4_v6_and_hostnames() {
+        assert_eq!(strip_port("10.0.0.1:50000"), "10.0.0.1");
+        assert_eq!(strip_port("10.0.0.1"), "10.0.0.1");
+        assert_eq!(strip_port("[fd00::1]:50000"), "fd00::1");
+        assert_eq!(strip_port("fd00::1"), "fd00::1");
+        assert_eq!(strip_port("talos.example.com:50000"), "talos.example.com");
     }
 
     #[test]

@@ -75,7 +75,8 @@ pub async fn create_k8s_client_with_source(
 ) -> Result<(Client, KubeconfigSource), K8sError> {
     if let Some(node_ip) = cp_node_ip {
         tracing::debug!("Targeting control plane node {} for kubeconfig", node_ip);
-        match fetch_node_kubeconfig(&talos_client.with_node(node_ip)).await {
+        let node_client = talos_client.with_node(node_ip);
+        match fetch_node_kubeconfig(&node_client).await {
             Ok(node_kubeconfig) => {
                 let node_ca = current_context_cluster_ca(&node_kubeconfig);
                 match (node_ca.as_deref(), ambient_kubeconfig_ca()) {
@@ -91,7 +92,7 @@ pub async fn create_k8s_client_with_source(
                         // Env client build failed (e.g. exec/OIDC auth we don't
                         // support): fall back to the node's kubeconfig.
                         return Ok((
-                            client_from_kubeconfig(node_kubeconfig).await?,
+                            client_from_kubeconfig(node_kubeconfig, &node_client).await?,
                             KubeconfigSource::TalosNode(node_ip.to_string()),
                         ));
                     }
@@ -103,7 +104,7 @@ pub async fn create_k8s_client_with_source(
                             node_ip
                         );
                         return Ok((
-                            client_from_kubeconfig(node_kubeconfig).await?,
+                            client_from_kubeconfig(node_kubeconfig, &node_client).await?,
                             KubeconfigSource::TalosNode(node_ip.to_string()),
                         ));
                     }
@@ -111,7 +112,7 @@ pub async fn create_k8s_client_with_source(
                     // node's kubeconfig (no false "mismatch" claim).
                     _ => {
                         return Ok((
-                            client_from_kubeconfig(node_kubeconfig).await?,
+                            client_from_kubeconfig(node_kubeconfig, &node_client).await?,
                             KubeconfigSource::TalosNode(node_ip.to_string()),
                         ));
                     }
@@ -189,7 +190,15 @@ async fn fetch_node_kubeconfig(client: &TalosClient) -> Result<kube::config::Kub
 }
 
 /// Build a K8s client from an already-parsed kubeconfig.
-async fn client_from_kubeconfig(kubeconfig: kube::config::Kubeconfig) -> Result<Client, K8sError> {
+///
+/// `talos` is the client the kubeconfig came from; its node and endpoint
+/// addresses are the fallback way to reach the API server when the
+/// kubeconfig's hostname doesn't resolve from here.
+async fn client_from_kubeconfig(
+    mut kubeconfig: kube::config::Kubeconfig,
+    talos: &TalosClient,
+) -> Result<Client, K8sError> {
+    reach_server_by_ip_if_unresolvable(&mut kubeconfig, &talos.known_addresses()).await;
     let config = Config::from_custom_kubeconfig(kubeconfig, &Default::default())
         .await
         .map_err(|e| K8sError::ClientCreate(e.to_string()))?;
@@ -198,7 +207,99 @@ async fn client_from_kubeconfig(kubeconfig: kube::config::Kubeconfig) -> Result<
 
 /// Fetch kubeconfig from a specific Talos client and create a K8s client
 async fn fetch_kubeconfig_from_client(client: &TalosClient) -> Result<Client, K8sError> {
-    client_from_kubeconfig(fetch_node_kubeconfig(client).await?).await
+    client_from_kubeconfig(fetch_node_kubeconfig(client).await?, client).await
+}
+
+/// Upper bound for resolving the API server name and for each TCP probe
+const SERVER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Split a kubeconfig server URL into (host, port); IPv6 hosts lose brackets
+fn server_host_port(server: &str) -> Option<(String, u16)> {
+    let authority = server
+        .strip_prefix("https://")
+        .or_else(|| server.strip_prefix("http://"))
+        .unwrap_or(server)
+        .split('/')
+        .next()?;
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port) = rest.split_once(']')?;
+        let port = port
+            .strip_prefix(':')
+            .map_or(Some(443), |p| p.parse().ok())?;
+        return Some((host.to_string(), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Some((host.to_string(), port.parse().ok()?)),
+        None => Some((authority.to_string(), 443)),
+    }
+}
+
+/// Clusters often publish the API server under an internal DNS name (e.g.
+/// `kube.prod.example.internal`) that only resolves inside their network or
+/// over a split-DNS VPN. When that name doesn't resolve from here, point the
+/// kubeconfig at the first of `candidates` (node / endpoint IPs) accepting TCP
+/// on the API port, keeping the original name for TLS verification so the
+/// server certificate is still checked against it.
+async fn reach_server_by_ip_if_unresolvable(
+    kubeconfig: &mut kube::config::Kubeconfig,
+    candidates: &[String],
+) {
+    let Some(cluster) = kubeconfig
+        .current_context
+        .as_deref()
+        .and_then(|name| kubeconfig.contexts.iter().find(|c| c.name == name))
+        .and_then(|c| c.context.as_ref())
+        .map(|c| c.cluster.clone())
+        .and_then(|name| kubeconfig.clusters.iter_mut().find(|c| c.name == name))
+        .and_then(|c| c.cluster.as_mut())
+    else {
+        return;
+    };
+    let Some((host, port)) = cluster.server.as_deref().and_then(server_host_port) else {
+        return;
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return;
+    }
+    let resolves = tokio::time::timeout(
+        SERVER_PROBE_TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok_and(|mut addrs| addrs.next().is_some()));
+    if resolves {
+        return;
+    }
+
+    for ip in candidates {
+        let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let connect = tokio::net::TcpStream::connect((addr, port));
+        if matches!(
+            tokio::time::timeout(SERVER_PROBE_TIMEOUT, connect).await,
+            Ok(Ok(_))
+        ) {
+            let server = match addr {
+                std::net::IpAddr::V4(v4) => format!("https://{v4}:{port}"),
+                std::net::IpAddr::V6(v6) => format!("https://[{v6}]:{port}"),
+            };
+            tracing::info!(
+                "Kubernetes API server {} does not resolve; reaching it via {}",
+                host,
+                server
+            );
+            cluster.server = Some(server);
+            cluster.tls_server_name.get_or_insert(host);
+            return;
+        }
+    }
+    tracing::warn!(
+        "Kubernetes API server {} does not resolve and none of {:?} accept connections on port {}",
+        host,
+        candidates,
+        port
+    );
 }
 
 /// The CA cert (base64 PEM) of the cluster a kubeconfig's current context points
@@ -1379,6 +1480,24 @@ fn classify_eviction_error(err: &kube::Error) -> EvictionErrorKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn server_host_port_parsing() {
+        use super::server_host_port;
+        assert_eq!(
+            server_host_port("https://kube.prod.example.internal:6443"),
+            Some(("kube.prod.example.internal".to_string(), 6443))
+        );
+        assert_eq!(
+            server_host_port("https://10.0.0.1"),
+            Some(("10.0.0.1".to_string(), 443))
+        );
+        assert_eq!(
+            server_host_port("https://[fd00::1]:6443/"),
+            Some(("fd00::1".to_string(), 6443))
+        );
+        assert_eq!(server_host_port("https://host:notaport"), None);
+    }
+
     fn api_error(code: u16, message: &str) -> kube::Error {
         kube::Error::Api(kube::core::ErrorResponse {
             status: "Failure".to_string(),
