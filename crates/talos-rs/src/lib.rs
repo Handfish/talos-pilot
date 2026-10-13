@@ -78,6 +78,7 @@ pub use client::{
     EtcdMemberInfo,
     EtcdMemberStatus,
     MemInfo,
+    MountUsage,
     // Network types
     NetDevRate,
     NetDevStats,
@@ -86,6 +87,7 @@ pub use client::{
     NodeCpuInfo,
     NodeLoadAvg,
     NodeMemory,
+    NodeMounts,
     NodeNetworkStats,
     // Process types
     NodeProcesses,

@@ -414,6 +414,35 @@ impl TalosClient {
         Ok(memories)
     }
 
+    /// Get filesystem usage (size / available) for every mount on the configured nodes
+    pub async fn mounts(&self) -> Result<Vec<NodeMounts>, TalosError> {
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(()));
+
+        let response = client.mounts(request).await?;
+        let inner = response.into_inner();
+
+        let mounts = inner
+            .messages
+            .into_iter()
+            .map(|msg| NodeMounts {
+                node: self.node_from_metadata(msg.metadata.as_ref(), 0),
+                mounts: msg
+                    .stats
+                    .into_iter()
+                    .map(|m| MountUsage {
+                        filesystem: m.filesystem,
+                        mounted_on: m.mounted_on,
+                        size: m.size,
+                        available: m.available,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(mounts)
+    }
+
     /// Get load average from all configured nodes
     pub async fn load_avg(&self) -> Result<Vec<NodeLoadAvg>, TalosError> {
         let mut client = self.machine_client();
@@ -1753,6 +1782,73 @@ pub struct NodeMemory {
     pub meminfo: Option<MemInfo>,
 }
 
+/// Filesystem usage for every mount on a node
+#[derive(Debug, Clone)]
+pub struct NodeMounts {
+    pub node: String,
+    pub mounts: Vec<MountUsage>,
+}
+
+/// Size and free space of one mounted filesystem (bytes)
+#[derive(Debug, Clone, PartialEq)]
+pub struct MountUsage {
+    pub filesystem: String,
+    pub mounted_on: String,
+    pub size: u64,
+    pub available: u64,
+}
+
+impl MountUsage {
+    /// Bytes in use (as reported by statfs: size minus available)
+    pub fn used(&self) -> u64 {
+        self.size.saturating_sub(self.available)
+    }
+
+    /// Percentage of the filesystem in use, `None` for zero-sized mounts
+    pub fn used_pct(&self) -> Option<f32> {
+        (self.size > 0).then(|| self.used() as f32 / self.size as f32 * 100.0)
+    }
+}
+
+/// Mount points that hold pod or runtime state rather than host storage
+const NON_HOST_MOUNT_PREFIXES: &[&str] = &["/var/lib/kubelet/", "/run/", "/proc", "/sys", "/dev"];
+
+impl NodeMounts {
+    /// The node's host disks: the EPHEMERAL `/var` partition plus any other
+    /// block-device or `/var/mnt` user volume, one entry per filesystem.
+    ///
+    /// Pod volumes (PVCs, subpaths), container overlays and virtual
+    /// filesystems are skipped, as are bind mounts of a filesystem already
+    /// listed. `/var` comes first.
+    pub fn host_disks(&self) -> Vec<&MountUsage> {
+        let mut disks: Vec<&MountUsage> = Vec::new();
+        for m in &self.mounts {
+            let host_fs = m.filesystem.starts_with("/dev/")
+                || m.mounted_on == "/var"
+                || m.mounted_on.starts_with("/var/mnt/");
+            let pod_mount = NON_HOST_MOUNT_PREFIXES
+                .iter()
+                .any(|p| m.mounted_on.starts_with(p));
+            if !host_fs || pod_mount || m.size == 0 {
+                continue;
+            }
+            match disks.iter_mut().find(|d| d.filesystem == m.filesystem) {
+                // Keep the shortest mount path of a bind-mounted filesystem
+                Some(d) if m.mounted_on.len() < d.mounted_on.len() => *d = m,
+                Some(_) => {}
+                None => disks.push(m),
+            }
+        }
+        disks.sort_by_key(|d| (d.mounted_on != "/var", d.mounted_on.clone()));
+        disks
+    }
+
+    /// The EPHEMERAL partition (`/var`), where images, logs and etcd live
+    pub fn var(&self) -> Option<&MountUsage> {
+        self.mounts.iter().find(|m| m.mounted_on == "/var")
+    }
+}
+
 /// Memory statistics
 #[derive(Debug, Clone)]
 pub struct MemInfo {
@@ -2604,6 +2700,46 @@ mod tests {
                 last_message: String::new(),
             }),
         }
+    }
+
+    #[test]
+    fn host_disks_skip_pod_and_virtual_mounts() {
+        let m = |fs: &str, on: &str, size: u64| MountUsage {
+            filesystem: fs.to_string(),
+            mounted_on: on.to_string(),
+            size,
+            available: size / 2,
+        };
+        let node = NodeMounts {
+            node: String::new(),
+            mounts: vec![
+                m("none", "/dev", 100),
+                m("rootfs", "/usr/lib/firmware", 100),
+                m(
+                    "/dev/drbd1003",
+                    "/var/lib/kubelet/pods/x/volumes/pvc/mount",
+                    100,
+                ),
+                m(
+                    "/dev/nvme0n1p5",
+                    "/var/lib/kubelet/pods/y/volume-subpaths/z",
+                    100,
+                ),
+                m("/dev/sdb1", "/var/mnt/data", 500),
+                m("overlay", "/run/containerd/x/rootfs", 100),
+                m("/dev/nvme0n1p5", "/var", 1000),
+                m("tank/data", "/var/mnt/tank", 800),
+                m("none", "/sys/firmware/efi/efivars", 0),
+            ],
+        };
+        let disks: Vec<&str> = node
+            .host_disks()
+            .iter()
+            .map(|d| d.mounted_on.as_str())
+            .collect();
+        assert_eq!(disks, ["/var", "/var/mnt/data", "/var/mnt/tank"]);
+        assert_eq!(node.var().map(|v| v.size), Some(1000));
+        assert_eq!(node.var().and_then(MountUsage::used_pct), Some(50.0));
     }
 
     #[test]

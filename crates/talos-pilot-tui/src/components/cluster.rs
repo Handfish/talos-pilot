@@ -4,6 +4,7 @@ use crate::action::Action;
 use crate::components::Component;
 use crate::components::diagnostics::k8s;
 use crate::reachability::prefer_reachable_addresses;
+use crate::zfs::{ZfsPool, fetch_zfs_pools};
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -15,7 +16,7 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use talos_rs::{
-    DiscoveryMember, EtcdMemberInfo, MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory,
+    DiscoveryMember, EtcdMemberInfo, MemInfo, NodeCpuInfo, NodeLoadAvg, NodeMemory, NodeMounts,
     NodeNetworkInfo, NodeServices, NodeSystemStat, ServiceInfo, TalosClient, TalosConfig,
     VersionInfo, get_discovery_members_with_retry,
 };
@@ -140,6 +141,8 @@ struct ClusterData {
     cpu_info: Vec<NodeCpuInfo>,
     /// System stats (boot time) from nodes
     system_stat: Vec<NodeSystemStat>,
+    /// Filesystem usage from nodes
+    mounts: Vec<NodeMounts>,
     /// Etcd members (control plane nodes only)
     etcd_members: Vec<EtcdMemberInfo>,
     /// Discovery members (ALL cluster nodes)
@@ -161,6 +164,10 @@ struct ClusterData {
     /// than this Talos context (so Kubernetes views ignore it and pin to a
     /// control plane node). Explains why `KUBECONFIG` is being disregarded.
     kubeconfig_warning: Option<String>,
+    /// Kubernetes client, created on first use and reused across refreshes
+    k8s_client: Option<kube::Client>,
+    /// ZFS pools per node name (from OpenEBS ZFSNode resources)
+    zfs_pools: HashMap<String, Vec<ZfsPool>>,
 }
 
 impl ClusterData {
@@ -391,6 +398,7 @@ impl ClusterData {
             let mut load_avg = Vec::new();
             let mut cpu_info = Vec::new();
             let mut system_stat = Vec::new();
+            let mut mounts = Vec::new();
 
             for (node_name, ip) in &nodes_to_query {
                 let node_client = client.with_node(ip);
@@ -431,6 +439,12 @@ impl ClusterData {
                     }
                     system_stat.extend(ns);
                 }
+                if let Ok(mut nm) = node_client.mounts().await {
+                    for m in &mut nm {
+                        m.node = node_name.clone();
+                    }
+                    mounts.extend(nm);
+                }
             }
 
             // Need to re-borrow cluster mutably after async calls
@@ -441,6 +455,7 @@ impl ClusterData {
                 cluster.load_avg = load_avg;
                 cluster.cpu_info = cpu_info;
                 cluster.system_stat = system_stat;
+                cluster.mounts = mounts;
 
                 // Fetch etcd status for header summary (target all control planes)
                 if let Some(client) = &cluster.client {
@@ -492,11 +507,33 @@ impl ClusterData {
         // helper reads the local kubeconfig first and returns None when unset,
         // so there's no extra Talos round-trip in the common case.
         let cp_ip = cluster.control_plane_ip();
-        if let Some(cp_ip) = cp_ip {
-            let warning = k8s::kubeconfig_mismatch_warning(&client, &cp_ip).await;
+        if let Some(cp_ip) = &cp_ip {
+            let warning = k8s::kubeconfig_mismatch_warning(&client, cp_ip).await;
             {
                 cluster.kubeconfig_warning = warning;
             }
+        }
+
+        // ZFS pool capacity. Bounded so an unreachable kube-apiserver can't
+        // stall the refresh; on failure the previous values are kept.
+        let zfs = tokio::time::timeout(ZFS_QUERY_TIMEOUT, async {
+            if cluster.k8s_client.is_none() {
+                cluster.k8s_client =
+                    k8s::create_k8s_client_with_source(&client, cp_ip.as_deref(), None)
+                        .await
+                        .ok()
+                        .map(|(client, _)| client);
+            }
+            match &cluster.k8s_client {
+                Some(k8s) => fetch_zfs_pools(k8s).await.ok(),
+                None => None,
+            }
+        })
+        .await;
+        match zfs {
+            Ok(Some(pools)) => cluster.zfs_pools = pools,
+            Ok(None) => tracing::debug!("ZFS pools unavailable for {}", cluster.name),
+            Err(_) => tracing::debug!("ZFS pool query timed out for {}", cluster.name),
         }
     }
 
@@ -695,6 +732,14 @@ fn memory_color(pct: f32) -> Color {
     } else {
         Color::Green
     }
+}
+
+/// Upper bound for the kube-apiserver ZFS pool query in a cluster refresh
+const ZFS_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bytes to GiB, for display
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0 / 1024.0
 }
 
 /// Color for a 1-minute load average
@@ -1307,6 +1352,16 @@ impl ClusterComponent {
             }
         }
 
+        if let Ok(mut node_mounts) = node_client.mounts().await {
+            for m in &mut node_mounts {
+                m.node = node_name.clone();
+            }
+            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
+                cluster.mounts.retain(|m| m.node != node_name);
+                cluster.mounts.extend(node_mounts);
+            }
+        }
+
         self.last_auto_refresh = Some(std::time::Instant::now());
         Ok(())
     }
@@ -1386,6 +1441,23 @@ impl ClusterComponent {
             .system_stat
             .iter()
             .find(|s| s.node == node_name || (s.node.is_empty() && node_name.is_empty()))
+    }
+
+    /// Get filesystem usage for a node in a specific cluster
+    fn get_node_mounts_for(&self, cluster_idx: usize, node_name: &str) -> Option<&NodeMounts> {
+        self.clusters
+            .get(cluster_idx)?
+            .mounts
+            .iter()
+            .find(|m| m.node == node_name || (m.node.is_empty() && node_name.is_empty()))
+    }
+
+    /// Get ZFS pools for a node in a specific cluster
+    fn get_node_zfs_pools_for(&self, cluster_idx: usize, node_name: &str) -> &[ZfsPool] {
+        self.clusters
+            .get(cluster_idx)
+            .and_then(|c| c.zfs_pools.get(node_name))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Get CPU info for a node in a specific cluster
@@ -2591,7 +2663,7 @@ impl ClusterComponent {
             "{}{}{:>3}%",
             "█".repeat(filled),
             "░".repeat(empty),
-            pct as u8
+            pct.round() as u8
         )
     }
 
@@ -2624,6 +2696,9 @@ impl ClusterComponent {
         let now = unix_now_secs();
         // Drop the least important columns on narrow panes rather than truncate
         let wide = inner.width >= 90;
+        let has_zfs = nodes
+            .iter()
+            .any(|n| !self.get_node_zfs_pools_for(cluster_idx, n).is_empty());
 
         let rows: Vec<Row> = nodes
             .iter()
@@ -2670,6 +2745,39 @@ impl ClusterComponent {
                     None => pending(),
                 };
 
+                let disk = match self
+                    .get_node_mounts_for(cluster_idx, node)
+                    .map(|m| m.var().and_then(|v| v.used_pct().map(|pct| (v, pct))))
+                {
+                    Some(Some((var, pct))) => Cell::from(Line::from(vec![
+                        Span::styled(
+                            format!("{:>3.0}%", pct),
+                            Style::default().fg(memory_color(pct)),
+                        ),
+                        Span::styled(format!(" {:.0}G free", gib(var.available)), dim),
+                    ])),
+                    // Node answered but has no /var mount: nothing to show
+                    Some(None) => Cell::from(Span::styled("-", dim)),
+                    None => pending(),
+                };
+
+                // Fullest pool, so the column flags the one that needs attention
+                let zfs = self
+                    .get_node_zfs_pools_for(cluster_idx, node)
+                    .iter()
+                    .filter_map(|p| p.used_pct().map(|pct| (p, pct)))
+                    .max_by(|a, b| a.1.total_cmp(&b.1));
+                let zfs = match zfs {
+                    Some((pool, pct)) => Cell::from(Line::from(vec![
+                        Span::styled(
+                            format!("{:>3.0}%", pct),
+                            Style::default().fg(memory_color(pct)),
+                        ),
+                        Span::styled(format!(" {:.0}G free", gib(pool.free)), dim),
+                    ])),
+                    None => Cell::from(Span::styled("-", dim)),
+                };
+
                 let net = self.get_node_network_info_for(cluster_idx, node);
                 let gw = match net {
                     Some(n) if n.gateways.is_empty() => Cell::from(Span::styled("-", dim)),
@@ -2705,8 +2813,12 @@ impl ClusterComponent {
                     )),
                     Cell::from(Span::styled(role, dim)),
                     mem,
-                    load,
+                    disk,
                 ];
+                if has_zfs {
+                    cells.push(zfs);
+                }
+                cells.push(load);
                 if wide {
                     cells.push(cores);
                 }
@@ -2715,14 +2827,20 @@ impl ClusterComponent {
             })
             .collect();
 
-        let mut header = vec!["Node", "Role", "Mem", "Load"];
+        let mut header = vec!["Node", "Role", "Mem", "Disk"];
         let name_width = nodes.iter().map(|n| n.chars().count()).max().unwrap_or(0);
         let mut widths = vec![
             Constraint::Length(name_width.max(4) as u16),
             Constraint::Length(6),
             Constraint::Length(9),
-            Constraint::Length(5),
+            Constraint::Length(14),
         ];
+        if has_zfs {
+            header.push("ZFS");
+            widths.push(Constraint::Length(15));
+        }
+        header.push("Load");
+        widths.push(Constraint::Length(5));
         if wide {
             header.push("Cores");
             widths.push(Constraint::Length(5));
@@ -3168,6 +3286,65 @@ impl ClusterComponent {
             resource_lines.push(Line::from(vec![
                 Span::styled(" Uptime: ", Style::default().dim()),
                 Span::styled(format_uptime(uptime), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // Host disks: /var (EPHEMERAL) first, then any user volumes
+        if let Some(mounts) = self.get_node_mounts_for(self.active_cluster, &node_name) {
+            for (i, disk) in mounts.host_disks().into_iter().enumerate() {
+                let Some(pct) = disk.used_pct() else {
+                    continue;
+                };
+                let label = if i == 0 { " Disk:   " } else { "         " };
+                resource_lines.push(Line::from(vec![
+                    Span::styled(label, Style::default().dim()),
+                    Span::styled(
+                        Self::render_compact_bar(pct, 10),
+                        Style::default().fg(memory_color(pct)),
+                    ),
+                    Span::styled(
+                        format!(
+                            " {:.1}/{:.1}GB, {:.1}GB free ",
+                            gib(disk.used()),
+                            gib(disk.size),
+                            gib(disk.available)
+                        ),
+                        Style::default().dim(),
+                    ),
+                    Span::styled(
+                        disk.mounted_on.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+
+        // ZFS pools
+        for (i, pool) in self
+            .get_node_zfs_pools_for(self.active_cluster, &node_name)
+            .iter()
+            .enumerate()
+        {
+            let Some(pct) = pool.used_pct() else {
+                continue;
+            };
+            let label = if i == 0 { " ZFS:    " } else { "         " };
+            resource_lines.push(Line::from(vec![
+                Span::styled(label, Style::default().dim()),
+                Span::styled(
+                    Self::render_compact_bar(pct, 10),
+                    Style::default().fg(memory_color(pct)),
+                ),
+                Span::styled(
+                    format!(
+                        " {:.1}/{:.1}GB, {:.1}GB free ",
+                        gib(pool.used),
+                        gib(pool.size()),
+                        gib(pool.free)
+                    ),
+                    Style::default().dim(),
+                ),
+                Span::styled(pool.name.clone(), Style::default().fg(Color::DarkGray)),
             ]));
         }
 
