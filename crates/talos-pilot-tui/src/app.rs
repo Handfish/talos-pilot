@@ -91,6 +91,8 @@ pub struct App {
     cluster: ClusterComponent,
     /// Multi-service logs component (created when viewing logs)
     multi_logs: Option<MultiLogsComponent>,
+    /// Log levels last shown in the logs view, restored when it is reopened
+    log_level_filter: crate::components::multi_logs::LevelFilter,
     /// Etcd status component (created when viewing etcd)
     etcd: Option<EtcdComponent>,
     /// Processes component (created when viewing processes)
@@ -159,6 +161,7 @@ impl App {
             view: View::Cluster,
             cluster: ClusterComponent::new(config_path.clone(), context),
             multi_logs: None,
+            log_level_filter: crate::components::multi_logs::ALL_LEVELS,
             etcd: None,
             processes: None,
             network: None,
@@ -829,6 +832,7 @@ impl App {
                         // Stop streaming if active
                         if let Some(multi_logs) = &mut self.multi_logs {
                             multi_logs.stop_streaming();
+                            self.log_level_filter = multi_logs.level_filter();
                         }
                         self.multi_logs = None;
                     }
@@ -1082,6 +1086,7 @@ impl App {
                     active_services.clone(),
                     all_services,
                 );
+                multi_logs.set_level_filter(self.log_level_filter);
 
                 // Fetch logs from active services and set up client for streaming
                 if let Some(client) = self.cluster.client() {

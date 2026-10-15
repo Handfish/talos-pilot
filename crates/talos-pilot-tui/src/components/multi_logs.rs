@@ -141,6 +141,49 @@ enum FloatingPane {
     Levels,
 }
 
+/// Which levels are shown, in panel order: Error, Warn, Info, Debug, Other.
+/// Kept by the app so the selection survives leaving and reopening the view.
+pub type LevelFilter = [bool; 5];
+
+/// Show every level
+pub const ALL_LEVELS: LevelFilter = [true; 5];
+
+/// What a level hotkey does
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LevelHotkey {
+    /// `0`: show every level
+    All,
+    /// `1`-`5`: show only this level
+    Only(usize),
+    /// Shift+`1`-`5`: add/remove this level
+    Toggle(usize),
+}
+
+impl LevelHotkey {
+    /// Map a key to a level hotkey. Shift+digit arrives as the shifted symbol
+    /// on most terminals (US layout `!@#$%`), or as the digit with SHIFT set
+    /// when the terminal reports modifiers (e.g. the kitty keyboard protocol).
+    fn from_key(key: &KeyEvent) -> Option<Self> {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char('0') if !shift => Some(Self::All),
+            KeyCode::Char(c @ '1'..='5') => {
+                let idx = c as usize - '1' as usize;
+                Some(if shift {
+                    Self::Toggle(idx)
+                } else {
+                    Self::Only(idx)
+                })
+            }
+            KeyCode::Char(c) => ['!', '@', '#', '$', '%']
+                .iter()
+                .position(|&s| s == c)
+                .map(Self::Toggle),
+            _ => None,
+        }
+    }
+}
+
 /// Level filter state
 #[derive(Debug, Clone)]
 struct LevelState {
@@ -1058,6 +1101,31 @@ impl MultiLogsComponent {
         self.rebuild_visible_indices();
     }
 
+    /// Show only the level at `index`
+    fn show_only_level(&mut self, index: usize) {
+        for (i, level) in self.levels.iter_mut().enumerate() {
+            level.active = i == index;
+        }
+        self.rebuild_visible_indices();
+    }
+
+    /// Which levels are currently shown
+    pub fn level_filter(&self) -> LevelFilter {
+        let mut filter = [false; 5];
+        for (active, level) in filter.iter_mut().zip(&self.levels) {
+            *active = level.active;
+        }
+        filter
+    }
+
+    /// Restore a previously chosen level selection
+    pub fn set_level_filter(&mut self, filter: LevelFilter) {
+        for (level, active) in self.levels.iter_mut().zip(filter) {
+            level.active = active;
+        }
+        self.rebuild_visible_indices();
+    }
+
     /// Count active levels
     fn active_level_count(&self) -> usize {
         self.levels.iter().filter(|l| l.active).count()
@@ -1357,7 +1425,7 @@ impl MultiLogsComponent {
 
     /// Draw the levels filter panel
     fn draw_levels_panel(&mut self, frame: &mut Frame, area: Rect) {
-        let panel_width = 18u16;
+        let panel_width = 20u16;
         let panel_height = (self.levels.len() + 2).min(area.height as usize - 2) as u16;
 
         // Position in top-left with small margin
@@ -1369,11 +1437,13 @@ impl MultiLogsComponent {
         let items: Vec<ListItem> = self
             .levels
             .iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(i, l)| {
                 let indicator = if l.active { "●" } else { "○" };
                 let style = Style::default().fg(l.level.color());
 
                 ListItem::new(Line::from(vec![
+                    Span::raw(format!("{} ", i + 1)).dim(),
                     Span::styled(indicator, style),
                     Span::raw(" "),
                     Span::styled(l.level.name(), style),
@@ -1609,6 +1679,15 @@ impl Component for MultiLogsComponent {
                     self.update_matches();
                 }
                 _ => {}
+            }
+            return Ok(None);
+        }
+
+        if let Some(hotkey) = LevelHotkey::from_key(&key) {
+            match hotkey {
+                LevelHotkey::All => self.activate_all_levels(),
+                LevelHotkey::Only(idx) => self.show_only_level(idx),
+                LevelHotkey::Toggle(idx) => self.toggle_level(idx),
             }
             return Ok(None);
         }
@@ -2101,6 +2180,12 @@ impl Component for MultiLogsComponent {
                 Span::raw("[l]").fg(Color::Yellow),
                 Span::raw(" lvls").dim(),
                 Span::raw(" "),
+                Span::raw("[1-5/0]").fg(Color::Yellow),
+                Span::raw(" only/all").dim(),
+                Span::raw(" "),
+                Span::raw("[⇧1-5]").fg(Color::Yellow),
+                Span::raw(" ±lvl").dim(),
+                Span::raw(" "),
                 Span::raw("[/]").fg(Color::Yellow),
                 Span::raw(" search").dim(),
                 Span::raw(" "),
@@ -2132,5 +2217,62 @@ impl Component for MultiLogsComponent {
         frame.render_widget(footer, footer_area);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn level_hotkeys() {
+        let none = KeyModifiers::NONE;
+        let shift = KeyModifiers::SHIFT;
+        let hk = |code, m| LevelHotkey::from_key(&key(code, m));
+        assert_eq!(hk(KeyCode::Char('0'), none), Some(LevelHotkey::All));
+        assert_eq!(hk(KeyCode::Char('1'), none), Some(LevelHotkey::Only(0)));
+        assert_eq!(hk(KeyCode::Char('5'), none), Some(LevelHotkey::Only(4)));
+        assert_eq!(hk(KeyCode::Char('2'), shift), Some(LevelHotkey::Toggle(1)));
+        assert_eq!(hk(KeyCode::Char('@'), shift), Some(LevelHotkey::Toggle(1)));
+        assert_eq!(hk(KeyCode::Char('%'), none), Some(LevelHotkey::Toggle(4)));
+        assert_eq!(hk(KeyCode::Char('6'), none), None);
+        assert_eq!(hk(KeyCode::Char('q'), none), None);
+    }
+
+    #[test]
+    fn level_filter_round_trips_and_hotkeys_combine() {
+        let mut logs = MultiLogsComponent::new(
+            "10.0.0.1".into(),
+            "worker".into(),
+            vec!["kubelet".into()],
+            vec!["kubelet".into()],
+        );
+        assert_eq!(logs.level_filter(), ALL_LEVELS);
+
+        // 1 then Shift+2: errors + warnings
+        logs.handle_key_event(key(KeyCode::Char('1'), KeyModifiers::NONE))
+            .unwrap();
+        logs.handle_key_event(key(KeyCode::Char('@'), KeyModifiers::SHIFT))
+            .unwrap();
+        let filter = logs.level_filter();
+        assert_eq!(filter, [true, true, false, false, false]);
+
+        let mut reopened = MultiLogsComponent::new(
+            "10.0.0.1".into(),
+            "worker".into(),
+            vec!["kubelet".into()],
+            vec!["kubelet".into()],
+        );
+        reopened.set_level_filter(filter);
+        assert_eq!(reopened.level_filter(), filter);
+
+        reopened
+            .handle_key_event(key(KeyCode::Char('0'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(reopened.level_filter(), ALL_LEVELS);
     }
 }
