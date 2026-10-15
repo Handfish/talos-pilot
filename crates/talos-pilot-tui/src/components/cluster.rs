@@ -160,10 +160,6 @@ struct ClusterData {
     /// Non-fatal warning when worker discovery is unavailable, so the node list
     /// (control-plane-only in that case) isn't silently misleading.
     discovery_warning: Option<String>,
-    /// Non-fatal warning when an ambient `KUBECONFIG` names a different cluster
-    /// than this Talos context (so Kubernetes views ignore it and pin to a
-    /// control plane node). Explains why `KUBECONFIG` is being disregarded.
-    kubeconfig_warning: Option<String>,
     /// Kubernetes client, created on first use and reused across refreshes
     k8s_client: Option<kube::Client>,
     /// ZFS pools per node name (from OpenEBS ZFSNode resources)
@@ -500,19 +496,7 @@ impl ClusterData {
             }
         }
 
-        // Warn if an ambient KUBECONFIG names a *different* cluster than this
-        // Talos context. Kubernetes views ignore it and pin to a control plane
-        // node (see k8s::create_k8s_client_with_source), so this only explains
-        // why KUBECONFIG is being disregarded — it never blocks anything. The
-        // helper reads the local kubeconfig first and returns None when unset,
-        // so there's no extra Talos round-trip in the common case.
         let cp_ip = cluster.control_plane_ip();
-        if let Some(cp_ip) = &cp_ip {
-            let warning = k8s::kubeconfig_mismatch_warning(&client, cp_ip).await;
-            {
-                cluster.kubeconfig_warning = warning;
-            }
-        }
 
         // ZFS pool capacity. Bounded so an unreachable kube-apiserver can't
         // stall the refresh; on failure the previous values are kept.
@@ -2568,13 +2552,6 @@ impl ClusterComponent {
                 // silently hiding workers. Indented + wrapped so it reads as
                 // part of this cluster's tray rather than a clipped stray line.
                 if let Some(warning) = &cluster.discovery_warning {
-                    lines.extend(warning_lines(warning, pane_layout[0].width));
-                }
-
-                // KUBECONFIG points at a different cluster than this context, so
-                // Kubernetes views ignore it and pin to a control plane node.
-                // Explain that rather than let it be a silent surprise.
-                if let Some(warning) = &cluster.kubeconfig_warning {
                     lines.extend(warning_lines(warning, pane_layout[0].width));
                 }
             }
