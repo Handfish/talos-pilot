@@ -30,7 +30,8 @@ pub enum Action {
     /// Show etcd cluster status
     ShowEtcd,
     /// Show processes for a node: (hostname, address)
-    ShowProcesses(String, String),
+    /// Processes of one or more nodes: (title, nodes)
+    ShowProcesses(String, Vec<crate::components::ProcessNode>),
     /// Show network stats for a node: (hostname, address)
     ShowNetwork(String, String),
     /// Show diagnostics for a node: (hostname, address, role, controlplane_endpoint)

@@ -1,6 +1,11 @@
-//! Processes component - displays running processes on a node
+//! Processes component - displays running processes on one or more nodes
 //!
 //! "Show me what's wrong in 5 seconds"
+//!
+//! Opened for a single node it shows that node's processes; opened for a
+//! cluster or a control plane / workers group it merges the processes of every
+//! node into one list with a NODE column, so the busiest processes of the whole
+//! group are visible at once.
 
 use crate::action::Action;
 use crate::components::Component;
@@ -13,13 +18,16 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use talos_pilot_core::{AsyncState, format_bytes_compact};
-use talos_rs::{CpuStat, ProcessInfo, ProcessState, TalosClient};
+use talos_rs::{CpuStat, MemInfo, ProcessInfo, ProcessState, TalosClient};
 
 /// Auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
+
+/// Upper bound for each per-node API call in a refresh
+const NODE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Sort order for process list
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,6 +56,41 @@ pub enum Mode {
     Filtering,
 }
 
+/// A node whose processes are listed
+#[derive(Debug, Clone)]
+pub struct ProcessNode {
+    pub hostname: String,
+    pub address: String,
+}
+
+/// A process and the node it runs on. PIDs are only unique per node, so
+/// processes are identified by `(node index, pid)`.
+type ProcKey = (usize, i32);
+
+#[derive(Debug, Clone)]
+struct NodeProcess {
+    /// Index into the component's `nodes`
+    node: usize,
+    info: ProcessInfo,
+}
+
+impl std::ops::Deref for NodeProcess {
+    type Target = ProcessInfo;
+    fn deref(&self) -> &ProcessInfo {
+        &self.info
+    }
+}
+
+impl NodeProcess {
+    fn key(&self) -> ProcKey {
+        (self.node, self.info.pid)
+    }
+
+    fn parent_key(&self) -> ProcKey {
+        (self.node, self.info.ppid)
+    }
+}
+
 /// State counts for summary bar
 #[derive(Debug, Clone, Default)]
 struct StateCounts {
@@ -70,49 +113,169 @@ struct DisplayEntry {
     ancestors_have_siblings: Vec<bool>,
 }
 
-/// Loaded process data (wrapped by AsyncState)
+/// Per-node system stats and CPU sampling state
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ProcessesData {
-    /// Node hostname
-    hostname: String,
-    /// Node address
-    address: String,
-
-    /// All processes from the node
-    processes: Vec<ProcessInfo>,
-    /// Filtered process indices (into processes vec)
-    filtered_indices: Vec<usize>,
-    /// Display entries for tree view (with depth and connector info)
-    display_entries: Vec<DisplayEntry>,
-
-    /// State counts for summary
-    state_counts: StateCounts,
+struct NodeStats {
     /// Total memory on node (for percentage calc)
     total_memory: u64,
     /// Memory used on node
     memory_used: u64,
-    /// Memory usage percentage (from system, not process sum)
-    memory_usage_percent: f32,
-
     /// Previous CPU stats (for calculating usage delta)
     prev_cpu_stat: Option<CpuStat>,
-    /// Current CPU usage percentage
-    cpu_usage_percent: f32,
+    /// Node CPU usage percentage, once two samples exist
+    cpu_usage_percent: Option<f32>,
     /// Number of CPUs on node
     cpu_count: usize,
     /// Load average (1, 5, 15 min)
     load_avg: (f64, f64, f64),
-
-    /// Previous CPU time per process (for calculating per-process CPU %)
+    /// Previous CPU time per PID (for calculating per-process CPU %)
     prev_cpu_times: HashMap<i32, f64>,
-    /// Calculated CPU percentage per process
-    cpu_percentages: HashMap<i32, f32>,
     /// Time of last CPU measurement
     last_cpu_sample: Option<Instant>,
+    /// Why the last process fetch for this node failed, if it did
+    error: Option<String>,
+}
+
+impl NodeStats {
+    fn memory_usage_percent(&self) -> f32 {
+        if self.total_memory == 0 {
+            0.0
+        } else {
+            self.memory_used as f32 / self.total_memory as f32 * 100.0
+        }
+    }
+}
+
+/// Loaded process data (wrapped by AsyncState)
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProcessesData {
+    /// Processes of all nodes
+    processes: Vec<NodeProcess>,
+    /// Filtered process indices (into processes vec)
+    filtered_indices: Vec<usize>,
+    /// Display entries for tree view (with depth and connector info)
+    display_entries: Vec<DisplayEntry>,
+    /// State counts for summary
+    state_counts: StateCounts,
+    /// Stats per node, parallel to the component's `nodes`
+    nodes: Vec<NodeStats>,
+    /// Calculated CPU percentage per process
+    cpu_percentages: HashMap<ProcKey, f32>,
+}
+
+impl ProcessesData {
+    fn total_memory(&self) -> u64 {
+        self.nodes.iter().map(|n| n.total_memory).sum()
+    }
+
+    fn cpu_count(&self) -> usize {
+        self.nodes.iter().map(|n| n.cpu_count).sum()
+    }
+
+    /// Memory usage across all nodes (from meminfo, not the process sum)
+    fn memory_usage_percent(&self) -> f32 {
+        let total = self.total_memory();
+        if total == 0 {
+            return 0.0;
+        }
+        let used: u64 = self.nodes.iter().map(|n| n.memory_used).sum();
+        used as f32 / total as f32 * 100.0
+    }
+
+    /// CPU usage across nodes, weighted by core count; `None` until sampled
+    fn cpu_usage_percent(&self) -> Option<f32> {
+        let sampled = self
+            .nodes
+            .iter()
+            .filter_map(|n| n.cpu_usage_percent.map(|pct| (pct, n.cpu_count.max(1))));
+        let (weighted, cores) = sampled.fold((0.0, 0), |(w, c), (pct, count)| {
+            (w + pct * count as f32, c + count)
+        });
+        (cores > 0).then(|| weighted / cores as f32)
+    }
+
+    fn cpu_percent(&self, proc: &NodeProcess) -> f32 {
+        self.cpu_percentages
+            .get(&proc.key())
+            .copied()
+            .unwrap_or(0.0)
+    }
+}
+
+/// One rendered row of the process table
+struct ProcessRow {
+    pid: i32,
+    node: String,
+    cpu: String,
+    mem: String,
+    state: String,
+    command: String,
+    cpu_color: Color,
+    mem_color: Color,
+    state_color: Color,
+    interesting: bool,
+}
+
+/// What one node returned in a refresh
+struct NodeFetch {
+    processes: std::result::Result<Vec<ProcessInfo>, String>,
+    meminfo: Option<MemInfo>,
+    cpu_stat: Option<CpuStat>,
+    cpu_count: Option<usize>,
+    load_avg: Option<(f64, f64, f64)>,
+}
+
+/// Fetch processes and system stats of one node, each call bounded
+async fn fetch_node(client: TalosClient) -> NodeFetch {
+    let t = NODE_FETCH_TIMEOUT;
+    let (procs, mem, stat, cpu, load) = tokio::join!(
+        tokio::time::timeout(t, client.processes()),
+        tokio::time::timeout(t, client.memory()),
+        tokio::time::timeout(t, client.system_stat()),
+        tokio::time::timeout(t, client.cpu_info()),
+        tokio::time::timeout(t, client.load_avg()),
+    );
+    NodeFetch {
+        processes: match procs {
+            Ok(Ok(nodes)) => Ok(nodes
+                .into_iter()
+                .next()
+                .map(|n| n.processes)
+                .unwrap_or_default()),
+            Ok(Err(e)) => Err(format!("Failed to fetch processes: {}", e)),
+            Err(_) => Err(format!("Request timed out after {}s", t.as_secs())),
+        },
+        meminfo: mem
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|m| m.into_iter().next())
+            .and_then(|m| m.meminfo),
+        cpu_stat: stat
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|s| s.into_iter().next())
+            .map(|s| s.cpu_total),
+        cpu_count: cpu
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|c| c.into_iter().next())
+            .map(|c| c.cpu_count),
+        load_avg: load
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|l| l.into_iter().next())
+            .map(|l| (l.load1, l.load5, l.load15)),
+    }
 }
 
 /// Processes component for viewing node processes
+#[derive(Clone)]
 pub struct ProcessesComponent {
+    /// What is being viewed: a node name, or a cluster / group name
+    title: String,
+    /// Nodes whose processes are listed
+    nodes: Vec<ProcessNode>,
+
     /// Async state wrapping all process data
     state: AsyncState<ProcessesData>,
 
@@ -124,8 +287,8 @@ pub struct ProcessesComponent {
     sort_by: SortBy,
     /// Tree view enabled
     tree_view: bool,
-    /// Tree root PID (None = full tree from init, Some(pid) = subtree)
-    tree_root: Option<i32>,
+    /// Tree root process (None = full tree from init, Some = subtree)
+    tree_root: Option<ProcKey>,
 
     /// State filter (None = show all, Some(state) = show only that state)
     state_filter: Option<ProcessState>,
@@ -140,31 +303,27 @@ pub struct ProcessesComponent {
     /// Auto-refresh enabled
     auto_refresh: bool,
 
-    /// Client for API calls
+    /// Client for API calls; each node is targeted with `with_node`
     client: Option<TalosClient>,
 }
 
 impl Default for ProcessesComponent {
     fn default() -> Self {
-        Self::new("".to_string(), "".to_string())
+        Self::new(String::new(), Vec::new())
     }
 }
 
 impl ProcessesComponent {
-    pub fn new(hostname: String, address: String) -> Self {
+    pub fn new(title: String, nodes: Vec<ProcessNode>) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
 
-        // Initialize with hostname/address in the data
-        let initial_data = ProcessesData {
-            hostname,
-            address,
-            ..Default::default()
-        };
         let mut state = AsyncState::new();
-        state.set_data(initial_data);
+        state.start_loading();
 
         Self {
+            title,
+            nodes,
             state,
             selected: 0,
             table_state,
@@ -190,223 +349,52 @@ impl ProcessesComponent {
         self.state.set_error(error);
     }
 
+    /// Whether processes of more than one node are listed
+    fn multi_node(&self) -> bool {
+        self.nodes.len() > 1
+    }
+
+    fn node_name(&self, idx: usize) -> &str {
+        self.nodes.get(idx).map_or("?", |n| n.hostname.as_str())
+    }
+
     /// Helper to get data reference
     fn data(&self) -> Option<&ProcessesData> {
         self.state.data()
     }
 
-    /// Helper to get mutable data reference
-    fn data_mut(&mut self) -> Option<&mut ProcessesData> {
-        self.state.data_mut()
-    }
-
-    /// Sort processes (wrapper that operates on current data)
-    fn sort_processes(&mut self) {
-        let sort_by = self.sort_by;
-        if let Some(data) = self.data_mut() {
-            match sort_by {
-                SortBy::CpuPercent => {
-                    let cpu_pcts = data.cpu_percentages.clone();
-                    data.processes.sort_by(|a, b| {
-                        let a_pct = cpu_pcts.get(&a.pid).unwrap_or(&0.0);
-                        let b_pct = cpu_pcts.get(&b.pid).unwrap_or(&0.0);
-                        b_pct
-                            .partial_cmp(a_pct)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-                SortBy::CpuTime => {
-                    data.processes.sort_by(|a, b| {
-                        b.cpu_time
-                            .partial_cmp(&a.cpu_time)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-                SortBy::Mem => {
-                    data.processes
-                        .sort_by_key(|p| std::cmp::Reverse(p.resident_memory));
-                }
-            }
-        }
-    }
-
-    /// Apply filter (wrapper that operates on current data)
-    fn apply_filter(&mut self) {
-        let filter = self.filter.clone();
-        let state_filter = self.state_filter.clone();
-        let tree_view = self.tree_view;
-        let tree_root = self.tree_root;
-
-        if let Some(data) = self.data_mut() {
-            data.filtered_indices = data
-                .processes
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    // Apply text filter
-                    let text_match = if let Some(ref filter) = filter {
-                        let filter_lower = filter.to_lowercase();
-                        p.command.to_lowercase().contains(&filter_lower)
-                            || p.args.to_lowercase().contains(&filter_lower)
-                            || p.executable.to_lowercase().contains(&filter_lower)
-                    } else {
-                        true
-                    };
-
-                    // Apply state filter
-                    let state_match = if let Some(ref state_filter) = state_filter {
-                        std::mem::discriminant(&p.state) == std::mem::discriminant(state_filter)
-                    } else {
-                        true
-                    };
-
-                    text_match && state_match
-                })
-                .map(|(i, _)| i)
-                .collect();
-
-            // Rebuild display list
-            Self::rebuild_display_list_static(data, tree_view, tree_root);
-        }
-    }
-
-    /// Rebuild display list (wrapper that operates on current data)
-    fn rebuild_display_list(&mut self) {
-        let tree_view = self.tree_view;
-        let tree_root = self.tree_root;
-        if let Some(data) = self.data_mut() {
-            Self::rebuild_display_list_static(data, tree_view, tree_root);
-        }
-    }
-
-    /// Static version of rebuild_display_list for use in async contexts
-    fn rebuild_display_list_static(
-        data: &mut ProcessesData,
-        tree_view: bool,
-        tree_root: Option<i32>,
-    ) {
-        use std::collections::HashMap;
-
-        if !tree_view {
-            // Flat view - just use filtered indices directly
-            data.display_entries = data
-                .filtered_indices
-                .iter()
-                .map(|&idx| DisplayEntry {
-                    process_idx: idx,
-                    depth: 0,
-                    is_last: false,
-                    ancestors_have_siblings: vec![],
-                })
-                .collect();
+    /// Run `f` on the loaded data with read access to the component's
+    /// settings (sort order, filters, tree mode)
+    fn with_data(&mut self, f: impl FnOnce(&Self, &mut ProcessesData)) {
+        let Some(slot) = self.state.data_mut() else {
             return;
+        };
+        let mut data = std::mem::take(slot);
+        f(self, &mut data);
+        if let Some(slot) = self.state.data_mut() {
+            *slot = data;
         }
-
-        // Tree view - build parent-child hierarchy
-        let mut pid_to_idx: HashMap<i32, usize> = HashMap::new();
-        for (idx, proc) in data.processes.iter().enumerate() {
-            pid_to_idx.insert(proc.pid, idx);
-        }
-
-        let mut children_map: HashMap<i32, Vec<usize>> = HashMap::new();
-        let mut root_indices: Vec<usize> = Vec::new();
-
-        let descendants: Option<std::collections::HashSet<i32>> = tree_root.map(|root_pid| {
-            let mut desc = std::collections::HashSet::new();
-            desc.insert(root_pid);
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for proc in &data.processes {
-                    if desc.contains(&proc.ppid) && !desc.contains(&proc.pid) {
-                        desc.insert(proc.pid);
-                        changed = true;
-                    }
-                }
-            }
-            desc
-        });
-
-        for &idx in &data.filtered_indices {
-            let proc = &data.processes[idx];
-
-            if let Some(ref desc) = descendants
-                && !desc.contains(&proc.pid)
-            {
-                continue;
-            }
-
-            let ppid = proc.ppid;
-            let parent_in_list = pid_to_idx
-                .get(&ppid)
-                .map(|&parent_idx| data.filtered_indices.contains(&parent_idx))
-                .unwrap_or(false);
-
-            let is_root = if let Some(root_pid) = tree_root {
-                proc.pid == root_pid
-            } else {
-                ppid == 0 || ppid == proc.pid || !parent_in_list
-            };
-
-            if is_root {
-                root_indices.push(idx);
-            } else if parent_in_list {
-                if descendants.as_ref().is_none_or(|d| d.contains(&ppid)) {
-                    children_map.entry(ppid).or_default().push(idx);
-                } else {
-                    root_indices.push(idx);
-                }
-            } else {
-                root_indices.push(idx);
-            }
-        }
-
-        data.display_entries.clear();
-
-        fn add_tree_entries(
-            entries: &mut Vec<DisplayEntry>,
-            processes: &[ProcessInfo],
-            children_map: &HashMap<i32, Vec<usize>>,
-            indices: &[usize],
-            depth: usize,
-            ancestors_have_siblings: Vec<bool>,
-        ) {
-            let count = indices.len();
-            for (i, &idx) in indices.iter().enumerate() {
-                let is_last = i == count - 1;
-                entries.push(DisplayEntry {
-                    process_idx: idx,
-                    depth,
-                    is_last,
-                    ancestors_have_siblings: ancestors_have_siblings.clone(),
-                });
-                let pid = processes[idx].pid;
-                if let Some(children) = children_map.get(&pid) {
-                    let mut child_ancestors = ancestors_have_siblings.clone();
-                    child_ancestors.push(!is_last);
-                    add_tree_entries(
-                        entries,
-                        processes,
-                        children_map,
-                        children,
-                        depth + 1,
-                        child_ancestors,
-                    );
-                }
-            }
-        }
-
-        add_tree_entries(
-            &mut data.display_entries,
-            &data.processes,
-            &children_map,
-            &root_indices,
-            0,
-            vec![],
-        );
     }
 
-    /// Refresh process data from the node
+    /// Re-sort and re-filter after a setting changed
+    fn resort(&mut self) {
+        self.with_data(|this, data| {
+            this.sort_processes_in_data(data);
+            this.apply_filter_to_data(data);
+        });
+    }
+
+    /// Re-filter after a filter changed
+    fn apply_filter(&mut self) {
+        self.with_data(|this, data| this.apply_filter_to_data(data));
+    }
+
+    /// Rebuild the flat/tree display list after the tree mode changed
+    fn rebuild_display_list(&mut self) {
+        self.with_data(|this, data| this.rebuild_display_list_into(data));
+    }
+
+    /// Refresh process data from every node concurrently
     pub async fn refresh(&mut self) -> Result<()> {
         let Some(client) = self.client.clone() else {
             self.set_error("No client configured".to_string());
@@ -415,87 +403,87 @@ impl ProcessesComponent {
 
         self.state.start_loading();
 
-        // Get or create data, preserving previous CPU state for delta calculations
+        // Keep previous data: CPU deltas need the last sample, and a node that
+        // fails this time keeps showing its last known processes.
         let mut data = self.state.take_data().unwrap_or_default();
+        data.nodes.resize_with(self.nodes.len(), NodeStats::default);
 
-        // Fetch processes, memory info, system stats, CPU info, and load avg in parallel
-        let timeout = std::time::Duration::from_secs(10);
-        let (procs_result, mem_result, stat_result, cpu_info_result, load_result) = tokio::join!(
-            tokio::time::timeout(timeout, client.processes()),
-            tokio::time::timeout(timeout, client.memory()),
-            tokio::time::timeout(timeout, client.system_stat()),
-            tokio::time::timeout(timeout, client.cpu_info()),
-            tokio::time::timeout(timeout, client.load_avg()),
-        );
+        let fetches = self
+            .nodes
+            .iter()
+            .map(|n| fetch_node(client.with_node(&n.address)));
+        let results = futures::future::join_all(fetches).await;
 
-        // Handle memory result (for total memory and usage)
-        if let Ok(Ok(mem_info)) = mem_result
-            && let Some(node_mem) = mem_info.into_iter().next()
-            && let Some(meminfo) = node_mem.meminfo
-        {
-            data.total_memory = meminfo.mem_total;
-            data.memory_used = meminfo.mem_total.saturating_sub(meminfo.mem_available);
-            data.memory_usage_percent = meminfo.usage_percent();
-        }
+        let mut previous: Vec<NodeProcess> = std::mem::take(&mut data.processes);
+        let mut cpu_percentages = HashMap::new();
+        let now = Instant::now();
 
-        // Handle CPU info result (for CPU count)
-        if let Ok(Ok(cpu_info)) = cpu_info_result
-            && let Some(node_cpu) = cpu_info.into_iter().next()
-        {
-            data.cpu_count = node_cpu.cpu_count;
-        }
-
-        // Handle load average result
-        if let Ok(Ok(load_info)) = load_result
-            && let Some(node_load) = load_info.into_iter().next()
-        {
-            data.load_avg = (node_load.load1, node_load.load5, node_load.load15);
-        }
-
-        // Handle system stat result (for CPU usage)
-        if let Ok(Ok(stats)) = stat_result
-            && let Some(node_stat) = stats.into_iter().next()
-        {
-            let curr_cpu = node_stat.cpu_total;
-            // Calculate CPU usage from delta if we have previous stats
-            if let Some(ref prev_cpu) = data.prev_cpu_stat {
-                data.cpu_usage_percent = CpuStat::usage_percent_from(prev_cpu, &curr_cpu);
+        for (idx, fetch) in results.into_iter().enumerate() {
+            let stats = &mut data.nodes[idx];
+            if let Some(meminfo) = fetch.meminfo {
+                stats.total_memory = meminfo.mem_total;
+                stats.memory_used = meminfo.mem_total.saturating_sub(meminfo.mem_available);
             }
-            data.prev_cpu_stat = Some(curr_cpu);
-        }
-
-        // Handle processes result
-        let node_processes = match procs_result {
-            Ok(Ok(procs)) => procs,
-            Ok(Err(e)) => {
-                self.state.set_error(format!(
-                    "Failed to fetch processes: {} (node: {})",
-                    e, data.address
-                ));
-                // Re-store data so far
-                self.state.set_data(data);
-                return Ok(());
+            if let Some(count) = fetch.cpu_count {
+                stats.cpu_count = count;
             }
-            Err(_) => {
-                self.state
-                    .set_error(format!("Request timed out after {}s", timeout.as_secs()));
-                // Re-store data so far
-                self.state.set_data(data);
-                return Ok(());
+            if let Some(load) = fetch.load_avg {
+                stats.load_avg = load;
             }
-        };
+            if let Some(curr) = fetch.cpu_stat {
+                if let Some(prev) = &stats.prev_cpu_stat {
+                    stats.cpu_usage_percent = Some(CpuStat::usage_percent_from(prev, &curr));
+                }
+                stats.prev_cpu_stat = Some(curr);
+            }
 
-        // Find processes for our node
-        if let Some(node_data) = node_processes.into_iter().next() {
-            data.processes = node_data.processes;
-            Self::calculate_cpu_percentages_into(&mut data);
-            Self::calculate_state_counts_into(&mut data);
-            self.sort_processes_in_data(&mut data);
-            self.apply_filter_to_data(&mut data);
-        } else {
-            data.processes.clear();
-            data.filtered_indices.clear();
+            match fetch.processes {
+                Ok(procs) => {
+                    stats.error = None;
+                    // Per-process CPU % from the CPU time delta. Not divided by
+                    // the core count, so (like htop) a process can exceed 100%.
+                    let elapsed = stats
+                        .last_cpu_sample
+                        .map(|t| now.duration_since(t).as_secs_f64())
+                        .unwrap_or(0.0);
+                    if elapsed > 0.1 && stats.cpu_count > 0 {
+                        for p in &procs {
+                            if let Some(&prev_time) = stats.prev_cpu_times.get(&p.pid) {
+                                let pct = ((p.cpu_time - prev_time) / elapsed * 100.0) as f32;
+                                cpu_percentages.insert((idx, p.pid), pct.max(0.0));
+                            }
+                        }
+                    }
+                    stats.prev_cpu_times = procs.iter().map(|p| (p.pid, p.cpu_time)).collect();
+                    stats.last_cpu_sample = Some(now);
+                    data.processes.extend(
+                        procs
+                            .into_iter()
+                            .map(|info| NodeProcess { node: idx, info }),
+                    );
+                }
+                Err(e) => {
+                    let e = if self.multi_node() {
+                        e
+                    } else {
+                        format!("{} (node: {})", e, self.nodes[idx].address)
+                    };
+                    stats.error = Some(e);
+                    // Keep this node's last known processes and CPU figures
+                    for p in previous.extract_if(.., |p| p.node == idx) {
+                        if let Some(&pct) = data.cpu_percentages.get(&p.key()) {
+                            cpu_percentages.insert(p.key(), pct);
+                        }
+                        data.processes.push(p);
+                    }
+                }
+            }
         }
+        data.cpu_percentages = cpu_percentages;
+
+        Self::calculate_state_counts_into(&mut data);
+        self.sort_processes_in_data(&mut data);
+        self.apply_filter_to_data(&mut data);
 
         // Reset selection if needed
         if !data.display_entries.is_empty() && self.selected >= data.display_entries.len() {
@@ -503,8 +491,25 @@ impl ProcessesComponent {
         }
         self.table_state.select(Some(self.selected));
 
-        // Store the data
+        // Every node failed: report it, keeping the last data on screen
+        let errors: Vec<String> = data
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| n.error.as_ref().map(|e| (i, e)))
+            .map(|(i, e)| {
+                if self.multi_node() {
+                    format!("{}: {}", self.node_name(i), e)
+                } else {
+                    e.clone()
+                }
+            })
+            .collect();
+        let all_failed = !self.nodes.is_empty() && errors.len() == self.nodes.len();
         self.state.set_data(data);
+        if all_failed {
+            self.state.set_error(errors.join("; "));
+        }
         Ok(())
     }
 
@@ -522,55 +527,19 @@ impl ProcessesComponent {
         }
     }
 
-    /// Calculate per-process CPU percentages from delta (static method)
-    fn calculate_cpu_percentages_into(data: &mut ProcessesData) {
-        let now = Instant::now();
-
-        // Calculate elapsed time since last sample
-        let elapsed_secs = data
-            .last_cpu_sample
-            .map(|t| now.duration_since(t).as_secs_f64())
-            .unwrap_or(0.0);
-
-        // Need at least some time elapsed to calculate percentage
-        if elapsed_secs > 0.1 && data.cpu_count > 0 {
-            // Calculate percentage for each process
-            for proc in &data.processes {
-                if let Some(&prev_time) = data.prev_cpu_times.get(&proc.pid) {
-                    let delta = proc.cpu_time - prev_time;
-                    // CPU % = (delta_cpu_time / elapsed_wall_time) * 100 / num_cpus
-                    // Actually for "percentage of one CPU", we don't divide by num_cpus
-                    // This matches htop behavior where a process can show >100% on multi-core
-                    let pct = ((delta / elapsed_secs) * 100.0) as f32;
-                    data.cpu_percentages.insert(proc.pid, pct.max(0.0));
-                }
-            }
-        }
-
-        // Store current CPU times for next calculation
-        data.prev_cpu_times.clear();
-        for proc in &data.processes {
-            data.prev_cpu_times.insert(proc.pid, proc.cpu_time);
-        }
-        data.last_cpu_sample = Some(now);
-    }
-
     /// Sort processes based on current sort order (operates on data)
     fn sort_processes_in_data(&self, data: &mut ProcessesData) {
         match self.sort_by {
             SortBy::CpuPercent => {
-                // Sort by CPU percentage
                 let cpu_pcts = &data.cpu_percentages;
+                let pct = |p: &NodeProcess| cpu_pcts.get(&p.key()).copied().unwrap_or(0.0);
                 data.processes.sort_by(|a, b| {
-                    let a_pct = cpu_pcts.get(&a.pid).unwrap_or(&0.0);
-                    let b_pct = cpu_pcts.get(&b.pid).unwrap_or(&0.0);
-                    b_pct
-                        .partial_cmp(a_pct)
+                    pct(b)
+                        .partial_cmp(&pct(a))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
             SortBy::CpuTime => {
-                // Sort by cumulative CPU time
                 data.processes.sort_by(|a, b| {
                     b.cpu_time
                         .partial_cmp(&a.cpu_time)
@@ -586,27 +555,24 @@ impl ProcessesComponent {
 
     /// Apply current filter to processes (operates on data)
     fn apply_filter_to_data(&self, data: &mut ProcessesData) {
+        let filter_lower = self.filter.as_ref().map(|f| f.to_lowercase());
         data.filtered_indices = data
             .processes
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                // Apply text filter
-                let text_match = if let Some(ref filter) = self.filter {
-                    let filter_lower = filter.to_lowercase();
-                    p.command.to_lowercase().contains(&filter_lower)
-                        || p.args.to_lowercase().contains(&filter_lower)
-                        || p.executable.to_lowercase().contains(&filter_lower)
-                } else {
-                    true
-                };
+                // Text filter: command, arguments, executable or node name
+                let text_match = filter_lower.as_ref().is_none_or(|f| {
+                    p.command.to_lowercase().contains(f)
+                        || p.args.to_lowercase().contains(f)
+                        || p.executable.to_lowercase().contains(f)
+                        || (self.multi_node() && self.node_name(p.node).to_lowercase().contains(f))
+                });
 
-                // Apply state filter
-                let state_match = if let Some(ref state_filter) = self.state_filter {
+                // State filter
+                let state_match = self.state_filter.as_ref().is_none_or(|state_filter| {
                     std::mem::discriminant(&p.state) == std::mem::discriminant(state_filter)
-                } else {
-                    true
-                };
+                });
 
                 text_match && state_match
             })
@@ -618,8 +584,6 @@ impl ProcessesComponent {
 
     /// Rebuild the display list (either flat or tree view) - operates on data
     fn rebuild_display_list_into(&self, data: &mut ProcessesData) {
-        use std::collections::HashMap;
-
         if !self.tree_view {
             // Flat view - just use filtered indices directly
             data.display_entries = data
@@ -635,28 +599,27 @@ impl ProcessesComponent {
             return;
         }
 
-        // Tree view - build parent-child hierarchy
-        // First, create a map of pid -> index for quick lookup
-        let mut pid_to_idx: HashMap<i32, usize> = HashMap::new();
-        for (idx, proc) in data.processes.iter().enumerate() {
-            pid_to_idx.insert(proc.pid, idx);
-        }
+        // Tree view - build parent-child hierarchy, per node
+        let key_to_idx: HashMap<ProcKey, usize> = data
+            .processes
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| (p.key(), idx))
+            .collect();
+        let filtered: HashSet<usize> = data.filtered_indices.iter().copied().collect();
 
-        // Group children by parent pid
-        let mut children_map: HashMap<i32, Vec<usize>> = HashMap::new();
+        let mut children_map: HashMap<ProcKey, Vec<usize>> = HashMap::new();
         let mut root_indices: Vec<usize> = Vec::new();
 
         // Determine which processes are descendants of tree_root (if set)
-        let descendants: Option<std::collections::HashSet<i32>> = self.tree_root.map(|root_pid| {
-            let mut desc = std::collections::HashSet::new();
-            desc.insert(root_pid);
+        let descendants: Option<HashSet<ProcKey>> = self.tree_root.map(|root| {
+            let mut desc = HashSet::from([root]);
             // Keep adding children until no more found
             let mut changed = true;
             while changed {
                 changed = false;
                 for proc in &data.processes {
-                    if desc.contains(&proc.ppid) && !desc.contains(&proc.pid) {
-                        desc.insert(proc.pid);
+                    if desc.contains(&proc.parent_key()) && desc.insert(proc.key()) {
                         changed = true;
                     }
                 }
@@ -669,36 +632,30 @@ impl ProcessesComponent {
 
             // If subtree mode, skip processes not in the subtree
             if let Some(ref desc) = descendants
-                && !desc.contains(&proc.pid)
+                && !desc.contains(&proc.key())
             {
                 continue;
             }
 
-            let ppid = proc.ppid;
+            let parent = proc.parent_key();
 
             // Check if parent exists in our filtered list
-            let parent_in_list = pid_to_idx
-                .get(&ppid)
-                .map(|&parent_idx| data.filtered_indices.contains(&parent_idx))
-                .unwrap_or(false);
+            let parent_in_list = key_to_idx
+                .get(&parent)
+                .is_some_and(|parent_idx| filtered.contains(parent_idx));
 
             // In subtree mode, root is the tree_root process
-            let is_root = if let Some(root_pid) = self.tree_root {
-                proc.pid == root_pid
+            let is_root = if let Some(root) = self.tree_root {
+                proc.key() == root
             } else {
-                ppid == 0 || ppid == proc.pid || !parent_in_list
+                proc.ppid == 0 || proc.ppid == proc.pid || !parent_in_list
             };
 
-            if is_root {
-                root_indices.push(idx);
-            } else if parent_in_list {
-                // Has a visible parent (and not filtered out by subtree)
-                if descendants.as_ref().is_none_or(|d| d.contains(&ppid)) {
-                    children_map.entry(ppid).or_default().push(idx);
-                } else {
-                    // Parent not in subtree, treat as root
-                    root_indices.push(idx);
-                }
+            if !is_root
+                && parent_in_list
+                && descendants.as_ref().is_none_or(|d| d.contains(&parent))
+            {
+                children_map.entry(parent).or_default().push(idx);
             } else {
                 root_indices.push(idx);
             }
@@ -709,8 +666,8 @@ impl ProcessesComponent {
 
         fn add_tree_entries(
             entries: &mut Vec<DisplayEntry>,
-            processes: &[ProcessInfo],
-            children_map: &HashMap<i32, Vec<usize>>,
+            processes: &[NodeProcess],
+            children_map: &HashMap<ProcKey, Vec<usize>>,
             indices: &[usize],
             depth: usize,
             ancestors_have_siblings: Vec<bool>,
@@ -727,8 +684,7 @@ impl ProcessesComponent {
                 });
 
                 // Process children
-                let pid = processes[idx].pid;
-                if let Some(children) = children_map.get(&pid) {
+                if let Some(children) = children_map.get(&processes[idx].key()) {
                     let mut child_ancestors = ancestors_have_siblings.clone();
                     child_ancestors.push(!is_last);
                     add_tree_entries(
@@ -754,7 +710,7 @@ impl ProcessesComponent {
     }
 
     /// Get currently selected process
-    fn selected_process(&self) -> Option<&ProcessInfo> {
+    fn selected_process(&self) -> Option<&NodeProcess> {
         self.data().and_then(|data| {
             data.display_entries
                 .get(self.selected)
@@ -798,6 +754,12 @@ impl ProcessesComponent {
         }
     }
 
+    /// Back to the top of the list after the list changed shape
+    fn reset_selection(&mut self) {
+        self.selected = 0;
+        self.table_state.select(Some(0));
+    }
+
     /// Get color for process state
     fn state_color(state: &ProcessState) -> Color {
         match state {
@@ -806,6 +768,18 @@ impl ProcessesComponent {
             ProcessState::DiskSleep => Color::Yellow,
             ProcessState::Stopped => Color::Magenta,
             _ => Color::default(),
+        }
+    }
+
+    /// Load average color relative to the node's core count
+    fn load_color(load: f64, cpu_count: usize) -> Color {
+        let threshold = cpu_count as f64;
+        if load > threshold {
+            Color::Red
+        } else if load > threshold * 0.7 {
+            Color::Yellow
+        } else {
+            Color::Green
         }
     }
 
@@ -818,15 +792,15 @@ impl ProcessesComponent {
 
         let sort_indicator = format!("[{}▼]", self.sort_by.label());
         let tree_indicator = if self.tree_view {
-            if let Some(root_pid) = self.tree_root {
+            if let Some(root) = self.tree_root {
                 // Find root process name
                 let root_name = data
                     .processes
                     .iter()
-                    .find(|p| p.pid == root_pid)
+                    .find(|p| p.key() == root)
                     .map(|p| p.command.as_str())
                     .unwrap_or("?");
-                format!("[TREE:{}/{}]", root_pid, root_name)
+                format!("[TREE:{}/{}]", root.1, root_name)
             } else {
                 "[TREE]".to_string()
             }
@@ -835,38 +809,48 @@ impl ProcessesComponent {
         };
         let proc_count = format!("{} procs", data.display_entries.len());
 
-        // System resources info
-        let cpu_info = if data.cpu_count > 0 {
-            format!("{} CPU", data.cpu_count)
+        // System resources info (summed over nodes)
+        let cpu_count = data.cpu_count();
+        let cpu_info = if cpu_count > 0 {
+            format!("{} CPU", cpu_count)
         } else {
             String::new()
         };
-        let mem_info = if data.total_memory > 0 {
-            format!("{} RAM", format_bytes_compact(data.total_memory))
+        let total_memory = data.total_memory();
+        let mem_info = if total_memory > 0 {
+            format!("{} RAM", format_bytes_compact(total_memory))
         } else {
             String::new()
         };
 
         let mut spans = vec![
             Span::styled("Processes: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&data.hostname),
-            Span::styled(" (", Style::default().fg(Color::DarkGray)),
-            Span::raw(&data.address),
-            Span::styled(")", Style::default().fg(Color::DarkGray)),
+            Span::raw(&self.title),
         ];
+        match self.nodes.as_slice() {
+            [node] => {
+                spans.push(Span::styled(" (", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::raw(&node.address));
+                spans.push(Span::styled(")", Style::default().fg(Color::DarkGray)));
+            }
+            nodes => spans.push(Span::styled(
+                format!(" · {} nodes", nodes.len()),
+                Style::default().fg(Color::DarkGray),
+            )),
+        }
 
         // Add system info
         if !cpu_info.is_empty() || !mem_info.is_empty() {
             spans.push(Span::raw("  "));
             spans.push(Span::styled("[", Style::default().fg(Color::DarkGray)));
             if !cpu_info.is_empty() {
-                spans.push(Span::styled(&cpu_info, Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(cpu_info, Style::default().fg(Color::Cyan)));
             }
-            if !cpu_info.is_empty() && !mem_info.is_empty() {
+            if cpu_count > 0 && total_memory > 0 {
                 spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
             }
             if !mem_info.is_empty() {
-                spans.push(Span::styled(&mem_info, Style::default().fg(Color::Magenta)));
+                spans.push(Span::styled(mem_info, Style::default().fg(Color::Magenta)));
             }
             spans.push(Span::styled("]", Style::default().fg(Color::DarkGray)));
         }
@@ -937,30 +921,18 @@ impl ProcessesComponent {
             None => return,
         };
 
-        // CPU bar with actual percentage (shows "--%" on first refresh since we need delta)
-        let (cpu_bar, cpu_color) = Self::usage_bar(data.cpu_usage_percent);
-        let cpu_pct = if data.prev_cpu_stat.is_some() {
-            format!("{:>3.0}%", data.cpu_usage_percent)
-        } else {
-            " --%".to_string()
+        // CPU bar (shows "--%" until two samples exist, since it needs a delta)
+        let cpu_usage = data.cpu_usage_percent();
+        let (cpu_bar, cpu_color) = Self::usage_bar(cpu_usage.unwrap_or(0.0));
+        let cpu_pct = match cpu_usage {
+            Some(pct) => format!("{:>3.0}%", pct),
+            None => " --%".to_string(),
         };
 
         // Memory bar with actual percentage
-        let (mem_bar, mem_color) = Self::usage_bar(data.memory_usage_percent);
-        let mem_pct = format!("{:>3.0}%", data.memory_usage_percent);
-
-        // Load average with color coding (red if > cpu_count, yellow if > cpu_count*0.7)
-        let cpu_count = data.cpu_count;
-        let load_color = |load: f64| {
-            let threshold = cpu_count as f64;
-            if load > threshold {
-                Color::Red
-            } else if load > threshold * 0.7 {
-                Color::Yellow
-            } else {
-                Color::Green
-            }
-        };
+        let mem_usage = data.memory_usage_percent();
+        let (mem_bar, mem_color) = Self::usage_bar(mem_usage);
+        let mem_pct = format!("{:>3.0}%", mem_usage);
 
         let mut spans = vec![
             Span::raw("CPU "),
@@ -970,24 +942,34 @@ impl ProcessesComponent {
             Span::styled(mem_bar, Style::default().fg(mem_color)),
             Span::raw(format!(" {} ", mem_pct)),
             Span::raw("  "),
-            // Load average
             Span::styled("Load: ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(
-                format!("{:.2}", data.load_avg.0),
-                Style::default().fg(load_color(data.load_avg.0)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{:.2}", data.load_avg.1),
-                Style::default().fg(load_color(data.load_avg.1)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{:.2}", data.load_avg.2),
-                Style::default().fg(load_color(data.load_avg.2)),
-            ),
-            Span::raw("  "),
         ];
+
+        // Load average: 1/5/15 min for one node, the 1 min load per node for
+        // several (colored against each node's own core count)
+        if let [stats] = data.nodes.as_slice() {
+            let loads = [stats.load_avg.0, stats.load_avg.1, stats.load_avg.2];
+            for load in loads {
+                spans.push(Span::styled(
+                    format!("{:.2}", load),
+                    Style::default().fg(Self::load_color(load, stats.cpu_count)),
+                ));
+                spans.push(Span::raw(" "));
+            }
+        } else {
+            for (idx, stats) in data.nodes.iter().enumerate() {
+                spans.push(Span::styled(
+                    format!("{} ", self.node_name(idx)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                spans.push(Span::styled(
+                    format!("{:.2}", stats.load_avg.0),
+                    Style::default().fg(Self::load_color(stats.load_avg.0, stats.cpu_count)),
+                ));
+                spans.push(Span::raw(" "));
+            }
+        }
+        spans.push(Span::raw(" "));
 
         // Add state counts with colors
         spans.push(Span::styled(
@@ -1023,35 +1005,11 @@ impl ProcessesComponent {
         frame.render_widget(para, area);
     }
 
-    /// Check if any process has high memory usage (>85% of total)
-    fn has_high_memory_process(&self) -> Option<(String, f64)> {
-        let data = self.data()?;
-        if data.total_memory == 0 {
-            return None;
-        }
-        let threshold = 0.85;
-        for proc in &data.processes {
-            let mem_percent = proc.resident_memory as f64 / data.total_memory as f64;
-            if mem_percent > threshold {
-                return Some((proc.command.clone(), mem_percent * 100.0));
-            }
-        }
-        None
-    }
-
-    /// Get system memory usage percentage (from meminfo, not process sum)
-    fn total_memory_usage_percent(&self) -> f64 {
-        self.data()
-            .map(|d| d.memory_usage_percent as f64)
-            .unwrap_or(0.0)
-    }
-
-    /// Draw warning banner if needed
-    fn draw_warning(&self, frame: &mut Frame, area: Rect) -> bool {
+    /// Warnings worth a banner: zombies, high memory, nodes that failed
+    fn warnings(&self) -> Vec<String> {
         let Some(data) = self.data() else {
-            return false;
+            return Vec::new();
         };
-
         let mut warnings = Vec::new();
 
         // Check for zombie processes
@@ -1062,49 +1020,65 @@ impl ProcessesComponent {
             ));
         }
 
-        // Check for high memory usage (total > 85%)
-        let mem_usage = self.total_memory_usage_percent();
-        if mem_usage > 85.0 {
-            warnings.push(format!("High memory usage: {:.1}%", mem_usage));
-        } else if let Some((proc_name, percent)) = self.has_high_memory_process() {
-            // Individual process using >85% of total memory
-            warnings.push(format!(
-                "Process '{}' using {:.1}% memory",
-                proc_name, percent
-            ));
+        // Node memory usage > 85% (from meminfo), else a single process using
+        // > 85% of its node's memory
+        let prefix = |idx: usize| {
+            if self.multi_node() {
+                format!("{}: ", self.node_name(idx))
+            } else {
+                String::new()
+            }
+        };
+        for (idx, stats) in data.nodes.iter().enumerate() {
+            let usage = stats.memory_usage_percent();
+            if usage > 85.0 {
+                warnings.push(format!("{}High memory usage: {:.1}%", prefix(idx), usage));
+            } else if stats.total_memory > 0
+                && let Some(proc) = data.processes.iter().find(|p| {
+                    p.node == idx && p.resident_memory as f64 / stats.total_memory as f64 > 0.85
+                })
+            {
+                warnings.push(format!(
+                    "{}Process '{}' using {:.1}% memory",
+                    prefix(idx),
+                    proc.command,
+                    proc.resident_memory as f64 / stats.total_memory as f64 * 100.0
+                ));
+            }
         }
 
-        if warnings.is_empty() {
-            return false;
+        // Nodes whose last fetch failed (when all failed, the error screen shows it)
+        if self.multi_node() && self.state.error().is_none() {
+            for (idx, stats) in data.nodes.iter().enumerate() {
+                if let Some(e) = &stats.error {
+                    warnings.push(format!(
+                        "{}: {} (showing last known)",
+                        self.node_name(idx),
+                        e
+                    ));
+                }
+            }
         }
+        warnings
+    }
 
+    /// Draw warning banner
+    fn draw_warning(&self, frame: &mut Frame, area: Rect, warnings: &[String]) {
         let warning_text = format!("⚠ {}", warnings.join(" • "));
         let para = Paragraph::new(warning_text).style(Style::default().fg(Color::Yellow));
         frame.render_widget(para, area);
-        true
     }
 
     /// Collect process row data for rendering (helper to limit borrow scope)
-    #[allow(clippy::type_complexity)]
-    fn collect_process_row_data(
-        &self,
-        area: Rect,
-    ) -> Option<
-        Vec<(
-            i32,
-            String,
-            String,
-            String,
-            String,
-            Color,
-            Color,
-            Color,
-            bool,
-        )>,
-    > {
+    fn collect_process_row_data(&self, area: Rect) -> Option<Vec<ProcessRow>> {
         let data = self.data()?;
         let tree_view = self.tree_view;
-        let max_cmd_len = area.width.saturating_sub(45) as usize;
+        let node_width = if self.multi_node() {
+            self.node_column_width() + 1
+        } else {
+            0
+        };
+        let max_cmd_len = area.width.saturating_sub(45 + node_width) as usize;
         let max_mem = data
             .processes
             .iter()
@@ -1118,7 +1092,7 @@ impl ProcessesComponent {
                 .filter_map(|entry| {
                     let proc = data.processes.get(entry.process_idx)?;
 
-                    let cpu_pct = data.cpu_percentages.get(&proc.pid).copied().unwrap_or(0.0);
+                    let cpu_pct = data.cpu_percent(proc);
                     let cpu_color = if cpu_pct > 50.0 {
                         Color::Red
                     } else if cpu_pct > 10.0 {
@@ -1142,9 +1116,6 @@ impl ProcessesComponent {
                         }
                     };
 
-                    let state_color = Self::state_color(&proc.state);
-                    let cpu_str = format!("{:>5.1}%  {}", cpu_pct, proc.cpu_time_human());
-                    let mem_str = proc.resident_memory_human();
                     let command = proc.display_command();
 
                     let tree_prefix = if !tree_view || entry.depth == 0 {
@@ -1167,30 +1138,41 @@ impl ProcessesComponent {
                     };
 
                     let full_command = format!("{}{}", tree_prefix, command);
-                    let cmd_display = if full_command.len() > max_cmd_len {
-                        format!("{}...", &full_command[..max_cmd_len.saturating_sub(3)])
+                    let command = if full_command.chars().count() > max_cmd_len {
+                        let keep = max_cmd_len.saturating_sub(3);
+                        format!("{}...", full_command.chars().take(keep).collect::<String>())
                     } else {
                         full_command
                     };
 
-                    let is_interesting = matches!(
-                        proc.state,
-                        ProcessState::Running | ProcessState::Zombie | ProcessState::DiskSleep
-                    );
-                    Some((
-                        proc.pid,
-                        cpu_str,
-                        mem_str,
-                        proc.state.short().to_string(),
-                        cmd_display,
+                    Some(ProcessRow {
+                        pid: proc.pid,
+                        node: self.node_name(proc.node).to_string(),
+                        cpu: format!("{:>5.1}%  {}", cpu_pct, proc.cpu_time_human()),
+                        mem: proc.resident_memory_human(),
+                        state: proc.state.short().to_string(),
+                        command,
                         cpu_color,
                         mem_color,
-                        state_color,
-                        is_interesting,
-                    ))
+                        state_color: Self::state_color(&proc.state),
+                        interesting: matches!(
+                            proc.state,
+                            ProcessState::Running | ProcessState::Zombie | ProcessState::DiskSleep
+                        ),
+                    })
                 })
                 .collect(),
         )
+    }
+
+    /// Width of the NODE column: the longest node name
+    fn node_column_width(&self) -> u16 {
+        self.nodes
+            .iter()
+            .map(|n| n.hostname.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(4) as u16
     }
 
     /// Draw the process table
@@ -1200,36 +1182,29 @@ impl ProcessesComponent {
             Some(data) => data,
             None => return,
         };
+        let multi = self.multi_node();
 
         let rows: Vec<Row> = row_data
             .into_iter()
-            .map(
-                |(
-                    pid,
-                    cpu_str,
-                    mem_str,
-                    state,
-                    cmd_display,
-                    cpu_color,
-                    mem_color,
-                    state_color,
-                    is_interesting,
-                )| {
-                    // Highlight interesting processes (running, zombie, disk-wait) with bold
-                    let base_style = if is_interesting {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
-                    Row::new(vec![
-                        Cell::from(format!("{:>6}", pid)).style(base_style),
-                        Cell::from(cpu_str).style(base_style.fg(cpu_color)),
-                        Cell::from(format!("{:>8}", mem_str)).style(base_style.fg(mem_color)),
-                        Cell::from(state).style(base_style.fg(state_color)),
-                        Cell::from(cmd_display).style(base_style),
-                    ])
-                },
-            )
+            .map(|row| {
+                // Highlight interesting processes (running, zombie, disk-wait) with bold
+                let base_style = if row.interesting {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let mut cells = vec![Cell::from(format!("{:>6}", row.pid)).style(base_style)];
+                if multi {
+                    cells.push(Cell::from(row.node).style(base_style.fg(Color::Cyan)));
+                }
+                cells.extend([
+                    Cell::from(row.cpu).style(base_style.fg(row.cpu_color)),
+                    Cell::from(format!("{:>8}", row.mem)).style(base_style.fg(row.mem_color)),
+                    Cell::from(row.state).style(base_style.fg(row.state_color)),
+                    Cell::from(row.command).style(base_style),
+                ]);
+                Row::new(cells)
+            })
             .collect();
 
         // Build header with sort indicators
@@ -1244,23 +1219,27 @@ impl ProcessesComponent {
             "MEM"
         };
 
-        let header = Row::new(vec![
-            Cell::from("PID"),
+        let mut header = vec![Cell::from("PID")];
+        let mut widths = vec![Constraint::Length(7)]; // PID
+        if multi {
+            header.push(Cell::from("NODE"));
+            widths.push(Constraint::Length(self.node_column_width()));
+        }
+        header.extend([
             Cell::from(cpu_header),
             Cell::from(mem_header),
             Cell::from("S"),
             Cell::from("COMMAND"),
-        ])
-        .style(Style::default().add_modifier(Modifier::DIM))
-        .bottom_margin(1);
-
-        let widths = [
-            Constraint::Length(7),      // PID
+        ]);
+        widths.extend([
             Constraint::Length(14),     // CPU% + TIME
             Constraint::Length(9),      // MEM
             Constraint::Length(2),      // State
             Constraint::Percentage(55), // Command
-        ];
+        ]);
+        let header = Row::new(header)
+            .style(Style::default().add_modifier(Modifier::DIM))
+            .bottom_margin(1);
 
         let table = Table::new(rows, widths)
             .header(header)
@@ -1283,16 +1262,25 @@ impl ProcessesComponent {
             return;
         };
 
-        let title = format!(" {} (PID {}) ", proc.command, proc.pid);
+        let title = if self.multi_node() {
+            format!(
+                " {} (PID {}) on {} ",
+                proc.command,
+                proc.pid,
+                self.node_name(proc.node)
+            )
+        } else {
+            format!(" {} (PID {}) ", proc.command, proc.pid)
+        };
 
         // Full command line with wrapping
         let full_cmd = proc.display_command();
 
-        // Find parent process name
+        // Find parent process name (on the same node)
         let parent_name = data
             .processes
             .iter()
-            .find(|p| p.pid == proc.ppid)
+            .find(|p| p.key() == proc.parent_key())
             .map(|p| p.command.as_str())
             .unwrap_or("-");
 
@@ -1464,10 +1452,8 @@ impl Component for ProcessesComponent {
         }
 
         // Calculate layout - check for any warning condition
-        let zombie_count = self.data().map(|d| d.state_counts.zombie).unwrap_or(0);
-        let has_warning = zombie_count > 0
-            || self.total_memory_usage_percent() > 85.0
-            || self.has_high_memory_process().is_some();
+        let warnings = self.warnings();
+        let has_warning = !warnings.is_empty();
         let warning_height = if has_warning { 1 } else { 0 };
 
         let chunks = Layout::vertical([
@@ -1485,7 +1471,7 @@ impl Component for ProcessesComponent {
         self.draw_summary_bar(frame, chunks[1]);
 
         if has_warning {
-            self.draw_warning(frame, chunks[2]);
+            self.draw_warning(frame, chunks[2], &warnings);
         }
 
         // Filter bar or spacer
@@ -1528,18 +1514,14 @@ impl ProcessesComponent {
                     SortBy::CpuTime => SortBy::CpuPercent,
                     _ => SortBy::CpuPercent,
                 };
-                self.sort_processes();
-                self.apply_filter();
-                self.selected = 0;
-                self.table_state.select(Some(0));
+                self.resort();
+                self.reset_selection();
                 Ok(None)
             }
             KeyCode::Char('2') => {
                 self.sort_by = SortBy::Mem;
-                self.sort_processes();
-                self.apply_filter();
-                self.selected = 0;
-                self.table_state.select(Some(0));
+                self.resort();
+                self.reset_selection();
                 Ok(None)
             }
             KeyCode::Char('/') => {
@@ -1554,19 +1536,18 @@ impl ProcessesComponent {
             }
             KeyCode::Char('t') => {
                 // Toggle subtree from selected process
-                if let Some(proc) = self.selected_process() {
-                    if self.tree_view && self.tree_root == Some(proc.pid) {
+                if let Some(key) = self.selected_process().map(NodeProcess::key) {
+                    if self.tree_view && self.tree_root == Some(key) {
                         // Already in subtree mode for this process - clear it
                         self.tree_view = false;
                         self.tree_root = None;
                     } else {
                         // Enter subtree mode for selected process
-                        self.tree_root = Some(proc.pid);
+                        self.tree_root = Some(key);
                         self.tree_view = true;
                     }
                     self.rebuild_display_list();
-                    self.selected = 0;
-                    self.table_state.select(Some(0));
+                    self.reset_selection();
                 }
                 Ok(None)
             }
@@ -1575,8 +1556,7 @@ impl ProcessesComponent {
                 self.tree_root = None;
                 self.tree_view = !self.tree_view;
                 self.rebuild_display_list();
-                self.selected = 0;
-                self.table_state.select(Some(0));
+                self.reset_selection();
                 Ok(None)
             }
             KeyCode::Char('z') => {
@@ -1587,8 +1567,7 @@ impl ProcessesComponent {
                     self.state_filter = Some(ProcessState::Zombie);
                 }
                 self.apply_filter();
-                self.selected = 0;
-                self.table_state.select(Some(0));
+                self.reset_selection();
                 Ok(None)
             }
             KeyCode::Char('d') => {
@@ -1599,8 +1578,7 @@ impl ProcessesComponent {
                     self.state_filter = Some(ProcessState::DiskSleep);
                 }
                 self.apply_filter();
-                self.selected = 0;
-                self.table_state.select(Some(0));
+                self.reset_selection();
                 Ok(None)
             }
             KeyCode::Char('y') => {
@@ -1627,8 +1605,7 @@ impl ProcessesComponent {
                 self.filter = None;
                 self.filter_input.clear();
                 self.apply_filter();
-                self.selected = 0;
-                self.table_state.select(Some(0));
+                self.reset_selection();
                 Ok(None)
             }
             KeyCode::Enter => {
@@ -1640,8 +1617,7 @@ impl ProcessesComponent {
                     Some(self.filter_input.clone())
                 };
                 self.apply_filter();
-                self.selected = 0;
-                self.table_state.select(Some(0));
+                self.reset_selection();
                 Ok(None)
             }
             KeyCode::Backspace => {
@@ -1664,5 +1640,122 @@ impl ProcessesComponent {
             }
             _ => Ok(None),
         }
+    }
+}
+
+impl crate::components::BackgroundRefresh for ProcessesComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        self.state = refreshed.state;
+        // Sort order, filters or tree mode may have changed while it ran
+        self.resort();
+        let len = self.data().map_or(0, |d| d.display_entries.len());
+        if self.selected >= len {
+            self.selected = len.saturating_sub(1);
+        }
+        self.table_state.select(Some(self.selected));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process(pid: i32, ppid: i32, command: &str, mem: u64) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid,
+            state: ProcessState::Sleeping,
+            threads: 1,
+            cpu_time: 0.0,
+            virtual_memory: 0,
+            resident_memory: mem,
+            command: command.to_string(),
+            executable: String::new(),
+            args: String::new(),
+        }
+    }
+
+    /// Two nodes, both with PID 1 and PID 2: keys keep them apart
+    fn two_nodes() -> ProcessesComponent {
+        let node = |name: &str| ProcessNode {
+            hostname: name.to_string(),
+            address: String::new(),
+        };
+        let mut comp = ProcessesComponent::new("test".into(), vec![node("n1"), node("n2")]);
+        let procs = [
+            (0, process(1, 0, "init", 10)),
+            (0, process(2, 1, "kubelet", 300)),
+            (1, process(1, 0, "init", 20)),
+            (1, process(2, 1, "etcd", 200)),
+        ];
+        comp.state.set_data(ProcessesData {
+            processes: procs
+                .into_iter()
+                .map(|(node, info)| NodeProcess { node, info })
+                .collect(),
+            nodes: vec![NodeStats::default(), NodeStats::default()],
+            ..Default::default()
+        });
+        comp.sort_by = SortBy::Mem;
+        comp.resort();
+        comp
+    }
+
+    fn listed(comp: &ProcessesComponent) -> Vec<(String, i32, usize)> {
+        let data = comp.data().unwrap();
+        data.display_entries
+            .iter()
+            .map(|e| {
+                let p = &data.processes[e.process_idx];
+                (comp.node_name(p.node).to_string(), p.pid, e.depth)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merges_nodes_and_sorts_across_them() {
+        let comp = two_nodes();
+        assert_eq!(
+            listed(&comp),
+            vec![
+                ("n1".into(), 2, 0),
+                ("n2".into(), 2, 0),
+                ("n2".into(), 1, 0),
+                ("n1".into(), 1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_keeps_each_node_separate() {
+        let mut comp = two_nodes();
+        comp.tree_view = true;
+        comp.rebuild_display_list();
+        // Each init has only its own node's child, despite equal PIDs
+        assert_eq!(
+            listed(&comp),
+            vec![
+                ("n2".into(), 1, 0),
+                ("n2".into(), 2, 1),
+                ("n1".into(), 1, 0),
+                ("n1".into(), 2, 1),
+            ]
+        );
+
+        comp.tree_root = Some((1, 1));
+        comp.rebuild_display_list();
+        assert_eq!(
+            listed(&comp),
+            vec![("n2".into(), 1, 0), ("n2".into(), 2, 1)]
+        );
+    }
+
+    #[test]
+    fn filter_matches_node_name() {
+        let mut comp = two_nodes();
+        comp.filter = Some("N2".into());
+        comp.apply_filter();
+        assert!(listed(&comp).iter().all(|(node, _, _)| node == "n2"));
+        assert_eq!(listed(&comp).len(), 2);
     }
 }

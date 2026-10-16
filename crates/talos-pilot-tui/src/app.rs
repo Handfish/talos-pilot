@@ -25,6 +25,7 @@ enum RefreshJob {
     Lifecycle(JoinHandle<LifecycleComponent>),
     Workloads(JoinHandle<WorkloadHealthComponent>),
     Storage(JoinHandle<StorageComponent>),
+    Processes(JoinHandle<ProcessesComponent>),
 }
 
 impl RefreshJob {
@@ -35,6 +36,7 @@ impl RefreshJob {
             RefreshJob::Lifecycle(h) => h.is_finished(),
             RefreshJob::Workloads(h) => h.is_finished(),
             RefreshJob::Storage(h) => h.is_finished(),
+            RefreshJob::Processes(h) => h.is_finished(),
         }
     }
 
@@ -45,6 +47,7 @@ impl RefreshJob {
             RefreshJob::Lifecycle(h) => h.abort(),
             RefreshJob::Workloads(h) => h.abort(),
             RefreshJob::Storage(h) => h.abort(),
+            RefreshJob::Processes(h) => h.abort(),
         }
     }
 }
@@ -711,6 +714,11 @@ impl App {
                     c.adopt_refresh(r);
                 }
             }
+            RefreshJob::Processes(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.processes, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
         }
     }
 
@@ -988,10 +996,13 @@ impl App {
                         }
                     }
                     View::Processes => {
-                        if let Some(processes) = &mut self.processes
-                            && let Err(e) = processes.refresh().await
+                        // Several nodes, each call bounded at 10s: refresh off
+                        // the event loop so a slow node can't freeze the UI
+                        if self.refresh_job.is_none()
+                            && let Some(processes) = &self.processes
                         {
-                            processes.set_error(e.to_string());
+                            self.refresh_job =
+                                Some(RefreshJob::Processes(spawn_refresh!(processes)));
                         }
                     }
                     View::Network => {
@@ -1184,27 +1195,19 @@ impl App {
                 self.etcd = Some(etcd);
                 self.view = View::Etcd;
             }
-            Action::ShowProcesses(hostname, address) => {
-                // Switch to processes view for a node
-                tracing::info!(
-                    "ShowProcesses: hostname='{}', address='{}'",
-                    hostname,
-                    address
-                );
+            Action::ShowProcesses(title, nodes) => {
+                self.cancel_refresh_job();
+                tracing::info!("ShowProcesses: '{}' ({} node(s))", title, nodes.len());
 
-                // Create processes component
-                let mut processes = ProcessesComponent::new(hostname, address.clone());
-
-                // Set the client and refresh data
-                if let Some(client) = self.cluster.client() {
-                    // Create a client configured for this specific node
-                    let node_client = client.with_node(&address);
-                    tracing::info!("Created node client for address: '{}'", address);
-                    processes.set_client(node_client);
-                    if let Err(e) = processes.refresh().await {
-                        tracing::error!("Process refresh error: {:?}", e);
-                        processes.set_error(e.to_string());
+                let mut processes = ProcessesComponent::new(title, nodes);
+                match self.cluster.client() {
+                    Some(client) => {
+                        processes.set_client(client.clone());
+                        // First load in the background; the view shows
+                        // "Loading processes..." until it lands
+                        self.refresh_job = Some(RefreshJob::Processes(spawn_refresh!(processes)));
                     }
+                    None => processes.set_error("Not connected".to_string()),
                 }
 
                 self.processes = Some(processes);

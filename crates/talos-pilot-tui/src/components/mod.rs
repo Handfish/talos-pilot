@@ -29,7 +29,7 @@ pub use logs::LogsComponent;
 pub use multi_logs::MultiLogsComponent;
 pub use network::NetworkStatsComponent;
 pub use node_operations::NodeOperationsComponent;
-pub use processes::ProcessesComponent;
+pub use processes::{ProcessNode, ProcessesComponent};
 pub use rolling_operations::RollingOperationsComponent;
 pub use security::SecurityComponent;
 pub use storage::StorageComponent;

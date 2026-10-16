@@ -1,8 +1,8 @@
 //! Cluster component - displays cluster overview with nodes
 
 use crate::action::Action;
-use crate::components::Component;
 use crate::components::diagnostics::k8s;
+use crate::components::{Component, ProcessNode};
 use crate::reachability::prefer_reachable_addresses;
 use crate::zfs::{ZfsPool, fetch_zfs_pools};
 use color_eyre::Result;
@@ -993,6 +993,32 @@ impl ClusterComponent {
         }
     }
 
+    /// Processes view for the selection: the selected node, or every online
+    /// node under the selected cluster / control plane / workers header
+    fn processes_action(&self) -> Option<Action> {
+        let (cluster_idx, names) = self.selected_nodes()?;
+        let cluster = self.clusters.get(cluster_idx)?;
+        let nodes: Vec<ProcessNode> = names
+            .into_iter()
+            .filter(|name| !cluster.offline.contains_key(name))
+            .map(|name| ProcessNode {
+                address: cluster
+                    .node_ips
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone()),
+                hostname: name,
+            })
+            .collect();
+        let title = match &self.selected_item {
+            NodeListItem::ClusterHeader(_) => cluster.name.clone(),
+            NodeListItem::ControlPlaneHeader(_) => format!("{} control plane", cluster.name),
+            NodeListItem::WorkersHeader(_) => format!("{} workers", cluster.name),
+            _ => nodes.first()?.hostname.clone(),
+        };
+        (!nodes.is_empty()).then_some(Action::ShowProcesses(title, nodes))
+    }
+
     /// Whether a node is a control plane node (see `ClusterData::is_controlplane`)
     fn node_is_controlplane(&self, cluster_idx: usize, node: &str) -> bool {
         self.clusters
@@ -1852,18 +1878,7 @@ impl ClusterComponent {
                     Ok(None)
                 }
             }
-            NavMenuItem::Processes => {
-                if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self
-                        .node_ips()
-                        .get(&node_name)
-                        .cloned()
-                        .unwrap_or(node_name.clone());
-                    Ok(Some(Action::ShowProcesses(node_name, node_ip)))
-                } else {
-                    Ok(None)
-                }
-            }
+            NavMenuItem::Processes => Ok(self.processes_action()),
             NavMenuItem::Diagnostics => {
                 if let Some(node_name) = self.current_node_name() {
                     let node_ip = self
@@ -2157,18 +2172,7 @@ impl Component for ClusterComponent {
 
             // Direct hotkeys for screens (always work)
             KeyCode::Char('e') => Ok(Some(Action::ShowEtcd)),
-            KeyCode::Char('p') => {
-                if let Some(node_name) = self.current_node_name() {
-                    let node_ip = self
-                        .node_ips()
-                        .get(&node_name)
-                        .cloned()
-                        .unwrap_or(node_name.clone());
-                    Ok(Some(Action::ShowProcesses(node_name, node_ip)))
-                } else {
-                    Ok(None)
-                }
-            }
+            KeyCode::Char('p') => Ok(self.processes_action()),
             KeyCode::Char('n') => {
                 if let Some(node_name) = self.current_node_name() {
                     let node_ip = self
