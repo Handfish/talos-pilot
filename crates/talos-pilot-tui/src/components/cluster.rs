@@ -112,6 +112,39 @@ enum NodeListItem {
     WorkerNode(usize, usize),
 }
 
+/// How long a node that no source lists any more (not in discovery or etcd)
+/// is still shown as offline before it is dropped from the list. Nodes that
+/// discovery or etcd still list stay as offline for as long as they are listed.
+const OFFLINE_NODE_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Upper bound for the per-node Version call that decides whether a node is
+/// online; an unreachable node otherwise waits out apid's ~20s proxy dial.
+const NODE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A known node that did not answer the last refresh (e.g. rebooting)
+#[derive(Debug, Clone)]
+struct OfflineNode {
+    /// When the node first failed to answer
+    since: std::time::Instant,
+    /// Role it had while it was online, used when no source lists it any more
+    controlplane: bool,
+}
+
+/// Version entry standing in for a node that did not answer, so it keeps its
+/// place in the node list
+fn offline_version(node: &str) -> VersionInfo {
+    VersionInfo {
+        node: node.to_string(),
+        version: String::new(),
+        sha: String::new(),
+        built: String::new(),
+        go_version: String::new(),
+        os: String::new(),
+        arch: String::new(),
+        platform: String::new(),
+    }
+}
+
 /// Per-cluster data storage
 #[derive(Clone, Default)]
 struct ClusterData {
@@ -164,6 +197,9 @@ struct ClusterData {
     k8s_client: Option<kube::Client>,
     /// ZFS pools per node name (from OpenEBS ZFSNode resources)
     zfs_pools: HashMap<String, Vec<ZfsPool>>,
+    /// Known nodes that did not answer the last refresh, by node name. They
+    /// stay in `versions` (as placeholders) so they show as offline.
+    offline: HashMap<String, OfflineNode>,
 }
 
 impl ClusterData {
@@ -198,6 +234,17 @@ impl ClusterData {
 
         // Clone client to avoid borrow issues
         let client = client.clone();
+
+        // Nodes shown before this refresh, with address and role, so one that
+        // stops answering (e.g. rebooting) is kept as offline, not dropped.
+        let previous: Vec<(String, String, bool)> = cluster
+            .versions
+            .iter()
+            .filter_map(|v| {
+                let ip = cluster.node_ips.get(&v.node)?.clone();
+                Some((v.node.clone(), ip, cluster.is_controlplane(&v.node)))
+            })
+            .collect();
 
         // First, fetch etcd members via gRPC
         match client.etcd_members().await {
@@ -334,7 +381,7 @@ impl ClusterData {
         }
 
         // Determine which nodes to query
-        let nodes_to_query: Vec<(String, String)> = if !cluster.discovery_members.is_empty() {
+        let mut nodes_to_query: Vec<(String, String)> = if !cluster.discovery_members.is_empty() {
             cluster
                 .discovery_members
                 .iter()
@@ -386,6 +433,36 @@ impl ClusterData {
             Vec::new()
         };
 
+        // Also query etcd members discovery doesn't list (a rebooting control
+        // plane can drop out of discovery while it is still an etcd member) and
+        // recently seen nodes nothing lists any more, so they show as offline.
+        let listed = |nodes: &[(String, String)], name: &str, ip: &str| {
+            nodes.iter().any(|(n, i)| n == name || i == ip)
+        };
+        for m in &cluster.etcd_members {
+            if let Some(ip) = m.ip_address()
+                && !m.hostname.is_empty()
+                && !listed(&nodes_to_query, &m.hostname, &ip)
+            {
+                nodes_to_query.push((m.hostname.clone(), ip));
+            }
+        }
+        for (name, ip, _) in &previous {
+            let expired = cluster
+                .offline
+                .get(name)
+                .is_some_and(|o| o.since.elapsed() > OFFLINE_NODE_GRACE);
+            if !expired && !listed(&nodes_to_query, name, ip) {
+                nodes_to_query.push((name.clone(), ip.clone()));
+            }
+        }
+        for (name, ip) in &nodes_to_query {
+            cluster
+                .node_ips
+                .entry(name.clone())
+                .or_insert_with(|| ip.clone());
+        }
+
         // Query each node
         if !nodes_to_query.is_empty() {
             let mut versions = Vec::new();
@@ -395,15 +472,42 @@ impl ClusterData {
             let mut cpu_info = Vec::new();
             let mut system_stat = Vec::new();
             let mut mounts = Vec::new();
+            let mut offline = HashMap::new();
 
             for (node_name, ip) in &nodes_to_query {
                 let node_client = client.with_node(ip);
 
-                if let Ok(mut nv) = node_client.version().await {
-                    for v in &mut nv {
-                        v.node = node_name.clone();
+                match tokio::time::timeout(NODE_PROBE_TIMEOUT, node_client.version()).await {
+                    Ok(Ok(mut nv)) => {
+                        for v in &mut nv {
+                            v.node = node_name.clone();
+                        }
+                        versions.extend(nv);
                     }
-                    versions.extend(nv);
+                    outcome => {
+                        // Not answering: keep it listed as offline and skip the
+                        // remaining calls, which would only time out as well.
+                        if let Ok(Err(e)) = &outcome {
+                            tracing::debug!("Node {} ({}) is offline: {}", node_name, ip, e);
+                        }
+                        let since = cluster
+                            .offline
+                            .get(node_name)
+                            .map_or_else(std::time::Instant::now, |o| o.since);
+                        let controlplane = previous
+                            .iter()
+                            .find(|(n, _, _)| n == node_name)
+                            .map_or_else(|| cluster.is_controlplane(node_name), |p| p.2);
+                        offline.insert(
+                            node_name.clone(),
+                            OfflineNode {
+                                since,
+                                controlplane,
+                            },
+                        );
+                        versions.push(offline_version(node_name));
+                        continue;
+                    }
                 }
                 if let Ok(mut ns) = node_client.services().await {
                     for s in &mut ns {
@@ -446,6 +550,7 @@ impl ClusterData {
             // Need to re-borrow cluster mutably after async calls
             {
                 cluster.versions = versions;
+                cluster.offline = offline;
                 cluster.services = services;
                 cluster.memory = memory;
                 cluster.load_avg = load_avg;
@@ -480,7 +585,8 @@ impl ClusterData {
         // have versions/etcd/discovery data; a transient failure keeps the
         // previously cached data, so this only trips when there is nothing at all.
         {
-            let has_any_data = !cluster.versions.is_empty()
+            // Offline placeholders don't count: they are nodes that didn't answer
+            let has_any_data = cluster.versions.len() > cluster.offline.len()
                 || !cluster.etcd_members.is_empty()
                 || !cluster.discovery_members.is_empty();
             if has_any_data {
@@ -519,6 +625,37 @@ impl ClusterData {
             Ok(None) => tracing::debug!("ZFS pools unavailable for {}", cluster.name),
             Err(_) => tracing::debug!("ZFS pool query timed out for {}", cluster.name),
         }
+    }
+
+    /// Whether a node is a control plane node.
+    ///
+    /// Discovery `machineType` is authoritative when available; then etcd
+    /// membership (only control planes run etcd), the role remembered for an
+    /// offline node, and finally the etcd service. Keeping these in one place
+    /// ensures the control-plane and worker groups stay complementary.
+    fn is_controlplane(&self, node: &str) -> bool {
+        let key = node.split(':').next().unwrap_or(node);
+        if let Some(member) = self.discovery_members.iter().find(|m| {
+            m.hostname.eq_ignore_ascii_case(node)
+                || m.hostname.eq_ignore_ascii_case(key)
+                || m.addresses.iter().any(|a| a == node || a == key)
+        }) {
+            return member.machine_type.eq_ignore_ascii_case("controlplane");
+        }
+        if self
+            .etcd_members
+            .iter()
+            .any(|m| m.hostname.eq_ignore_ascii_case(key))
+        {
+            return true;
+        }
+        if let Some(offline) = self.offline.get(node) {
+            return offline.controlplane;
+        }
+        self.services
+            .iter()
+            .find(|s| s.node == node)
+            .is_some_and(|s| s.services.iter().any(|svc| svc.id == "etcd"))
     }
 
     /// Addresses known to reach their node: etcd member IPs (etcd peers talk
@@ -807,27 +944,44 @@ impl ClusterComponent {
         }
     }
 
-    /// Whether a node is a control plane node.
-    ///
-    /// Discovery `machineType` is authoritative when available; otherwise we
-    /// fall back to the etcd-service heuristic (only control plane nodes run
-    /// etcd). Keeping these two in one place ensures the control-plane and
-    /// worker groups stay complementary (every node lands in exactly one).
+    /// Whether a node is a control plane node (see `ClusterData::is_controlplane`)
     fn node_is_controlplane(&self, cluster_idx: usize, node: &str) -> bool {
-        if let Some(cluster) = self.clusters.get(cluster_idx) {
-            let key = node.split(':').next().unwrap_or(node);
-            if let Some(member) = cluster.discovery_members.iter().find(|m| {
-                m.hostname.eq_ignore_ascii_case(node)
-                    || m.hostname.eq_ignore_ascii_case(key)
-                    || m.addresses.iter().any(|a| a == node || a == key)
-            }) {
-                return member.machine_type.eq_ignore_ascii_case("controlplane");
-            }
+        self.clusters
+            .get(cluster_idx)
+            .is_some_and(|c| c.is_controlplane(node))
+    }
+
+    /// How long a node has not been answering, or `None` when it is online
+    fn node_offline_for(&self, cluster_idx: usize, node: &str) -> Option<std::time::Duration> {
+        self.clusters
+            .get(cluster_idx)?
+            .offline
+            .get(node)
+            .map(|o| o.since.elapsed())
+    }
+
+    /// Tree row for a node: health symbol and color, plus an "offline" note
+    fn node_row_status(&self, cluster_idx: usize, node: &str) -> (&'static str, Color, String) {
+        if let Some(down) = self.node_offline_for(cluster_idx, node) {
+            return (
+                "○",
+                Color::Red,
+                format!("  offline {}", format_uptime(down.as_secs())),
+            );
         }
-        // Fallback: presence of the etcd service marks a control plane node.
-        self.get_node_services_for(cluster_idx, node)
-            .map(|s| s.iter().any(|svc| svc.id == "etcd"))
-            .unwrap_or(false)
+        let mem_pct = self
+            .get_node_memory_for(cluster_idx, node)
+            .map(|m| m.usage_percent())
+            .unwrap_or(0.0);
+        let svc_healthy = self
+            .get_node_services_for(cluster_idx, node)
+            .map(|services| services.iter().all(|s| s.is_healthy() != Some(false)))
+            .unwrap_or(true);
+        if svc_healthy && mem_pct < 90.0 {
+            ("●", Color::Green, String::new())
+        } else {
+            ("◐", Color::Yellow, String::new())
+        }
     }
 
     /// Get control plane nodes for a cluster (discovery machineType, else etcd service)
@@ -1291,6 +1445,11 @@ impl ClusterComponent {
         let Some(node_ip) = cluster.node_ips.get(&node_name).cloned() else {
             return Ok(());
         };
+        // Offline nodes are re-checked by the cluster refresh; querying one
+        // here would only wait out a timeout.
+        if cluster.offline.contains_key(&node_name) {
+            return Ok(());
+        }
 
         let node_client = client.with_node(&node_ip);
 
@@ -2342,6 +2501,12 @@ impl ClusterComponent {
                         Style::default().dim(),
                     ),
                 ];
+                if !cluster.offline.is_empty() {
+                    cluster_line.push(Span::styled(
+                        format!(" {} offline", cluster.offline.len()),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
                 cluster_line.extend(etcd_spans);
                 lines.push(Line::from(cluster_line));
                 mark(&lines, NodeListItem::ClusterHeader(cluster_idx));
@@ -2411,27 +2576,8 @@ impl ClusterComponent {
                             let is_node_selected = self.selected_item
                                 == NodeListItem::ControlPlaneNode(cluster_idx, idx);
 
-                            // Health indicator
-                            let mem_pct = self
-                                .get_node_memory_for(cluster_idx, &v.node)
-                                .map(|m| m.usage_percent())
-                                .unwrap_or(0.0);
-                            let svc_healthy = self
-                                .get_node_services_for(cluster_idx, &v.node)
-                                .map(|services| {
-                                    services.iter().all(|s| s.is_healthy() != Some(false))
-                                })
-                                .unwrap_or(true);
-                            let health_symbol = if svc_healthy && mem_pct < 90.0 {
-                                "●"
-                            } else {
-                                "◐"
-                            };
-                            let health_color = if svc_healthy && mem_pct < 90.0 {
-                                Color::Green
-                            } else {
-                                Color::Yellow
-                            };
+                            let (health_symbol, health_color, offline_note) =
+                                self.node_row_status(cluster_idx, &v.node);
 
                             let selector = if is_node_selected && nodes_focused {
                                 "▸"
@@ -2453,6 +2599,7 @@ impl ClusterComponent {
                                     Style::default().fg(health_color),
                                 ),
                                 Span::styled(node_name, name_style),
+                                Span::styled(offline_note, Style::default().fg(Color::Red).dim()),
                             ]));
                             mark(&lines, NodeListItem::ControlPlaneNode(cluster_idx, idx));
                         }
@@ -2499,27 +2646,8 @@ impl ClusterComponent {
                             let is_node_selected =
                                 self.selected_item == NodeListItem::WorkerNode(cluster_idx, idx);
 
-                            // Health indicator
-                            let mem_pct = self
-                                .get_node_memory_for(cluster_idx, &v.node)
-                                .map(|m| m.usage_percent())
-                                .unwrap_or(0.0);
-                            let svc_healthy = self
-                                .get_node_services_for(cluster_idx, &v.node)
-                                .map(|services| {
-                                    services.iter().all(|s| s.is_healthy() != Some(false))
-                                })
-                                .unwrap_or(true);
-                            let health_symbol = if svc_healthy && mem_pct < 90.0 {
-                                "●"
-                            } else {
-                                "◐"
-                            };
-                            let health_color = if svc_healthy && mem_pct < 90.0 {
-                                Color::Green
-                            } else {
-                                Color::Yellow
-                            };
+                            let (health_symbol, health_color, offline_note) =
+                                self.node_row_status(cluster_idx, &v.node);
 
                             let selector = if is_node_selected && nodes_focused {
                                 "▸"
@@ -2541,6 +2669,7 @@ impl ClusterComponent {
                                     Style::default().fg(health_color),
                                 ),
                                 Span::styled(node_name, name_style),
+                                Span::styled(offline_note, Style::default().fg(Color::Red).dim()),
                             ]));
                             mark(&lines, NodeListItem::WorkerNode(cluster_idx, idx));
                         }
@@ -2685,6 +2814,35 @@ impl ClusterComponent {
                 } else {
                     "worker"
                 };
+
+                // Offline: nothing current to show; say so in the Uptime column
+                if let Some(down) = self.node_offline_for(cluster_idx, node) {
+                    let none = || Cell::from(Span::styled("-", dim));
+                    let red = Style::default().fg(Color::Red);
+                    let mut cells = vec![
+                        Cell::from(Span::styled(node.clone(), red)),
+                        Cell::from(Span::styled(role, dim)),
+                        none(),
+                        none(),
+                    ];
+                    if has_zfs {
+                        cells.push(none());
+                    }
+                    cells.push(none());
+                    if wide {
+                        cells.push(none());
+                    }
+                    cells.extend([
+                        Cell::from(Span::styled("offline", red)),
+                        Cell::from(Span::styled("✗", red)),
+                        none(),
+                        Cell::from(Span::styled(
+                            format!("down {}", format_uptime(down.as_secs())),
+                            dim,
+                        )),
+                    ]);
+                    return Row::new(cells);
+                }
 
                 let mem = match self.get_node_memory_for(cluster_idx, node) {
                     Some(m) => {
@@ -2874,6 +3032,10 @@ impl ClusterComponent {
             .iter()
             .map(|n| self.get_node_services_for(cluster_idx, n))
             .collect();
+        let offline: Vec<bool> = nodes
+            .iter()
+            .map(|n| self.node_offline_for(cluster_idx, n).is_some())
+            .collect();
 
         let mut ids: Vec<&str> = per_node
             .iter()
@@ -2909,8 +3071,9 @@ impl ClusterComponent {
                     Style::default().fg(Color::White)
                 };
                 let mut cells = vec![Cell::from(Span::styled(id.to_string(), name_style))];
-                cells.extend(per_node.iter().map(|services| {
+                cells.extend(per_node.iter().zip(&offline).map(|(services, &offline)| {
                     let (symbol, style) = match services {
+                        None if offline => ("-", dim),
                         None => ("…", dim),
                         Some(_) => match find(*services, id) {
                             None => ("·", dim),
@@ -3169,15 +3332,48 @@ impl ClusterComponent {
             node_name_str.clone()
         };
         let node_ip = self.node_ips().get(&node_name).cloned().unwrap_or_default();
-        let role = if self
-            .get_node_services(&node_name)
-            .map(|s| s.iter().any(|svc| svc.id == "etcd"))
-            .unwrap_or(false)
-        {
+        let role = if self.node_is_controlplane(cluster_idx, &node_name) {
             "controlplane"
         } else {
             "worker"
         };
+
+        if let Some(down) = self.node_offline_for(cluster_idx, &node_name) {
+            let block = Block::default()
+                .title(format!(" {} · {} ", node_name, role))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color));
+            let lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Status: ", Style::default().dim()),
+                    Span::styled(
+                        format!("Offline for {}", format_uptime(down.as_secs())),
+                        Style::default().fg(Color::Red).bold(),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  IP:     ", Style::default().dim()),
+                    Span::raw(node_ip),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  The node is not answering the Talos API (rebooting, shut down or",
+                    Style::default().dim(),
+                )),
+                Line::from(Span::styled(
+                    "  unreachable). It is checked on every refresh and comes back by itself.",
+                    Style::default().dim(),
+                )),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
 
         let title = format!(" {} · {} ", node_name, role);
         let block = Block::default()
@@ -3466,6 +3662,45 @@ mod tests {
 
     /// When discovery is unavailable (empty members), fall back to the
     /// etcd-service heuristic so control plane nodes are still identified.
+    #[test]
+    fn offline_nodes_keep_their_group_and_status() {
+        let mut comp = ClusterComponent::default();
+        let offline = |controlplane| OfflineNode {
+            since: std::time::Instant::now(),
+            controlplane,
+        };
+        comp.clusters.push(ClusterData {
+            name: "test".to_string(),
+            versions: vec![ver("cp1"), ver("cp2"), ver("cp3"), ver("w1"), ver("w2")],
+            services: vec![services_with("cp1", &["etcd"])],
+            // cp2 left discovery while rebooting but is still an etcd member
+            etcd_members: vec![EtcdMemberInfo {
+                id: 2,
+                hostname: "cp2".to_string(),
+                peer_urls: vec!["https://10.0.0.2:2380".to_string()],
+                client_urls: Vec::new(),
+                is_learner: false,
+            }],
+            offline: HashMap::from([
+                ("cp2".to_string(), offline(false)),
+                ("cp3".to_string(), offline(true)),
+                ("w2".to_string(), offline(false)),
+            ]),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            names(&comp.controlplane_nodes_for(0)),
+            vec!["cp1", "cp2", "cp3"]
+        );
+        assert_eq!(names(&comp.worker_nodes_for(0)), vec!["w1", "w2"]);
+
+        let (symbol, color, note) = comp.node_row_status(0, "cp3");
+        assert_eq!((symbol, color), ("○", Color::Red));
+        assert!(note.contains("offline"), "{note}");
+        assert_eq!(comp.node_row_status(0, "w1").0, "●");
+    }
+
     #[test]
     fn falls_back_to_etcd_service_without_discovery() {
         let mut comp = ClusterComponent::default();
