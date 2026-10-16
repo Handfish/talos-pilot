@@ -21,6 +21,22 @@ use talos_rs::{
     VersionInfo, get_discovery_members_with_retry,
 };
 
+/// The value occurring most often (ties go to the first seen), or `None` if empty
+fn most_common<'a>(values: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for v in values {
+        match counts.iter_mut().find(|(c, _)| *c == v) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((v, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .rev()
+        .max_by_key(|(_, n)| *n)
+        .map(|(v, _)| v)
+}
+
 /// Simple etcd status for header display
 #[derive(Debug, Clone, Default)]
 struct EtcdSummary {
@@ -197,6 +213,8 @@ struct ClusterData {
     k8s_client: Option<kube::Client>,
     /// ZFS pools per node name (from OpenEBS ZFSNode resources)
     zfs_pools: HashMap<String, Vec<ZfsPool>>,
+    /// Kubelet version per lowercased Kubernetes node name
+    kubelet_versions: HashMap<String, String>,
     /// Known nodes that did not answer the last refresh, by node name. They
     /// stay in `versions` (as placeholders) so they show as offline.
     offline: HashMap<String, OfflineNode>,
@@ -604,9 +622,10 @@ impl ClusterData {
 
         let cp_ip = cluster.control_plane_ip();
 
-        // ZFS pool capacity. Bounded so an unreachable kube-apiserver can't
-        // stall the refresh; on failure the previous values are kept.
-        let zfs = tokio::time::timeout(ZFS_QUERY_TIMEOUT, async {
+        // ZFS pool capacity and kubelet versions from the Kubernetes API.
+        // Bounded so an unreachable kube-apiserver can't stall the refresh; on
+        // failure the previous values are kept.
+        let k8s_data = tokio::time::timeout(K8S_QUERY_TIMEOUT, async {
             if cluster.k8s_client.is_none() {
                 cluster.k8s_client =
                     k8s::create_k8s_client_with_source(&client, cp_ip.as_deref(), None)
@@ -614,16 +633,28 @@ impl ClusterData {
                         .ok()
                         .map(|(client, _)| client);
             }
-            match &cluster.k8s_client {
-                Some(k8s) => fetch_zfs_pools(k8s).await.ok(),
-                None => None,
-            }
+            let k8s = cluster.k8s_client.as_ref()?;
+            Some(tokio::join!(
+                fetch_zfs_pools(k8s),
+                fetch_kubelet_versions(k8s)
+            ))
         })
         .await;
-        match zfs {
-            Ok(Some(pools)) => cluster.zfs_pools = pools,
-            Ok(None) => tracing::debug!("ZFS pools unavailable for {}", cluster.name),
-            Err(_) => tracing::debug!("ZFS pool query timed out for {}", cluster.name),
+        match k8s_data {
+            Ok(Some((zfs, kubelets))) => {
+                match zfs {
+                    Ok(pools) => cluster.zfs_pools = pools,
+                    Err(e) => tracing::debug!("ZFS pools unavailable for {}: {}", cluster.name, e),
+                }
+                match kubelets {
+                    Ok(versions) => cluster.kubelet_versions = versions,
+                    Err(e) => {
+                        tracing::debug!("Kubelet versions unavailable for {}: {}", cluster.name, e)
+                    }
+                }
+            }
+            Ok(None) => tracing::debug!("Kubernetes API unavailable for {}", cluster.name),
+            Err(_) => tracing::debug!("Kubernetes query timed out for {}", cluster.name),
         }
     }
 
@@ -855,8 +886,26 @@ fn memory_color(pct: f32) -> Color {
     }
 }
 
-/// Upper bound for the kube-apiserver ZFS pool query in a cluster refresh
-const ZFS_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Upper bound for the kube-apiserver queries (ZFS pools, kubelet versions)
+/// in a cluster refresh
+const K8S_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Kubelet version of every Kubernetes node, keyed by lowercased node name
+async fn fetch_kubelet_versions(
+    client: &kube::Client,
+) -> Result<HashMap<String, String>, kube::Error> {
+    let nodes: kube::Api<k8s_openapi::api::core::v1::Node> = kube::Api::all(client.clone());
+    Ok(nodes
+        .list(&kube::api::ListParams::default())
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|node| {
+            let version = node.status?.node_info?.kubelet_version;
+            Some((node.metadata.name?.to_lowercase(), version))
+        })
+        .collect())
+}
 
 /// Bytes to GiB, for display
 fn gib(bytes: u64) -> f64 {
@@ -1613,6 +1662,26 @@ impl ClusterComponent {
     }
 
     /// Get CPU info for a node in the active cluster
+    /// Talos version a node reported (none for an offline placeholder)
+    fn get_node_talos_version_for(&self, cluster_idx: usize, node_name: &str) -> Option<&str> {
+        self.clusters
+            .get(cluster_idx)?
+            .versions
+            .iter()
+            .find(|v| v.node == node_name && !v.version.is_empty())
+            .map(|v| v.version.as_str())
+    }
+
+    /// Kubelet version from the Kubernetes Node object of the same name
+    fn get_node_kubelet_version_for(&self, cluster_idx: usize, node_name: &str) -> Option<&str> {
+        let key = node_name.split(':').next().unwrap_or(node_name);
+        self.clusters
+            .get(cluster_idx)?
+            .kubelet_versions
+            .get(&key.to_lowercase())
+            .map(String::as_str)
+    }
+
     fn get_node_cpu_info(&self, node_name: &str) -> Option<&NodeCpuInfo> {
         self.get_node_cpu_info_for(self.active_cluster, node_name)
     }
@@ -2806,6 +2875,27 @@ impl ClusterComponent {
             .iter()
             .any(|n| !self.get_node_zfs_pools_for(cluster_idx, n).is_empty());
 
+        // A version differing from the group's most common one is highlighted,
+        // which makes a partly rolled-out upgrade stand out.
+        let talos_common = most_common(
+            nodes
+                .iter()
+                .filter_map(|n| self.get_node_talos_version_for(cluster_idx, n)),
+        );
+        let k8s_common = most_common(
+            nodes
+                .iter()
+                .filter_map(|n| self.get_node_kubelet_version_for(cluster_idx, n)),
+        );
+        let version_cell = |version: Option<&str>, common: Option<&str>| match version {
+            Some(v) if Some(v) == common => Cell::from(v.to_string()),
+            Some(v) => Cell::from(Span::styled(
+                v.to_string(),
+                Style::default().fg(Color::Yellow),
+            )),
+            None => Cell::from(Span::styled("-", dim)),
+        };
+
         let rows: Vec<Row> = nodes
             .iter()
             .map(|node| {
@@ -2822,6 +2912,8 @@ impl ClusterComponent {
                     let mut cells = vec![
                         Cell::from(Span::styled(node.clone(), red)),
                         Cell::from(Span::styled(role, dim)),
+                        none(),
+                        none(),
                         none(),
                         none(),
                     ];
@@ -2947,6 +3039,14 @@ impl ClusterComponent {
                         Style::default().fg(Color::White),
                     )),
                     Cell::from(Span::styled(role, dim)),
+                    version_cell(
+                        self.get_node_talos_version_for(cluster_idx, node),
+                        talos_common,
+                    ),
+                    version_cell(
+                        self.get_node_kubelet_version_for(cluster_idx, node),
+                        k8s_common,
+                    ),
                     mem,
                     disk,
                 ];
@@ -2962,11 +3062,34 @@ impl ClusterComponent {
             })
             .collect();
 
-        let mut header = vec!["Node", "Role", "Mem", "Disk"];
+        let mut header = vec!["Node", "Role", "Talos", "K8s", "Mem", "Disk"];
         let name_width = nodes.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+        let version_width = |versions: Vec<Option<&str>>| {
+            versions
+                .into_iter()
+                .flatten()
+                .map(|v| v.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(5) as u16
+        };
+        let talos_width = version_width(
+            nodes
+                .iter()
+                .map(|n| self.get_node_talos_version_for(cluster_idx, n))
+                .collect(),
+        );
+        let k8s_width = version_width(
+            nodes
+                .iter()
+                .map(|n| self.get_node_kubelet_version_for(cluster_idx, n))
+                .collect(),
+        );
         let mut widths = vec![
             Constraint::Length(name_width.max(4) as u16),
             Constraint::Length(6),
+            Constraint::Length(talos_width),
+            Constraint::Length(k8s_width),
             Constraint::Length(9),
             Constraint::Length(14),
         ];
@@ -3397,6 +3520,20 @@ impl ClusterComponent {
             Span::styled(&node_ip, Style::default().fg(Color::DarkGray)),
         ])];
 
+        // Talos and Kubernetes (kubelet) versions
+        let mut version_spans = Vec::new();
+        if let Some(v) = self.get_node_talos_version_for(cluster_idx, &node_name) {
+            version_spans.push(Span::styled(" Talos: ", Style::default().dim()));
+            version_spans.push(Span::raw(v.to_string()));
+        }
+        if let Some(v) = self.get_node_kubelet_version_for(cluster_idx, &node_name) {
+            version_spans.push(Span::styled("  K8s: ", Style::default().dim()));
+            version_spans.push(Span::raw(v.to_string()));
+        }
+        if !version_spans.is_empty() {
+            resource_lines.push(Line::from(version_spans));
+        }
+
         // Memory bar
         if let Some(mem) = self.get_node_memory(&node_name) {
             let pct = mem.usage_percent();
@@ -3699,6 +3836,14 @@ mod tests {
         assert_eq!((symbol, color), ("○", Color::Red));
         assert!(note.contains("offline"), "{note}");
         assert_eq!(comp.node_row_status(0, "w1").0, "●");
+    }
+
+    #[test]
+    fn most_common_prefers_majority_then_first_seen() {
+        let v = ["v1.11.2", "v1.11.3", "v1.11.2"];
+        assert_eq!(most_common(v.into_iter()), Some("v1.11.2"));
+        assert_eq!(most_common(["a", "b"].into_iter()), Some("a"));
+        assert_eq!(most_common(std::iter::empty()), None);
     }
 
     #[test]
