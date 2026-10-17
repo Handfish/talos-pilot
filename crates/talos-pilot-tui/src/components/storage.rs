@@ -60,6 +60,7 @@ pub struct StorageData {
 }
 
 /// Storage component for viewing disk and volume information
+#[derive(Clone)]
 pub struct StorageComponent {
     /// Async state wrapping all storage data
     state: AsyncState<StorageData>,
@@ -122,7 +123,12 @@ impl StorageComponent {
         };
 
         Self {
-            state: AsyncState::with_data(initial_data),
+            // Loading until the first (background) refresh lands
+            state: {
+                let mut state = AsyncState::with_data(initial_data);
+                state.start_loading();
+                state
+            },
             view_mode: StorageViewMode::Disks,
             disk_table_state,
             volume_table_state,
@@ -585,7 +591,12 @@ impl Component for StorageComponent {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
         // Check loading state
-        if self.state.is_loading() && !self.state.has_data() {
+        if self.state.is_loading()
+            && self
+                .state
+                .data()
+                .is_none_or(|d| d.disks.is_empty() && d.volumes.is_empty())
+        {
             let loading = Paragraph::new("Loading storage info...")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(loading, area);
@@ -630,5 +641,11 @@ impl Component for StorageComponent {
         frame.render_widget(help_paragraph, chunks[2]);
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for StorageComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        self.state = refreshed.state;
     }
 }

@@ -8,6 +8,7 @@ use crate::components::diagnostics::k8s::{
     KubeconfigSource, PdbHealthInfo, PodHealthInfo, check_pdb_health, check_pod_health,
     create_k8s_client_with_source, discovery_members_via_k8s,
 };
+use crate::reachability::prefer_reachable_addresses;
 use crate::ui_ext::HealthIndicatorExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -196,6 +197,7 @@ pub struct LifecycleData {
 }
 
 /// Lifecycle component for viewing version and lifecycle status
+#[derive(Clone)]
 pub struct LifecycleComponent {
     /// Async state wrapping all lifecycle data
     state: AsyncState<LifecycleData>,
@@ -408,6 +410,12 @@ impl LifecycleComponent {
             // table covers workers, not just the endpoint the base client
             // targets. Keep the previously fetched data if the roster query
             // yields nothing (graceful degradation).
+            let hints: Vec<String> = client
+                .etcd_members()
+                .await
+                .map(|ms| ms.iter().filter_map(|m| m.ip_address()).collect())
+                .unwrap_or_default();
+            prefer_reachable_addresses(&client, &mut data.discovery_members, &hints).await;
             let (roster_versions, roster_times) =
                 enumerate_roster_node_info(&client, &data.discovery_members).await;
             if !roster_versions.is_empty() {
@@ -416,27 +424,36 @@ impl LifecycleComponent {
             }
         }
 
+        // Fetch each node's config hash for drift detection, concurrently and
+        // in this cluster's context. Resolve the IP from the roster so this
+        // still works when the node is named by hostname (e.g. workers
+        // enumerated via the Kubernetes API).
+        let talos_context = (!context_name.is_empty()).then_some(context_name.as_str());
+        let config_path = self.config_path.as_deref();
+        let config_hashes: Vec<Option<String>> =
+            futures::future::join_all(data.versions.iter().map(|v| {
+                let node_addr = roster_ip_for(&data.discovery_members, &v.node);
+                async move {
+                    talos_rs::get_machine_config_for_node(talos_context, &node_addr, config_path)
+                        .await
+                        .ok()
+                        .map(|config| config.version)
+                }
+            }))
+            .await;
+
         // Build node statuses combining version and time info
-        // Fetch config hash for each node individually for drift detection
         let statuses: Vec<NodeStatus> = data
             .versions
             .iter()
-            .map(|v| {
+            .zip(config_hashes)
+            .map(|(v, node_config_hash)| {
                 // Look up time sync status for this node
                 let time_synced = data
                     .time_info
                     .iter()
                     .find(|t| t.node == v.node)
                     .map(|t| t.synced);
-
-                // Get config hash for this specific node. Resolve the IP from
-                // the roster so this still works when the node is named by
-                // hostname (e.g. workers enumerated via the Kubernetes API).
-                let node_addr = roster_ip_for(&data.discovery_members, &v.node);
-                let node_config_hash = match talos_rs::get_machine_config(&node_addr) {
-                    Ok(config) => Some(config.version),
-                    Err(_) => None,
-                };
 
                 NodeStatus {
                     hostname: v.node.clone(),
@@ -1160,6 +1177,27 @@ impl Component for LifecycleComponent {
         self.draw_footer(frame, chunks[5]);
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for LifecycleComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        // The node selection lives inside the data; carry the live one over
+        let selected = self.data().map(|d| d.node_statuses.selected_index());
+        self.state = refreshed.state;
+        self.k8s_client = refreshed.k8s_client;
+        self.k8s_source = refreshed.k8s_source;
+        let selected = match (self.state.data_mut(), selected) {
+            (Some(data), Some(idx)) => {
+                data.node_statuses.select(idx);
+                Some(data.node_statuses.selected_index())
+            }
+            (Some(data), None) => Some(data.node_statuses.selected_index()),
+            _ => None,
+        };
+        if let Some(idx) = selected {
+            self.table_state.select(Some(idx));
+        }
     }
 }
 

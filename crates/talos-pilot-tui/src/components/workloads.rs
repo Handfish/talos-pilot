@@ -6,13 +6,17 @@
 //! - Health classification per namespace
 //!
 //! Philosophy: Show actual K8s API state. Group by namespace with issues first.
+//!
+//! The view can be scoped to a set of nodes (a node, or a cluster's control
+//! plane / workers): it then lists only the workloads with pods on those nodes,
+//! with how many of their pods there are ready, and only those nodes' pods.
 
 use crate::action::Action;
 use crate::components::Component;
 use crate::ui_ext::HealthIndicatorExt;
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
-use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
+use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Client,
@@ -25,7 +29,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use talos_pilot_core::constants::HIGH_RESTART_THRESHOLD;
 use talos_pilot_core::{AsyncState, HasHealth, HealthIndicator};
@@ -115,9 +119,11 @@ pub struct WorkloadInfo {
     pub desired: i32,
     pub health: HealthState,
     pub issues: Vec<String>,
+    /// Ready / total pods on the scoped nodes (`None` for the whole cluster)
+    pub here: Option<(i32, i32)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkloadKind {
     Deployment,
     StatefulSet,
@@ -157,6 +163,41 @@ pub struct NamespaceSummary {
     pub healthy_workloads: usize,
 }
 
+/// A workload's namespace, kind and name
+type WorkloadKey = (String, WorkloadKind, String);
+
+/// Workload that controls a pod, found through its controller owner reference
+/// (a ReplicaSet resolves to its Deployment via `rs_owners`)
+fn pod_owner(
+    pod: &Pod,
+    rs_owners: &HashMap<(String, String), String>,
+) -> Option<(WorkloadKind, String)> {
+    let owners = pod.metadata.owner_references.as_ref()?;
+    let owner = owners
+        .iter()
+        .find(|o| o.controller == Some(true))
+        .or_else(|| owners.first())?;
+    match owner.kind.as_str() {
+        "StatefulSet" => Some((WorkloadKind::StatefulSet, owner.name.clone())),
+        "DaemonSet" => Some((WorkloadKind::DaemonSet, owner.name.clone())),
+        "ReplicaSet" => {
+            let ns = pod.metadata.namespace.clone().unwrap_or_default();
+            rs_owners
+                .get(&(ns, owner.name.clone()))
+                .map(|deploy| (WorkloadKind::Deployment, deploy.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a pod's `Ready` condition is true
+fn pod_is_ready(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+}
+
 /// Auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 10;
 
@@ -176,12 +217,21 @@ pub struct WorkloadsData {
 }
 
 /// Workload Health Component
+#[derive(Clone)]
 pub struct WorkloadHealthComponent {
     /// Async state for loaded data
     state: AsyncState<WorkloadsData>,
 
     /// Kubernetes client
     k8s_client: Option<Client>,
+    /// Where to get a Kubernetes client when there is none yet: the Talos
+    /// client and a control plane node to fetch the kubeconfig from
+    k8s_source: Option<(talos_rs::TalosClient, Option<String>)>,
+
+    /// What the view covers, e.g. the cluster or node name
+    title: String,
+    /// Nodes the view is limited to (`None` for the whole cluster)
+    scope: Option<HashSet<String>>,
 
     /// Selected namespace index
     selected_namespace: usize,
@@ -197,20 +247,18 @@ pub struct WorkloadHealthComponent {
     auto_refresh: bool,
 }
 
-impl Default for WorkloadHealthComponent {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WorkloadHealthComponent {
-    pub fn new() -> Self {
+    /// Workloads view titled `title`, limited to pods on `nodes` when given
+    pub fn new(title: String, nodes: Option<Vec<String>>) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
 
         Self {
             state: AsyncState::new(),
             k8s_client: None,
+            k8s_source: None,
+            title,
+            scope: nodes.map(|n| n.into_iter().collect()),
             selected_namespace: 0,
             selected_item: 0,
             drill_down: false,
@@ -229,6 +277,17 @@ impl WorkloadHealthComponent {
         self.k8s_client = Some(client);
     }
 
+    /// Create the Kubernetes client during the (background) refresh, from
+    /// the kubeconfig of `cp_ip`, so a slow fetch never blocks the UI
+    pub fn set_k8s_source(&mut self, talos_client: talos_rs::TalosClient, cp_ip: Option<String>) {
+        self.k8s_source = Some((talos_client, cp_ip));
+    }
+
+    /// Show the loading state until the first background refresh lands
+    pub fn start_loading(&mut self) {
+        self.state.start_loading();
+    }
+
     /// Set an error message
     pub fn set_error(&mut self, error: String) {
         self.state.set_error(error);
@@ -236,6 +295,37 @@ impl WorkloadHealthComponent {
 
     /// Refresh workload data from the cluster
     pub async fn refresh(&mut self) -> Result<()> {
+        if self.k8s_client.is_none()
+            && let Some((talos_client, cp_ip)) = &self.k8s_source
+        {
+            // Pin to a control plane node of the launched context so we read
+            // the right cluster's workloads, not whatever an ambient
+            // KUBECONFIG points at.
+            let created = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                crate::components::diagnostics::k8s::create_k8s_client_with_source(
+                    talos_client,
+                    cp_ip.as_deref(),
+                    None,
+                ),
+            )
+            .await;
+            match created {
+                Ok(Ok((k8s_client, _source))) => self.k8s_client = Some(k8s_client),
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to create K8s client: {:?}", e);
+                    self.set_error(format!("Failed to connect to Kubernetes: {}", e));
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.set_error(
+                        "Failed to connect to Kubernetes: timed out fetching the kubeconfig"
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+            }
+        }
         let Some(client) = &self.k8s_client else {
             self.set_error("No Kubernetes client configured".to_string());
             return Ok(());
@@ -248,6 +338,8 @@ impl WorkloadHealthComponent {
         let statefulsets_api: Api<StatefulSet> = Api::all(client.clone());
         let daemonsets_api: Api<DaemonSet> = Api::all(client.clone());
         let pods_api: Api<Pod> = Api::all(client.clone());
+        let replicasets_api: Api<ReplicaSet> = Api::all(client.clone());
+        let scope = self.scope.clone();
 
         let list_params = ListParams::default();
         let timeout = std::time::Duration::from_secs(15);
@@ -256,19 +348,31 @@ impl WorkloadHealthComponent {
                 deployments_api.list(&list_params),
                 statefulsets_api.list(&list_params),
                 daemonsets_api.list(&list_params),
-                pods_api.list(&list_params)
+                pods_api.list(&list_params),
+                // Only needed to map a scoped node's pods back to Deployments
+                async {
+                    match &scope {
+                        Some(_) => replicasets_api.list(&list_params).await.map(Some),
+                        None => Ok(None),
+                    }
+                }
             )
         })
         .await;
 
-        let (deployments_result, statefulsets_result, daemonsets_result, pods_result) =
-            match fetch_result {
-                Ok(results) => results,
-                Err(_) => {
-                    self.set_error(format!("Request timed out after {}s", timeout.as_secs()));
-                    return Ok(());
-                }
-            };
+        let (
+            deployments_result,
+            statefulsets_result,
+            daemonsets_result,
+            pods_result,
+            replicasets_result,
+        ) = match fetch_result {
+            Ok(results) => results,
+            Err(_) => {
+                self.set_error(format!("Request timed out after {}s", timeout.as_secs()));
+                return Ok(());
+            }
+        };
 
         // Process results
         let deployments = deployments_result.map_err(|e| {
@@ -286,18 +390,72 @@ impl WorkloadHealthComponent {
             e
         })?;
 
-        let pods = pods_result.map_err(|e| {
+        let mut pods = pods_result.map_err(|e| {
             self.set_error(format!("Failed to fetch pods: {}", e));
             e
         })?;
+
+        let replicasets = replicasets_result.map_err(|e| {
+            self.set_error(format!("Failed to fetch replicasets: {}", e));
+            e
+        })?;
+
+        // Scoped: keep only the pods on the scoped nodes and count, per
+        // workload, how many of them there are ready
+        let placement: Option<HashMap<WorkloadKey, (i32, i32)>> = scope.as_ref().map(|nodes| {
+            pods.items.retain(|p| {
+                p.spec
+                    .as_ref()
+                    .and_then(|s| s.node_name.as_ref())
+                    .is_some_and(|n| nodes.contains(n))
+            });
+            let rs_owners: HashMap<(String, String), String> = replicasets
+                .into_iter()
+                .flat_map(|list| list.items)
+                .filter_map(|rs| {
+                    let deploy = rs
+                        .metadata
+                        .owner_references
+                        .as_ref()?
+                        .iter()
+                        .find(|o| o.kind == "Deployment")?
+                        .name
+                        .clone();
+                    Some((
+                        (rs.metadata.namespace.clone()?, rs.metadata.name.clone()?),
+                        deploy,
+                    ))
+                })
+                .collect();
+            let mut placement = HashMap::new();
+            for pod in &pods.items {
+                if let Some((kind, name)) = pod_owner(pod, &rs_owners) {
+                    let ns = pod.metadata.namespace.clone().unwrap_or_default();
+                    let entry: &mut (i32, i32) = placement.entry((ns, kind, name)).or_default();
+                    entry.0 += i32::from(pod_is_ready(pod));
+                    entry.1 += 1;
+                }
+            }
+            placement
+        });
+        // Pods of a workload on the scoped nodes; `Some(None)` drops the
+        // workload from a scoped view
+        let here = |ns: &str, kind: WorkloadKind, name: &str| -> Option<Option<(i32, i32)>> {
+            match &placement {
+                None => Some(None),
+                Some(p) => p
+                    .get(&(ns.to_string(), kind, name.to_string()))
+                    .map(|c| Some(*c)),
+            }
+        };
 
         // Build namespace map
         let mut ns_map: HashMap<String, NamespaceSummary> = HashMap::new();
 
         // Track counts locally
-        let total_deployments = deployments.items.len();
-        let total_statefulsets = statefulsets.items.len();
-        let total_daemonsets = daemonsets.items.len();
+        let mut total_deployments = 0usize;
+        let mut total_statefulsets = 0usize;
+        let mut total_daemonsets = 0usize;
         let mut total_pods_healthy = 0usize;
         let mut total_pods_degraded = 0usize;
         let mut total_pods_failing = 0usize;
@@ -314,6 +472,10 @@ impl WorkloadHealthComponent {
                 .name
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
+            let Some(here) = here(&ns, WorkloadKind::Deployment, &name) else {
+                continue;
+            };
+            total_deployments += 1;
 
             let status = deploy.status.as_ref();
             let desired = status.and_then(|s| s.replicas).unwrap_or(0);
@@ -330,6 +492,7 @@ impl WorkloadHealthComponent {
                 desired,
                 health,
                 issues,
+                here,
             };
 
             ns_map
@@ -358,6 +521,10 @@ impl WorkloadHealthComponent {
                 .name
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
+            let Some(here) = here(&ns, WorkloadKind::StatefulSet, &name) else {
+                continue;
+            };
+            total_statefulsets += 1;
 
             let status = sts.status.as_ref();
             let desired = status.map(|s| s.replicas).unwrap_or(0);
@@ -373,6 +540,7 @@ impl WorkloadHealthComponent {
                 desired,
                 health,
                 issues,
+                here,
             };
 
             ns_map
@@ -401,6 +569,10 @@ impl WorkloadHealthComponent {
                 .name
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
+            let Some(here) = here(&ns, WorkloadKind::DaemonSet, &name) else {
+                continue;
+            };
+            total_daemonsets += 1;
 
             let status = ds.status.as_ref();
             let desired = status.map(|s| s.desired_number_scheduled).unwrap_or(0);
@@ -416,6 +588,7 @@ impl WorkloadHealthComponent {
                 desired,
                 health,
                 issues,
+                here,
             };
 
             ns_map
@@ -753,8 +926,13 @@ impl WorkloadHealthComponent {
             Color::White
         };
 
+        let scope = match &self.scope {
+            Some(nodes) if nodes.len() == 1 => "On this node: ".to_string(),
+            Some(nodes) => format!("On {} nodes: ", nodes.len()),
+            None => "Summary: ".to_string(),
+        };
         let line = Line::from(vec![
-            Span::raw("Summary: "),
+            Span::raw(scope),
             Span::styled(
                 format!("{}", data.total_deployments),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -884,7 +1062,10 @@ impl WorkloadHealthComponent {
     #[allow(clippy::type_complexity)]
     fn collect_drill_down_data(
         &self,
-    ) -> Option<(String, Vec<(String, String, String, String, String, Color)>)> {
+    ) -> Option<(
+        String,
+        Vec<(String, String, String, String, String, String, Color)>,
+    )> {
         let data = self.data()?;
         let ns = data.namespaces.get(self.selected_namespace)?;
         let title = format!(" {} ", ns.name);
@@ -894,7 +1075,13 @@ impl WorkloadHealthComponent {
         // Add workloads
         for workload in &ns.workloads {
             let (indicator, color) = workload.health.indicator();
-            let status = format!("{}/{} ready", workload.ready, workload.desired);
+            let status = match workload.here {
+                Some((ready, total)) => format!(
+                    "{}/{} ready ({}/{} here)",
+                    workload.ready, workload.desired, ready, total
+                ),
+                None => format!("{}/{} ready", workload.ready, workload.desired),
+            };
             let issue_text = if workload.issues.is_empty() {
                 String::new()
             } else {
@@ -905,6 +1092,7 @@ impl WorkloadHealthComponent {
                 workload.name.clone(),
                 workload.kind.display().to_string(),
                 status,
+                String::new(),
                 issue_text,
                 color,
             ));
@@ -922,6 +1110,7 @@ impl WorkloadHealthComponent {
                 pod.name.clone(),
                 "Pod".to_string(),
                 format!("{} restarts", pod.restarts),
+                pod.node.clone().unwrap_or_else(|| "-".to_string()),
                 issue_text,
                 color,
             ));
@@ -939,23 +1128,26 @@ impl WorkloadHealthComponent {
         // Build rows from collected data
         let rows: Vec<Row> = row_data
             .into_iter()
-            .map(|(indicator, name, kind, status, issue_text, color)| {
+            .map(|(indicator, name, kind, status, node, issue_text, color)| {
                 Row::new(vec![
                     Cell::from(indicator).style(Style::default().fg(color)),
                     Cell::from(name),
                     Cell::from(kind),
                     Cell::from(status),
+                    Cell::from(node),
                     Cell::from(issue_text).style(Style::default().fg(color)),
                 ])
             })
             .collect();
 
+        let status_width = if self.scope.is_some() { 26 } else { 15 };
         let widths = [
             Constraint::Length(3),
-            Constraint::Percentage(40),
+            Constraint::Percentage(35),
             Constraint::Length(12),
-            Constraint::Length(15),
-            Constraint::Percentage(25),
+            Constraint::Length(status_width),
+            Constraint::Length(16),
+            Constraint::Fill(1),
         ];
 
         let header = Row::new(vec![
@@ -963,6 +1155,7 @@ impl WorkloadHealthComponent {
             Cell::from("NAME"),
             Cell::from("KIND"),
             Cell::from("STATUS"),
+            Cell::from("NODE"),
             Cell::from("ISSUE"),
         ])
         .style(Style::default().add_modifier(Modifier::DIM))
@@ -1075,12 +1268,12 @@ impl Component for WorkloadHealthComponent {
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
         // Draw title
         let block = Block::default()
-            .title(" Workload Health ")
+            .title(format!(" Workload Health: {} ", self.title))
             .borders(Borders::ALL);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if self.state.is_loading() {
+        if self.state.is_loading() && !self.state.has_data() {
             let loading =
                 Paragraph::new("Loading workloads...").style(Style::default().fg(Color::DarkGray));
             frame.render_widget(loading, inner);
@@ -1099,8 +1292,12 @@ impl Component for WorkloadHealthComponent {
             .map(|d| !d.namespaces.is_empty())
             .unwrap_or(false);
         if !has_namespaces {
-            let empty =
-                Paragraph::new("No workloads found").style(Style::default().fg(Color::DarkGray));
+            let message = if self.scope.is_some() {
+                "No workloads on these nodes"
+            } else {
+                "No workloads found"
+            };
+            let empty = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
             frame.render_widget(empty, inner);
             return Ok(());
         }
@@ -1124,5 +1321,87 @@ impl Component for WorkloadHealthComponent {
         self.draw_footer(frame, chunks[2]);
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for WorkloadHealthComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        self.state = refreshed.state;
+        if self.k8s_client.is_none() {
+            self.k8s_client = refreshed.k8s_client;
+        }
+        let ns_count = self.data().map(|d| d.namespaces.len()).unwrap_or(0);
+        if ns_count > 0 && self.selected_namespace >= ns_count {
+            self.selected_namespace = 0;
+        }
+        self.table_state.select(Some(self.selected_namespace));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+
+    fn pod_owned_by(kind: &str, name: &str) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                namespace: Some("apps".to_string()),
+                owner_references: Some(vec![OwnerReference {
+                    kind: kind.to_string(),
+                    name: name.to_string(),
+                    controller: Some(true),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pod_owner_resolves_replicasets_to_deployments() {
+        let rs_owners = HashMap::from([(
+            ("apps".to_string(), "web-7d9f".to_string()),
+            "web".to_string(),
+        )]);
+        assert_eq!(
+            pod_owner(&pod_owned_by("ReplicaSet", "web-7d9f"), &rs_owners),
+            Some((WorkloadKind::Deployment, "web".to_string()))
+        );
+        assert_eq!(
+            pod_owner(&pod_owned_by("DaemonSet", "cilium"), &rs_owners),
+            Some((WorkloadKind::DaemonSet, "cilium".to_string()))
+        );
+        assert_eq!(
+            pod_owner(&pod_owned_by("StatefulSet", "db"), &rs_owners),
+            Some((WorkloadKind::StatefulSet, "db".to_string()))
+        );
+        // A ReplicaSet without a Deployment, a Job or no owner: not a workload
+        assert_eq!(
+            pod_owner(&pod_owned_by("ReplicaSet", "bare"), &rs_owners),
+            None
+        );
+        assert_eq!(pod_owner(&pod_owned_by("Job", "backup"), &rs_owners), None);
+        assert_eq!(pod_owner(&Pod::default(), &rs_owners), None);
+    }
+
+    #[test]
+    fn pod_ready_reads_the_ready_condition() {
+        let with_ready = |status: &str| Pod {
+            status: Some(PodStatus {
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_string(),
+                    status: status.to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(pod_is_ready(&with_ready("True")));
+        assert!(!pod_is_ready(&with_ready("False")));
+        assert!(!pod_is_ready(&Pod::default()));
     }
 }

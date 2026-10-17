@@ -19,7 +19,7 @@ use kube::{
     Client,
     api::{Api, ListParams},
 };
-use talos_rs::is_kubespan_enabled;
+use talos_rs::is_kubespan_enabled_for_node;
 
 /// Run Cilium-specific diagnostic checks
 pub async fn run_cilium_checks(
@@ -353,11 +353,12 @@ async fn check_kubespan_compatibility(
 
     // Check if KubeSpan is enabled
     let kubespan_enabled = if let Some(ref endpoint) = ctx.node_endpoint {
-        // Run KubeSpan check in a blocking task since talosctl is synchronous
-        let endpoint = endpoint.clone();
-        tokio::task::spawn_blocking(move || is_kubespan_enabled(&endpoint))
-            .await
-            .unwrap_or(false)
+        is_kubespan_enabled_for_node(
+            ctx.talos_context.as_deref(),
+            endpoint,
+            ctx.config_path.as_deref(),
+        )
+        .await
     } else {
         false
     };

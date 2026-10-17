@@ -29,6 +29,7 @@ fn exec_talosctl(args: &[&str]) -> Result<String, TalosError> {
 async fn exec_talosctl_async(args: &[&str]) -> Result<String, TalosError> {
     let output = tokio::process::Command::new("talosctl")
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(TalosError::Io)?;
@@ -454,6 +455,41 @@ pub async fn apply_config_insecure(
     }
 }
 
+/// Patch a node's machine config using context authentication, rebooting to apply
+///
+/// Executes: talosctl --context <context> [--talosconfig <path>] -n <node> patch machineconfig --mode=reboot -p <patch>
+///
+/// The patch is passed inline rather than via `@file`, so there is no temp file
+/// another local user could swap out before talosctl reads it.
+pub async fn patch_machineconfig_for_node(
+    context: &str,
+    node_ip: &str,
+    config_path: Option<&str>,
+    patch: &str,
+) -> Result<String, TalosError> {
+    let mut args = vec!["--context", context];
+
+    // Add talosconfig path if provided
+    let config_path_string;
+    if let Some(path) = config_path {
+        config_path_string = path.to_string();
+        args.push("--talosconfig");
+        args.push(&config_path_string);
+    }
+
+    args.extend_from_slice(&[
+        "-n",
+        node_ip,
+        "patch",
+        "machineconfig",
+        "--mode=reboot",
+        "-p",
+        patch,
+    ]);
+
+    exec_talosctl_async(&args).await
+}
+
 /// Reboot a node in insecure mode
 ///
 /// Executes: talosctl reboot --insecure -n <endpoint>
@@ -492,21 +528,38 @@ pub fn get_discovery_members(node: &str) -> Result<Vec<DiscoveryMember>, TalosEr
     parse_discovery_members_yaml(&output)
 }
 
+/// Upper bound for one `talosctl get members` run. A request that apid has to
+/// forward to an unreachable node otherwise hangs for its ~20s dial timeout,
+/// which stalls startup since the first refresh runs behind the connect screen.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Host part of a talosconfig endpoint (`host`, `host:port`, `[v6]` or `[v6]:port`).
+fn endpoint_host(endpoint: &str) -> &str {
+    if let Some(rest) = endpoint.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match endpoint.split_once(':') {
+        // A bare IPv6 address has several colons and no port
+        Some((host, port)) if !port.contains(':') => host,
+        _ => endpoint,
+    }
+}
+
 /// Get discovery members for a context (async, non-blocking)
 ///
-/// Executes: talosctl --context <context> -n <node> get members -o yaml
+/// Executes, for each configured endpoint until one succeeds:
+/// talosctl --context <context> -e <endpoint> -n <endpoint> get members -o yaml
 ///
-/// This version uses the context name to get the correct certificates and endpoint,
-/// and uses tokio async process to avoid blocking the runtime.
-/// It extracts a node IP from the context's endpoints to target the query.
+/// Pinning `-e` to the same node as `-n` makes each endpoint answer for itself.
+/// Without it talosctl picks any endpoint, which then has to forward the
+/// request to `-n` — and nodes frequently cannot reach each other's public
+/// endpoint IPs, so that hop hangs until apid's dial timeout.
 ///
 /// If `config_path` is provided, loads config from that path instead of the default.
 pub async fn get_discovery_members_for_context(
     context: &str,
     config_path: Option<&str>,
 ) -> Result<Vec<DiscoveryMember>, TalosError> {
-    // Load config to get an endpoint IP to use as the node target
-    // talosctl requires -n flag if nodes: is not set in the config
     let config = match config_path {
         Some(path) => {
             let path_buf = std::path::PathBuf::from(path);
@@ -519,28 +572,29 @@ pub async fn get_discovery_members_for_context(
         .get(context)
         .ok_or_else(|| TalosError::ContextNotFound(context.to_string()))?;
 
-    // Get the first endpoint and extract the IP (remove port if present)
-    let node_ip = ctx
-        .endpoints
-        .first()
-        .ok_or_else(|| TalosError::NoEndpoints(context.to_string()))?
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_string();
-
-    if node_ip.is_empty() {
-        return Err(TalosError::NoEndpoints(context.to_string()));
+    let mut last_error = TalosError::NoEndpoints(context.to_string());
+    for endpoint in &ctx.endpoints {
+        let host = endpoint_host(endpoint);
+        if host.is_empty() {
+            continue;
+        }
+        match get_discovery_members_for_node_async(context, Some(endpoint), host, config_path).await
+        {
+            Ok(members) => return Ok(members),
+            Err(e) => {
+                tracing::debug!("Discovery via endpoint {} failed: {}", endpoint, e);
+                last_error = e;
+            }
+        }
     }
-
-    get_discovery_members_for_node_async(context, &node_ip, config_path).await
+    Err(last_error)
 }
 
 /// Get discovery members for a specific node IP using context certificates (async).
 ///
 /// This allows querying a specific control plane node directly instead of going through the VIP.
 ///
-/// Executes: talosctl --context <context> [--talosconfig <path>] -n <node> get members -o yaml
+/// Executes: talosctl --context <context> [--talosconfig <path>] [-e <endpoint>] -n <node> get members -o yaml
 ///
 /// The `--talosconfig` flag is essential for users who run with `--config <path>`:
 /// without it talosctl reads the default `~/.talos/config`, where the context
@@ -548,11 +602,20 @@ pub async fn get_discovery_members_for_context(
 /// degrades to control-plane-only (the "worker nodes missing" reports).
 async fn get_discovery_members_for_node_async(
     context: &str,
+    endpoint: Option<&str>,
     node_ip: &str,
     config_path: Option<&str>,
 ) -> Result<Vec<DiscoveryMember>, TalosError> {
-    let args = members_command_args(context, node_ip, config_path);
-    let output = exec_talosctl_async(&args).await?;
+    let args = members_command_args(context, endpoint, node_ip, config_path);
+    let output = tokio::time::timeout(DISCOVERY_TIMEOUT, exec_talosctl_async(&args))
+        .await
+        .map_err(|_| {
+            TalosError::Connection(format!(
+                "talosctl get members for {} timed out after {}s",
+                node_ip,
+                DISCOVERY_TIMEOUT.as_secs()
+            ))
+        })??;
     parse_discovery_members_yaml(&output)
 }
 
@@ -564,6 +627,7 @@ async fn get_discovery_members_for_node_async(
 /// silently degraded the node list to control-plane-only (workers missing).
 fn members_command_args<'a>(
     context: &'a str,
+    endpoint: Option<&'a str>,
     node_ip: &'a str,
     config_path: Option<&'a str>,
 ) -> Vec<&'a str> {
@@ -571,6 +635,10 @@ fn members_command_args<'a>(
     if let Some(path) = config_path {
         args.push("--talosconfig");
         args.push(path);
+    }
+    if let Some(endpoint) = endpoint {
+        args.push("-e");
+        args.push(endpoint);
     }
     args.extend_from_slice(&["-n", node_ip, "get", "members", "-o", "yaml"]);
     args
@@ -625,7 +693,7 @@ pub async fn get_discovery_members_with_retry(
         fastrand::shuffle(&mut shuffled_ips);
 
         for node_ip in shuffled_ips {
-            match get_discovery_members_for_node_async(context, node_ip, config_path).await {
+            match get_discovery_members_for_node_async(context, None, node_ip, config_path).await {
                 Ok(members) => {
                     tracing::debug!(
                         "Successfully fetched discovery members from fallback node {}",
@@ -642,6 +710,175 @@ pub async fn get_discovery_members_with_retry(
     }
 
     Err(last_error.unwrap_or_else(|| TalosError::NoEndpoints(context.to_string())))
+}
+
+/// Network summary for a node, as shown by the Talos dashboard
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeNetworkInfo {
+    /// Node addresses with prefix length, excluding Kubernetes pod addresses
+    pub addresses: Vec<String>,
+    /// Default-route gateways
+    pub gateways: Vec<String>,
+    /// Configured DNS servers
+    pub dns_servers: Vec<String>,
+    /// `NetworkStatus.connectivityReady`, `None` if it could not be read
+    pub connectivity_ready: Option<bool>,
+}
+
+/// Upper bound for each per-node `talosctl get` (see [`get_resource_yaml`])
+const NODE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `talosctl [--context c] get <resource> [id] -o yaml` against one node,
+/// with a timeout.
+///
+/// Always pass the context of the cluster `node_ip` belongs to: without it
+/// talosctl goes through the *current* context's endpoint, which for a node in
+/// another cluster hangs ~20s on apid's proxy dial before failing.
+async fn get_resource_yaml(
+    context: Option<&str>,
+    node_ip: &str,
+    config_path: Option<&str>,
+    resource: &[&str],
+) -> Result<String, TalosError> {
+    let mut args = Vec::new();
+    if let Some(context) = context {
+        args.extend_from_slice(&["--context", context]);
+    }
+    if let Some(path) = config_path {
+        args.extend_from_slice(&["--talosconfig", path]);
+    }
+    args.extend_from_slice(&["-n", node_ip, "get"]);
+    args.extend_from_slice(resource);
+    args.extend_from_slice(&["-o", "yaml"]);
+
+    tokio::time::timeout(NODE_QUERY_TIMEOUT, exec_talosctl_async(&args))
+        .await
+        .map_err(|_| {
+            TalosError::Connection(format!(
+                "talosctl get {} timed out after {}s",
+                resource.join(" "),
+                NODE_QUERY_TIMEOUT.as_secs()
+            ))
+        })?
+}
+
+/// Get KubeSpan peer status for a node in `context` (async, with timeout)
+pub async fn get_kubespan_peers_for_node(
+    context: Option<&str>,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> Result<Vec<KubeSpanPeerStatus>, TalosError> {
+    let output = get_resource_yaml(context, node_ip, config_path, &["kubespanpeerstatus"]).await?;
+    parse_kubespan_peers_yaml(&output)
+}
+
+/// Whether KubeSpan is enabled on a node in `context` (async, with timeout).
+/// Any failure reads as "not enabled", like [`is_kubespan_enabled`].
+pub async fn is_kubespan_enabled_for_node(
+    context: Option<&str>,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> bool {
+    get_resource_yaml(context, node_ip, config_path, &["kubespanconfig"])
+        .await
+        .is_ok_and(|output| kubespan_enabled_in(&output))
+}
+
+/// Get the machine config resource of a node in `context` (async, with timeout)
+pub async fn get_machine_config_for_node(
+    context: Option<&str>,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> Result<MachineConfigInfo, TalosError> {
+    let output = get_resource_yaml(context, node_ip, config_path, &["machineconfig"]).await?;
+    parse_machine_config_yaml(&output)
+}
+
+/// Get the node's addresses, gateways, DNS servers and connectivity status
+///
+/// Executes (concurrently) against `node_ip`:
+/// `get nodeaddress current-no-k8s`, `get routestatus`, `get resolvers`,
+/// `get networkstatus`. Fields whose query fails are left empty / `None`;
+/// an error is returned only if every query fails.
+pub async fn get_node_network_info(
+    context: &str,
+    node_ip: &str,
+    config_path: Option<&str>,
+) -> Result<NodeNetworkInfo, TalosError> {
+    let (addresses, routes, resolvers, status) = tokio::join!(
+        get_resource_yaml(
+            Some(context),
+            node_ip,
+            config_path,
+            &["nodeaddress", "current-no-k8s"]
+        ),
+        get_resource_yaml(Some(context), node_ip, config_path, &["routestatus"]),
+        get_resource_yaml(Some(context), node_ip, config_path, &["resolvers"]),
+        get_resource_yaml(Some(context), node_ip, config_path, &["networkstatus"]),
+    );
+
+    if let (Err(e), Err(_), Err(_), Err(_)) = (&addresses, &routes, &resolvers, &status) {
+        return Err(TalosError::Connection(e.to_string()));
+    }
+
+    Ok(NodeNetworkInfo {
+        addresses: addresses
+            .map(|y| parse_spec_string_list(&y, "addresses"))
+            .unwrap_or_default(),
+        gateways: routes
+            .map(|y| parse_default_gateways(&y))
+            .unwrap_or_default(),
+        dns_servers: resolvers
+            .map(|y| parse_spec_string_list(&y, "dnsServers"))
+            .unwrap_or_default(),
+        connectivity_ready: status.ok().and_then(|y| parse_connectivity_ready(&y)),
+    })
+}
+
+/// Iterate over the `spec` of each document in multi-document talosctl YAML
+fn yaml_specs(yaml_str: &str) -> impl Iterator<Item = serde_yaml::Value> + '_ {
+    yaml_str.split("\n---").filter_map(|doc| {
+        serde_yaml::from_str::<serde_yaml::Value>(doc.trim())
+            .ok()?
+            .get("spec")
+            .cloned()
+    })
+}
+
+/// Collect a string list field from the first document's spec
+fn parse_spec_string_list(yaml_str: &str, field: &str) -> Vec<String> {
+    yaml_specs(yaml_str)
+        .next()
+        .and_then(|spec| {
+            spec.get(field)?.as_sequence().map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Gateways of default routes (empty destination) in the main table
+fn parse_default_gateways(yaml_str: &str) -> Vec<String> {
+    let mut gateways: Vec<String> = Vec::new();
+    for spec in yaml_specs(yaml_str) {
+        let field = |name: &str| spec.get(name).and_then(|v| v.as_str()).unwrap_or("");
+        let gateway = field("gateway");
+        if field("dst").is_empty()
+            && field("table") == "main"
+            && !gateway.is_empty()
+            && !gateways.iter().any(|g| g == gateway)
+        {
+            gateways.push(gateway.to_string());
+        }
+    }
+    gateways
+}
+
+/// `connectivityReady` from the NetworkStatus resource
+fn parse_connectivity_ready(yaml_str: &str) -> Option<bool> {
+    yaml_specs(yaml_str).find_map(|spec| spec.get("connectivityReady").and_then(|v| v.as_bool()))
 }
 
 /// Get address status for a node (for VIP detection)
@@ -662,15 +899,15 @@ pub fn get_address_status(node: &str) -> Result<Vec<AddressStatus>, TalosError> 
 /// while kubespanidentity may be empty on single-node clusters.
 pub fn is_kubespan_enabled(node: &str) -> bool {
     match exec_talosctl(&["get", "kubespanconfig", "--nodes", node, "-o", "yaml"]) {
-        Ok(output) => {
-            // Check if output contains KubeSpanConfig with enabled: true
-            let trimmed = output.trim();
-            !trimmed.is_empty()
-                && trimmed.contains("KubeSpanConfig")
-                && trimmed.contains("enabled: true")
-        }
+        Ok(output) => kubespan_enabled_in(&output),
         Err(_) => false,
     }
+}
+
+/// Whether `talosctl get kubespanconfig -o yaml` output shows `enabled: true`
+fn kubespan_enabled_in(output: &str) -> bool {
+    let trimmed = output.trim();
+    !trimmed.is_empty() && trimmed.contains("KubeSpanConfig") && trimmed.contains("enabled: true")
 }
 
 /// Parse volume status YAML output from talosctl
@@ -1459,7 +1696,7 @@ spec:
 
     #[test]
     fn members_args_include_talosconfig_when_config_path_set() {
-        let args = members_command_args("mycluster", "10.0.0.1", Some("/etc/talos/config"));
+        let args = members_command_args("mycluster", None, "10.0.0.1", Some("/etc/talos/config"));
         assert_eq!(
             args,
             vec![
@@ -1478,8 +1715,38 @@ spec:
     }
 
     #[test]
+    fn members_args_pin_endpoint_to_node() {
+        let args = members_command_args("kprod", Some("5.9.183.236"), "5.9.183.236", None);
+        assert_eq!(
+            args,
+            vec![
+                "--context",
+                "kprod",
+                "-e",
+                "5.9.183.236",
+                "-n",
+                "5.9.183.236",
+                "get",
+                "members",
+                "-o",
+                "yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_host_strips_port_and_brackets() {
+        assert_eq!(endpoint_host("10.0.0.1"), "10.0.0.1");
+        assert_eq!(endpoint_host("10.0.0.1:50000"), "10.0.0.1");
+        assert_eq!(endpoint_host("talos.example.com:443"), "talos.example.com");
+        assert_eq!(endpoint_host("[2a01::1]:50000"), "2a01::1");
+        assert_eq!(endpoint_host("[2a01::1]"), "2a01::1");
+        assert_eq!(endpoint_host("2a01::1"), "2a01::1");
+    }
+
+    #[test]
     fn members_args_omit_talosconfig_when_none() {
-        let args = members_command_args("mycluster", "10.0.0.1", None);
+        let args = members_command_args("mycluster", None, "10.0.0.1", None);
         assert!(!args.contains(&"--talosconfig"));
         assert_eq!(&args[..2], &["--context", "mycluster"]);
     }
@@ -1530,5 +1797,27 @@ spec:
         for ip in &multiple {
             assert!(shuffled.contains(&ip));
         }
+    }
+
+    #[test]
+    fn network_info_parsing() {
+        let addresses = "node: 65.21.17.62\nmetadata:\n    id: current-no-k8s\nspec:\n    addresses:\n        - 65.21.17.62/26\n        - 100.64.0.8/32\n    sortAlgorithm: v1\n";
+        assert_eq!(
+            parse_spec_string_list(addresses, "addresses"),
+            vec!["65.21.17.62/26", "100.64.0.8/32"]
+        );
+
+        let routes = "spec:\n    dst: 10.44.2.0/24\n    gateway: 10.44.2.147\n    table: main\n---\nspec:\n    dst: \"\"\n    gateway: \"\"\n    table: \"180\"\n---\nspec:\n    dst: \"\"\n    gateway: 65.21.17.1\n    table: main\n---\nspec:\n    dst: \"\"\n    gateway: 65.21.17.1\n    table: main\n";
+        assert_eq!(parse_default_gateways(routes), vec!["65.21.17.1"]);
+
+        let resolvers = "spec:\n    dnsServers:\n        - 185.12.64.1\n        - 1.1.1.1\n";
+        assert_eq!(
+            parse_spec_string_list(resolvers, "dnsServers"),
+            vec!["185.12.64.1", "1.1.1.1"]
+        );
+
+        let status = "spec:\n    addressReady: true\n    connectivityReady: false\n";
+        assert_eq!(parse_connectivity_ready(status), Some(false));
+        assert_eq!(parse_connectivity_ready("spec: {}\n"), None);
     }
 }

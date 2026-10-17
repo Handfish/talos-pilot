@@ -11,6 +11,7 @@ description = "Rust SDK for Talos Linux API"
 tonic.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+hyper-util.workspace = true
 
 # Async
 tokio.workspace = true

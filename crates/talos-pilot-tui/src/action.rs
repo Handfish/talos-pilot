@@ -30,7 +30,8 @@ pub enum Action {
     /// Show etcd cluster status
     ShowEtcd,
     /// Show processes for a node: (hostname, address)
-    ShowProcesses(String, String),
+    /// Processes of one or more nodes: (title, nodes)
+    ShowProcesses(String, Vec<crate::components::ProcessNode>),
     /// Show network stats for a node: (hostname, address)
     ShowNetwork(String, String),
     /// Show diagnostics for a node: (hostname, address, role, controlplane_endpoint)
@@ -42,8 +43,9 @@ pub enum Action {
     ShowSecurity,
     /// Show lifecycle/version view
     ShowLifecycle,
-    /// Show workload health view
-    ShowWorkloads,
+    /// Show workload health view: (title, nodes to limit it to, or `None`
+    /// for the whole cluster)
+    ShowWorkloads(String, Option<Vec<String>>),
     /// Show storage/disks view for a node: (hostname, address)
     ShowStorage(String, String),
     /// Show node operations overlay: (hostname, address, is_controlplane)

@@ -84,20 +84,30 @@ pub async fn run_service_checks(
         Ok(services_list) => {
             for node_services in services_list {
                 for service in node_services.services {
-                    let is_healthy = service.health.as_ref().map(|h| h.healthy).unwrap_or(false);
+                    let id = format!("service_{}", service.id);
+                    let health = service.is_healthy();
 
                     let status_msg = format!(
                         "{} ({})",
                         service.state,
-                        if is_healthy { "healthy" } else { "unhealthy" }
+                        match health {
+                            Some(true) => "healthy",
+                            Some(false) => "unhealthy",
+                            None => "no health check",
+                        }
                     );
 
-                    if is_healthy {
-                        checks.push(DiagnosticCheck::pass(
-                            &format!("service_{}", service.id),
-                            &service.id,
-                            &status_msg,
-                        ));
+                    if health == Some(true) {
+                        checks.push(DiagnosticCheck::pass(&id, &service.id, &status_msg));
+                    } else if health.is_none() {
+                        // No health check defined (dashboard, system extensions):
+                        // a running service is fine; otherwise flag its state
+                        // without claiming it is unhealthy.
+                        if service.state == "Running" {
+                            checks.push(DiagnosticCheck::pass(&id, &service.id, &status_msg));
+                        } else {
+                            checks.push(DiagnosticCheck::warn(&id, &service.id, &status_msg));
+                        }
                     } else {
                         checks.push(DiagnosticCheck::fail(
                             &format!("service_{}", service.id),

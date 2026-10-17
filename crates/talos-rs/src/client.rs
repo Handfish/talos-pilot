@@ -69,6 +69,19 @@ impl TalosClient {
     ///
     /// This returns a clone of the client with requests directed to the specified node.
     /// Uses gRPC metadata to target the node through the VIP/endpoint.
+    /// Addresses of the machines this client knows about: its target nodes,
+    /// then the configured endpoints, without ports and without duplicates.
+    pub fn known_addresses(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for addr in self.nodes.iter().chain(&self.endpoints) {
+            let host = strip_port(addr).to_string();
+            if !host.is_empty() && !out.contains(&host) {
+                out.push(host);
+            }
+        }
+        out
+    }
+
     pub fn with_node(&self, node: &str) -> Self {
         Self {
             channel: self.channel.clone(),
@@ -414,6 +427,35 @@ impl TalosClient {
         Ok(memories)
     }
 
+    /// Get filesystem usage (size / available) for every mount on the configured nodes
+    pub async fn mounts(&self) -> Result<Vec<NodeMounts>, TalosError> {
+        let mut client = self.machine_client();
+        let request = self.with_nodes(Request::new(()));
+
+        let response = client.mounts(request).await?;
+        let inner = response.into_inner();
+
+        let mounts = inner
+            .messages
+            .into_iter()
+            .map(|msg| NodeMounts {
+                node: self.node_from_metadata(msg.metadata.as_ref(), 0),
+                mounts: msg
+                    .stats
+                    .into_iter()
+                    .map(|m| MountUsage {
+                        filesystem: m.filesystem,
+                        mounted_on: m.mounted_on,
+                        size: m.size,
+                        available: m.available,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(mounts)
+    }
+
     /// Get load average from all configured nodes
     pub async fn load_avg(&self) -> Result<Vec<NodeLoadAvg>, TalosError> {
         let mut client = self.machine_client();
@@ -496,6 +538,7 @@ impl TalosClient {
 
                 NodeSystemStat {
                     node: self.node_from_metadata(msg.metadata.as_ref(), 0),
+                    boot_time: msg.boot_time,
                     cpu_total,
                     process_running: msg.process_running,
                     process_blocked: msg.process_blocked,
@@ -1717,6 +1760,19 @@ pub struct ServiceInfo {
     pub health: Option<ServiceHealth>,
 }
 
+impl ServiceInfo {
+    /// Health as reported by Talos: `Some(true/false)` when the service has a
+    /// health check, `None` when it has none (talosctl shows `?`), as is
+    /// usual for `dashboard` and system extensions. `None` must not be read as
+    /// unhealthy.
+    pub fn is_healthy(&self) -> Option<bool> {
+        self.health
+            .as_ref()
+            .filter(|h| !h.unknown)
+            .map(|h| h.healthy)
+    }
+}
+
 /// Health status of a service
 #[derive(Debug, Clone)]
 pub struct ServiceHealth {
@@ -1737,6 +1793,73 @@ pub struct ServiceRestartResult {
 pub struct NodeMemory {
     pub node: String,
     pub meminfo: Option<MemInfo>,
+}
+
+/// Filesystem usage for every mount on a node
+#[derive(Debug, Clone)]
+pub struct NodeMounts {
+    pub node: String,
+    pub mounts: Vec<MountUsage>,
+}
+
+/// Size and free space of one mounted filesystem (bytes)
+#[derive(Debug, Clone, PartialEq)]
+pub struct MountUsage {
+    pub filesystem: String,
+    pub mounted_on: String,
+    pub size: u64,
+    pub available: u64,
+}
+
+impl MountUsage {
+    /// Bytes in use (as reported by statfs: size minus available)
+    pub fn used(&self) -> u64 {
+        self.size.saturating_sub(self.available)
+    }
+
+    /// Percentage of the filesystem in use, `None` for zero-sized mounts
+    pub fn used_pct(&self) -> Option<f32> {
+        (self.size > 0).then(|| self.used() as f32 / self.size as f32 * 100.0)
+    }
+}
+
+/// Mount points that hold pod or runtime state rather than host storage
+const NON_HOST_MOUNT_PREFIXES: &[&str] = &["/var/lib/kubelet/", "/run/", "/proc", "/sys", "/dev"];
+
+impl NodeMounts {
+    /// The node's host disks: the EPHEMERAL `/var` partition plus any other
+    /// block-device or `/var/mnt` user volume, one entry per filesystem.
+    ///
+    /// Pod volumes (PVCs, subpaths), container overlays and virtual
+    /// filesystems are skipped, as are bind mounts of a filesystem already
+    /// listed. `/var` comes first.
+    pub fn host_disks(&self) -> Vec<&MountUsage> {
+        let mut disks: Vec<&MountUsage> = Vec::new();
+        for m in &self.mounts {
+            let host_fs = m.filesystem.starts_with("/dev/")
+                || m.mounted_on == "/var"
+                || m.mounted_on.starts_with("/var/mnt/");
+            let pod_mount = NON_HOST_MOUNT_PREFIXES
+                .iter()
+                .any(|p| m.mounted_on.starts_with(p));
+            if !host_fs || pod_mount || m.size == 0 {
+                continue;
+            }
+            match disks.iter_mut().find(|d| d.filesystem == m.filesystem) {
+                // Keep the shortest mount path of a bind-mounted filesystem
+                Some(d) if m.mounted_on.len() < d.mounted_on.len() => *d = m,
+                Some(_) => {}
+                None => disks.push(m),
+            }
+        }
+        disks.sort_by_key(|d| (d.mounted_on != "/var", d.mounted_on.clone()));
+        disks
+    }
+
+    /// The EPHEMERAL partition (`/var`), where images, logs and etcd live
+    pub fn var(&self) -> Option<&MountUsage> {
+        self.mounts.iter().find(|m| m.mounted_on == "/var")
+    }
 }
 
 /// Memory statistics
@@ -1782,6 +1905,8 @@ pub struct NodeCpuInfo {
 #[derive(Debug, Clone)]
 pub struct NodeSystemStat {
     pub node: String,
+    /// Boot time in seconds since the Unix epoch
+    pub boot_time: u64,
     pub cpu_total: CpuStat,
     pub process_running: u64,
     pub process_blocked: u64,
@@ -1798,6 +1923,26 @@ pub struct CpuStat {
     pub irq: f64,
     pub soft_irq: f64,
     pub steal: f64,
+}
+
+/// `host:port` or `[v6]:port` → host; bare hosts and IPv6 addresses unchanged
+fn strip_port(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => host,
+        _ => addr,
+    }
+}
+
+impl NodeSystemStat {
+    /// Time since boot as of `now_secs` (seconds since the Unix epoch).
+    ///
+    /// Returns `None` if the node did not report a boot time.
+    pub fn uptime_secs(&self, now_secs: u64) -> Option<u64> {
+        (self.boot_time > 0).then(|| now_secs.saturating_sub(self.boot_time))
+    }
 }
 
 impl CpuStat {
@@ -2568,6 +2713,96 @@ impl NodeTimeInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn service(health: Option<(bool, bool)>) -> ServiceInfo {
+        ServiceInfo {
+            id: "svc".to_string(),
+            state: "Running".to_string(),
+            health: health.map(|(unknown, healthy)| ServiceHealth {
+                unknown,
+                healthy,
+                last_message: String::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn host_disks_skip_pod_and_virtual_mounts() {
+        let m = |fs: &str, on: &str, size: u64| MountUsage {
+            filesystem: fs.to_string(),
+            mounted_on: on.to_string(),
+            size,
+            available: size / 2,
+        };
+        let node = NodeMounts {
+            node: String::new(),
+            mounts: vec![
+                m("none", "/dev", 100),
+                m("rootfs", "/usr/lib/firmware", 100),
+                m(
+                    "/dev/drbd1003",
+                    "/var/lib/kubelet/pods/x/volumes/pvc/mount",
+                    100,
+                ),
+                m(
+                    "/dev/nvme0n1p5",
+                    "/var/lib/kubelet/pods/y/volume-subpaths/z",
+                    100,
+                ),
+                m("/dev/sdb1", "/var/mnt/data", 500),
+                m("overlay", "/run/containerd/x/rootfs", 100),
+                m("/dev/nvme0n1p5", "/var", 1000),
+                m("tank/data", "/var/mnt/tank", 800),
+                m("none", "/sys/firmware/efi/efivars", 0),
+            ],
+        };
+        let disks: Vec<&str> = node
+            .host_disks()
+            .iter()
+            .map(|d| d.mounted_on.as_str())
+            .collect();
+        assert_eq!(disks, ["/var", "/var/mnt/data", "/var/mnt/tank"]);
+        assert_eq!(node.var().map(|v| v.size), Some(1000));
+        assert_eq!(node.var().and_then(MountUsage::used_pct), Some(50.0));
+    }
+
+    #[test]
+    fn strip_port_handles_v4_v6_and_hostnames() {
+        assert_eq!(strip_port("10.0.0.1:50000"), "10.0.0.1");
+        assert_eq!(strip_port("10.0.0.1"), "10.0.0.1");
+        assert_eq!(strip_port("[fd00::1]:50000"), "fd00::1");
+        assert_eq!(strip_port("fd00::1"), "fd00::1");
+        assert_eq!(strip_port("talos.example.com:50000"), "talos.example.com");
+    }
+
+    #[test]
+    fn uptime_from_boot_time() {
+        let stat = NodeSystemStat {
+            node: String::new(),
+            boot_time: 1_000,
+            cpu_total: CpuStat::default(),
+            process_running: 0,
+            process_blocked: 0,
+        };
+        assert_eq!(stat.uptime_secs(4_600), Some(3_600));
+        // Clock skew: never underflow
+        assert_eq!(stat.uptime_secs(500), Some(0));
+        // No boot time reported
+        let unknown = NodeSystemStat {
+            boot_time: 0,
+            ..stat
+        };
+        assert_eq!(unknown.uptime_secs(4_600), None);
+    }
+
+    #[test]
+    fn service_without_health_check_is_not_unhealthy() {
+        // ext-tailscale / dashboard: Talos reports unknown=true, healthy=false
+        assert_eq!(service(Some((true, false))).is_healthy(), None);
+        assert_eq!(service(None).is_healthy(), None);
+        assert_eq!(service(Some((false, true))).is_healthy(), Some(true));
+        assert_eq!(service(Some((false, false))).is_healthy(), Some(false));
+    }
 
     /// Helper to create a TalosClient for testing without a real connection
     fn create_test_client(nodes: Vec<String>, endpoints: Vec<String>) -> TalosClient {

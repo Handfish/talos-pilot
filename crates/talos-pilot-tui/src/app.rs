@@ -1,6 +1,7 @@
 //! Application state and main loop
 
 use crate::action::Action;
+use crate::components::BackgroundRefresh;
 use crate::components::rolling_operations::RollingNodeInfo;
 use crate::components::wizard::{WizardComponent, WizardState};
 use crate::components::{
@@ -10,9 +11,74 @@ use crate::components::{
 };
 use crate::tui::{self, Tui};
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// A view refresh running on a clone of the view's component
+enum RefreshJob {
+    Diagnostics(JoinHandle<DiagnosticsComponent>),
+    Security(JoinHandle<SecurityComponent>),
+    Lifecycle(JoinHandle<LifecycleComponent>),
+    Workloads(JoinHandle<WorkloadHealthComponent>),
+    Storage(JoinHandle<StorageComponent>),
+    Processes(JoinHandle<ProcessesComponent>),
+    Etcd(JoinHandle<EtcdComponent>),
+}
+
+impl RefreshJob {
+    fn is_finished(&self) -> bool {
+        match self {
+            RefreshJob::Diagnostics(h) => h.is_finished(),
+            RefreshJob::Security(h) => h.is_finished(),
+            RefreshJob::Lifecycle(h) => h.is_finished(),
+            RefreshJob::Workloads(h) => h.is_finished(),
+            RefreshJob::Storage(h) => h.is_finished(),
+            RefreshJob::Processes(h) => h.is_finished(),
+            RefreshJob::Etcd(h) => h.is_finished(),
+        }
+    }
+
+    fn abort(&self) {
+        match self {
+            RefreshJob::Diagnostics(h) => h.abort(),
+            RefreshJob::Security(h) => h.abort(),
+            RefreshJob::Lifecycle(h) => h.abort(),
+            RefreshJob::Workloads(h) => h.abort(),
+            RefreshJob::Storage(h) => h.abort(),
+            RefreshJob::Processes(h) => h.abort(),
+            RefreshJob::Etcd(h) => h.abort(),
+        }
+    }
+}
+
+/// Run `refresh()` on a clone of a component in a spawned task, recording a
+/// failure as the clone's error, and evaluate to the task's handle. (A macro
+/// because each component's `refresh` is an inherent async method.)
+macro_rules! spawn_refresh {
+    ($component:expr) => {{
+        let mut component = $component.clone();
+        tokio::spawn(async move {
+            if let Err(e) = component.refresh().await {
+                component.set_error(e.to_string());
+            }
+            component
+        })
+    }};
+}
+
+/// First logs fetch of the logs view: (service, log text) pairs, or an error
+type LogsFetch = std::result::Result<Vec<(String, String)>, String>;
+
+/// Whether a key event is Ctrl+C
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+}
 
 /// Current view in the application
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +107,8 @@ pub struct App {
     cluster: ClusterComponent,
     /// Multi-service logs component (created when viewing logs)
     multi_logs: Option<MultiLogsComponent>,
+    /// Log levels last shown in the logs view, restored when it is reopened
+    log_level_filter: crate::components::multi_logs::LevelFilter,
     /// Etcd status component (created when viewing etcd)
     etcd: Option<EtcdComponent>,
     /// Processes component (created when viewing processes)
@@ -71,6 +139,12 @@ pub struct App {
     action_tx: mpsc::UnboundedSender<AsyncResult>,
     /// Custom config file path (from --config flag)
     config_path: Option<String>,
+    /// In-flight background refresh of the current view (see `start_refresh_job`)
+    refresh_job: Option<RefreshJob>,
+    /// In-flight first logs fetch of the logs view (see `poll_view_setup`)
+    logs_fetch: Option<JoinHandle<LogsFetch>>,
+    /// In-flight Kubernetes client creation for rolling operations
+    rolling_k8s_fetch: Option<JoinHandle<Option<kube::Client>>>,
     /// Whether running in insecure mode (no TLS)
     insecure: bool,
     /// Endpoint for insecure mode
@@ -93,40 +167,6 @@ impl Default for App {
     }
 }
 
-/// Draw the animated, cancellable startup "connecting" screen.
-fn draw_connecting(frame: &mut ratatui::Frame, spinner: usize) {
-    use ratatui::layout::Alignment;
-    use ratatui::style::{Color, Style};
-    use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Block, Borders, Paragraph};
-
-    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
-    let spin = FRAMES[spinner % FRAMES.len()];
-
-    let area = frame.area();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let para = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("{}  Connecting to Talos cluster...", spin),
-            Style::default().fg(Color::Cyan),
-        )),
-        Line::from(Span::styled(
-            "Trying configured endpoints   (press q or Ctrl-C to cancel)",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" talos-pilot "),
-    )
-    .alignment(Alignment::Center);
-    frame.render_widget(para, area);
-}
-
 impl App {
     pub fn new(
         config_path: Option<String>,
@@ -141,6 +181,7 @@ impl App {
             view: View::Cluster,
             cluster: ClusterComponent::new(config_path.clone(), context),
             multi_logs: None,
+            log_level_filter: crate::components::multi_logs::ALL_LEVELS,
             etcd: None,
             processes: None,
             network: None,
@@ -156,6 +197,9 @@ impl App {
             action_rx,
             action_tx,
             config_path,
+            refresh_job: None,
+            logs_fetch: None,
+            rolling_k8s_fetch: None,
             insecure,
             insecure_endpoint,
         }
@@ -217,6 +261,9 @@ impl App {
             // Handle events with timeout
             if event::poll(self.tick_rate)? {
                 match event::read()? {
+                    Event::Key(key) if is_ctrl_c(&key) => {
+                        self.should_quit = true;
+                    }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if let Some(action) = wizard.handle_key_event(key)? {
                             match action {
@@ -516,39 +563,10 @@ impl App {
 
     /// Main event loop
     async fn main_loop(&mut self, terminal: &mut Tui) -> Result<()> {
-        // Connect on startup while showing an animated, cancellable "connecting"
-        // screen. connect() dials all configured endpoints concurrently and the
-        // first reachable one wins; we drive it alongside an input poll so the
-        // UI never looks frozen and the user can bail out with q / Esc / Ctrl-C
-        // instead of feeling like the terminal is stuck.
-        let connect_result = {
-            let mut connect_fut = Box::pin(self.cluster.connect());
-            let mut spinner: usize = 0;
-            loop {
-                terminal.draw(|frame| draw_connecting(frame, spinner))?;
-                spinner = spinner.wrapping_add(1);
-
-                tokio::select! {
-                    res = &mut connect_fut => break res,
-                    _ = tokio::time::sleep(Duration::from_millis(120)) => {
-                        // Non-blocking drain of pending input; abort keys exit cleanly.
-                        while event::poll(Duration::from_millis(0))? {
-                            if let Event::Key(key) = event::read()?
-                                && key.kind == KeyEventKind::Press
-                            {
-                                let abort = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                                    || (key.code == KeyCode::Char('c')
-                                        && key.modifiers.contains(KeyModifiers::CONTROL));
-                                if abort {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        connect_result?;
+        // Load the cluster list from talosconfig. This does no network I/O:
+        // each cluster connects in the background and fills in as it becomes
+        // reachable, so the UI is usable at once even if some are down.
+        self.cluster.connect().await?;
 
         loop {
             // Draw current view
@@ -628,88 +646,18 @@ impl App {
             // Handle events with timeout
             if event::poll(self.tick_rate)? {
                 match event::read()? {
+                    // The terminal is in raw mode, so Ctrl+C arrives as a key
+                    // rather than SIGINT: quit from any view
+                    Event::Key(key) if is_ctrl_c(&key) => {
+                        self.should_quit = true;
+                    }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        let action = match self.view {
-                            View::Cluster => self.cluster.handle_key_event(key)?,
-                            View::MultiLogs => {
-                                if let Some(multi_logs) = &mut self.multi_logs {
-                                    multi_logs.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Etcd => {
-                                if let Some(etcd) = &mut self.etcd {
-                                    etcd.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Processes => {
-                                if let Some(processes) = &mut self.processes {
-                                    processes.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Network => {
-                                if let Some(network) = &mut self.network {
-                                    network.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Diagnostics => {
-                                if let Some(diagnostics) = &mut self.diagnostics {
-                                    diagnostics.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Security => {
-                                if let Some(security) = &mut self.security {
-                                    security.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Lifecycle => {
-                                if let Some(lifecycle) = &mut self.lifecycle {
-                                    lifecycle.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Workloads => {
-                                if let Some(workloads) = &mut self.workloads {
-                                    workloads.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::Storage => {
-                                if let Some(storage) = &mut self.storage {
-                                    storage.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::NodeOperations => {
-                                if let Some(node_ops) = &mut self.node_operations {
-                                    node_ops.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                            View::RollingOperations => {
-                                if let Some(rolling_ops) = &mut self.rolling_operations {
-                                    rolling_ops.handle_key_event(key)?
-                                } else {
-                                    None
-                                }
-                            }
-                        };
-                        if let Some(action) = action {
+                        if let Some(action) = self.dispatch_key(key)? {
+                            self.handle_action(action).await?;
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        if let Some(action) = self.dispatch_mouse(mouse)? {
                             self.handle_action(action).await?;
                         }
                     }
@@ -724,6 +672,9 @@ impl App {
             }
 
             // Check async results (non-blocking)
+            self.poll_refresh_job();
+            self.poll_view_setup();
+
             while let Ok(result) = self.action_rx.try_recv() {
                 match result {
                     AsyncResult::Connected => {
@@ -754,6 +705,194 @@ impl App {
     }
 
     /// Handle an action
+    /// Hand a finished background refresh back to its component
+    fn poll_refresh_job(&mut self) {
+        use futures::FutureExt;
+
+        if !self.refresh_job.as_ref().is_some_and(|j| j.is_finished()) {
+            return;
+        }
+        let Some(job) = self.refresh_job.take() else {
+            return;
+        };
+        // A panicked or aborted task yields nothing; the next auto-refresh retries
+        match job {
+            RefreshJob::Diagnostics(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.diagnostics, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Security(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.security, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Lifecycle(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.lifecycle, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Workloads(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.workloads, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Storage(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.storage, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Processes(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.processes, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+            RefreshJob::Etcd(h) => {
+                if let (Some(c), Some(Ok(r))) = (&mut self.etcd, h.now_or_never()) {
+                    c.adopt_refresh(r);
+                }
+            }
+        }
+    }
+
+    /// Finish view setup that ran in the background: the first logs fetch of
+    /// the logs view, and the Kubernetes client of rolling operations
+    fn poll_view_setup(&mut self) {
+        use futures::FutureExt;
+
+        if self.logs_fetch.as_ref().is_some_and(|h| h.is_finished())
+            && let Some(Some(Ok(result))) = self.logs_fetch.take().map(|h| h.now_or_never())
+            && let Some(multi_logs) = &mut self.multi_logs
+        {
+            match result {
+                Ok(logs) => {
+                    multi_logs.set_logs(logs);
+                    // Auto-start streaming for live updates
+                    multi_logs.start_streaming();
+                }
+                Err(e) => multi_logs.set_error(e),
+            }
+        }
+
+        if self
+            .rolling_k8s_fetch
+            .as_ref()
+            .is_some_and(|h| h.is_finished())
+            && let Some(Some(Ok(Some(k8s)))) =
+                self.rolling_k8s_fetch.take().map(|h| h.now_or_never())
+            && let Some(rolling_ops) = &mut self.rolling_operations
+        {
+            rolling_ops.set_k8s_client(k8s);
+        }
+    }
+
+    /// Drop an in-flight background refresh, e.g. because its view is being
+    /// replaced by one for another node; its result would be stale.
+    fn cancel_refresh_job(&mut self) {
+        if let Some(job) = self.refresh_job.take() {
+            job.abort();
+        }
+    }
+
+    /// Route a key press to the component for the current view
+    fn dispatch_key(&mut self, key: KeyEvent) -> Result<Option<Action>> {
+        Ok(match self.view {
+            View::Cluster => self.cluster.handle_key_event(key)?,
+            View::MultiLogs => {
+                if let Some(multi_logs) = &mut self.multi_logs {
+                    multi_logs.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Etcd => {
+                if let Some(etcd) = &mut self.etcd {
+                    etcd.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Processes => {
+                if let Some(processes) = &mut self.processes {
+                    processes.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Network => {
+                if let Some(network) = &mut self.network {
+                    network.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Diagnostics => {
+                if let Some(diagnostics) = &mut self.diagnostics {
+                    diagnostics.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Security => {
+                if let Some(security) = &mut self.security {
+                    security.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Lifecycle => {
+                if let Some(lifecycle) = &mut self.lifecycle {
+                    lifecycle.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Workloads => {
+                if let Some(workloads) = &mut self.workloads {
+                    workloads.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::Storage => {
+                if let Some(storage) = &mut self.storage {
+                    storage.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::NodeOperations => {
+                if let Some(node_ops) = &mut self.node_operations {
+                    node_ops.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+            View::RollingOperations => {
+                if let Some(rolling_ops) = &mut self.rolling_operations {
+                    rolling_ops.handle_key_event(key)?
+                } else {
+                    None
+                }
+            }
+        })
+    }
+
+    /// Route a mouse event: the cluster view handles clicks and the wheel
+    /// itself; other views get the wheel as Up/Down key presses so lists and
+    /// logs scroll without per-component mouse code.
+    fn dispatch_mouse(&mut self, mouse: MouseEvent) -> Result<Option<Action>> {
+        if self.view == View::Cluster {
+            return self.cluster.handle_mouse_event(mouse);
+        }
+        let code = match mouse.kind {
+            MouseEventKind::ScrollUp => KeyCode::Up,
+            MouseEventKind::ScrollDown => KeyCode::Down,
+            _ => return Ok(None),
+        };
+        self.dispatch_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
     async fn handle_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Quit => {
@@ -765,6 +904,7 @@ impl App {
                         // Stop streaming if active
                         if let Some(multi_logs) = &mut self.multi_logs {
                             multi_logs.stop_streaming();
+                            self.log_level_filter = multi_logs.level_filter();
                         }
                         self.multi_logs = None;
                     }
@@ -810,9 +950,16 @@ impl App {
                         if let Some(next_action) = self.cluster.update(Action::Tick)? {
                             Box::pin(self.handle_action(next_action)).await?;
                         }
-                        // Auto-refresh selected node stats every 5 seconds
+                        // Rebuild the node list in the background so nodes that
+                        // went away (e.g. rebooted) come back without pressing r
+                        self.cluster.apply_background_refresh();
+                        self.cluster.start_background_refresh();
+                        self.cluster.poll_network_info();
+                        // Auto-refresh selected node stats every 5 seconds, in
+                        // the background so a struggling node can't freeze the UI
+                        self.cluster.poll_selected_node_refresh();
                         if self.cluster.should_auto_refresh() {
-                            let _ = self.cluster.refresh_selected_node().await;
+                            self.cluster.refresh_selected_node();
                         }
                     }
                     View::MultiLogs => {
@@ -898,92 +1045,97 @@ impl App {
                 // Terminal will automatically resize on next draw
             }
             Action::Refresh => {
-                tracing::info!("Refresh requested");
+                // Views ask on every tick while a background refresh is in flight
+                tracing::debug!("Refresh requested");
+                // Refreshes run on the event loop, so their duration is how
+                // long the UI is frozen. Log slow ones to find the culprit.
+                let started = std::time::Instant::now();
                 match self.view {
                     View::Cluster => {
                         self.cluster.refresh().await?;
                     }
                     View::Etcd => {
-                        if let Some(etcd) = &mut self.etcd
-                            && let Err(e) = etcd.refresh().await
+                        if self.refresh_job.is_none()
+                            && let Some(etcd) = &self.etcd
                         {
-                            etcd.set_error(e.to_string());
+                            self.refresh_job = Some(RefreshJob::Etcd(spawn_refresh!(etcd)));
                         }
                     }
                     View::Processes => {
-                        if let Some(processes) = &mut self.processes
-                            && let Err(e) = processes.refresh().await
+                        // Several nodes, each call bounded at 10s: refresh off
+                        // the event loop so a slow node can't freeze the UI
+                        if self.refresh_job.is_none()
+                            && let Some(processes) = &self.processes
                         {
-                            processes.set_error(e.to_string());
+                            self.refresh_job =
+                                Some(RefreshJob::Processes(spawn_refresh!(processes)));
                         }
                     }
                     View::Network => {
+                        // Starts a pending restart / file view / capture and a
+                        // stats fetch in the background
                         if let Some(network) = &mut self.network {
-                            // Check for pending service restart first
-                            if network.has_pending_restart() {
-                                let _ = network.perform_pending_restart().await;
-                            }
-                            // Check for file viewer content fetch
-                            if network.file_viewer_needs_fetch() {
-                                network.fetch_file_content().await;
-                            }
-                            // Check for packet capture start
-                            if network.needs_capture_start() {
-                                network.start_capture_async().await;
-                            }
-                            if let Err(e) = network.refresh().await {
-                                network.set_error(e.to_string());
-                            }
+                            network.refresh();
                         }
                     }
                     View::MultiLogs => {
                         // Multi-logs handles its own streaming refresh
                     }
                     View::Diagnostics => {
-                        if let Some(diagnostics) = &mut self.diagnostics
-                            && let Err(e) = diagnostics.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(diagnostics) = &self.diagnostics
                         {
-                            diagnostics.set_error(e.to_string());
+                            self.refresh_job =
+                                Some(RefreshJob::Diagnostics(spawn_refresh!(diagnostics)));
                         }
                     }
                     View::Security => {
-                        if let Some(security) = &mut self.security
-                            && let Err(e) = security.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(security) = &self.security
                         {
-                            security.set_error(e.to_string());
+                            self.refresh_job = Some(RefreshJob::Security(spawn_refresh!(security)));
                         }
                     }
                     View::Lifecycle => {
-                        if let Some(lifecycle) = &mut self.lifecycle
-                            && let Err(e) = lifecycle.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(lifecycle) = &self.lifecycle
                         {
-                            lifecycle.set_error(e.to_string());
+                            self.refresh_job =
+                                Some(RefreshJob::Lifecycle(spawn_refresh!(lifecycle)));
                         }
                     }
                     View::Workloads => {
-                        if let Some(workloads) = &mut self.workloads
-                            && let Err(e) = workloads.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(workloads) = &self.workloads
                         {
-                            workloads.set_error(e.to_string());
+                            self.refresh_job =
+                                Some(RefreshJob::Workloads(spawn_refresh!(workloads)));
                         }
                     }
                     View::Storage => {
-                        if let Some(storage) = &mut self.storage
-                            && let Err(e) = storage.refresh().await
+                        // Slow (Kubernetes API heavy): refresh off the event loop
+                        if self.refresh_job.is_none()
+                            && let Some(storage) = &self.storage
                         {
-                            storage.set_error(e.to_string());
+                            self.refresh_job = Some(RefreshJob::Storage(spawn_refresh!(storage)));
                         }
                     }
                     View::NodeOperations => {
-                        if let Some(node_ops) = &mut self.node_operations
-                            && let Err(e) = node_ops.refresh().await
-                        {
-                            node_ops.set_error(e.to_string());
+                        if let Some(node_ops) = &mut self.node_operations {
+                            node_ops.refresh();
                         }
                     }
                     View::RollingOperations => {
                         // Rolling operations doesn't have a refresh method
                     }
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= Duration::from_millis(500) {
+                    tracing::warn!("{:?} refresh blocked the UI for {:?}", self.view, elapsed);
                 }
             }
             Action::ShowMultiLogs(node_ip, node_role, active_services, all_services) => {
@@ -997,6 +1149,7 @@ impl App {
                     active_services.clone(),
                     all_services,
                 );
+                multi_logs.set_level_filter(self.log_level_filter);
 
                 // Fetch logs from active services and set up client for streaming
                 if let Some(client) = self.cluster.client() {
@@ -1006,18 +1159,25 @@ impl App {
                     // Set the client for streaming capability
                     multi_logs.set_client(node_client.clone(), self.tail_lines);
 
-                    let service_refs: Vec<&str> =
-                        active_services.iter().map(|s| s.as_str()).collect();
-                    match node_client.logs_multi(&service_refs, self.tail_lines).await {
-                        Ok(logs) => {
-                            multi_logs.set_logs(logs);
-                            // Auto-start streaming for live updates
-                            multi_logs.start_streaming();
-                        }
-                        Err(e) => {
-                            multi_logs.set_error(e.to_string());
-                        }
+                    // First fetch in the background (see `poll_view_setup`)
+                    let tail_lines = self.tail_lines;
+                    if let Some(h) = self.logs_fetch.take() {
+                        h.abort();
                     }
+                    self.logs_fetch = Some(tokio::spawn(async move {
+                        let service_refs: Vec<&str> =
+                            active_services.iter().map(|s| s.as_str()).collect();
+                        match tokio::time::timeout(
+                            Duration::from_secs(15),
+                            node_client.logs_multi(&service_refs, tail_lines),
+                        )
+                        .await
+                        {
+                            Ok(Ok(logs)) => Ok(logs),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err("Timed out fetching logs after 15s".to_string()),
+                        }
+                    }));
                 }
 
                 self.multi_logs = Some(multi_logs);
@@ -1027,6 +1187,7 @@ impl App {
                 // Legacy - no longer used, we use ShowMultiLogs now
             }
             Action::ShowDiagnostics(hostname, address, role, cp_endpoint) => {
+                self.cancel_refresh_job();
                 // Switch to diagnostics view for a node
                 tracing::info!(
                     "ShowDiagnostics: hostname='{}', address='{}', role='{}', cp_endpoint={:?}",
@@ -1046,16 +1207,15 @@ impl App {
 
                 // Set the control plane endpoint for worker nodes to fetch kubeconfig
                 diagnostics.set_controlplane_endpoint(cp_endpoint);
+                diagnostics
+                    .set_talos_context(self.cluster.current_context_name().map(|s| s.to_string()));
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {
                     // Create a client configured for this specific node
                     let node_client = client.with_node(&address);
                     diagnostics.set_client(node_client);
-                    if let Err(e) = diagnostics.refresh().await {
-                        tracing::error!("Diagnostics refresh error: {:?}", e);
-                        diagnostics.set_error(e.to_string());
-                    }
+                    self.refresh_job = Some(RefreshJob::Diagnostics(spawn_refresh!(diagnostics)));
                 }
 
                 self.diagnostics = Some(diagnostics);
@@ -1063,17 +1223,25 @@ impl App {
             }
             Action::ApplyDiagnosticFix => {
                 // Apply a diagnostic fix (from confirmation dialog)
+                // Applied on a clone in the background, then refreshed; the
+                // view shows the fix as in progress until it lands
+                self.cancel_refresh_job();
                 if let Some(diagnostics) = &mut self.diagnostics {
-                    if let Err(e) = diagnostics.apply_pending_fix().await {
-                        diagnostics.set_error(e.to_string());
-                    }
-                    // Refresh after applying fix
-                    if let Err(e) = diagnostics.refresh().await {
-                        diagnostics.set_error(e.to_string());
-                    }
+                    let mut worker = diagnostics.clone();
+                    diagnostics.begin_apply_fix();
+                    self.refresh_job = Some(RefreshJob::Diagnostics(tokio::spawn(async move {
+                        if let Err(e) = worker.apply_pending_fix().await {
+                            worker.set_error(e.to_string());
+                        }
+                        if let Err(e) = worker.refresh().await {
+                            worker.set_error(e.to_string());
+                        }
+                        worker
+                    })));
                 }
             }
             Action::ShowEtcd => {
+                self.cancel_refresh_job();
                 // Switch to etcd status view
                 tracing::info!("Viewing etcd cluster status");
 
@@ -1083,35 +1251,25 @@ impl App {
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {
                     etcd.set_client(client.clone());
-                    if let Err(e) = etcd.refresh().await {
-                        etcd.set_error(e.to_string());
-                    }
+                    self.refresh_job = Some(RefreshJob::Etcd(spawn_refresh!(etcd)));
                 }
 
                 self.etcd = Some(etcd);
                 self.view = View::Etcd;
             }
-            Action::ShowProcesses(hostname, address) => {
-                // Switch to processes view for a node
-                tracing::info!(
-                    "ShowProcesses: hostname='{}', address='{}'",
-                    hostname,
-                    address
-                );
+            Action::ShowProcesses(title, nodes) => {
+                self.cancel_refresh_job();
+                tracing::info!("ShowProcesses: '{}' ({} node(s))", title, nodes.len());
 
-                // Create processes component
-                let mut processes = ProcessesComponent::new(hostname, address.clone());
-
-                // Set the client and refresh data
-                if let Some(client) = self.cluster.client() {
-                    // Create a client configured for this specific node
-                    let node_client = client.with_node(&address);
-                    tracing::info!("Created node client for address: '{}'", address);
-                    processes.set_client(node_client);
-                    if let Err(e) = processes.refresh().await {
-                        tracing::error!("Process refresh error: {:?}", e);
-                        processes.set_error(e.to_string());
+                let mut processes = ProcessesComponent::new(title, nodes);
+                match self.cluster.client() {
+                    Some(client) => {
+                        processes.set_client(client.clone());
+                        // First load in the background; the view shows
+                        // "Loading processes..." until it lands
+                        self.refresh_job = Some(RefreshJob::Processes(spawn_refresh!(processes)));
                     }
+                    None => processes.set_error("Not connected".to_string()),
                 }
 
                 self.processes = Some(processes);
@@ -1134,94 +1292,94 @@ impl App {
                     let node_client = client.with_node(&address);
                     tracing::info!("Created node client for network: '{}'", address);
                     network.set_client(node_client);
-                    if let Err(e) = network.refresh().await {
-                        tracing::error!("Network refresh error: {:?}", e);
-                        network.set_error(e.to_string());
-                    }
+                    network.set_talos_context(
+                        self.cluster.current_context_name().map(str::to_string),
+                        self.config_path.clone(),
+                    );
+                    network.refresh();
                 }
 
                 self.network = Some(network);
                 self.view = View::Network;
             }
             Action::ShowSecurity => {
+                self.cancel_refresh_job();
                 // Switch to security/certificates view
                 tracing::info!("Viewing security/certificates");
 
                 // Create security component
-                let mut security = SecurityComponent::new(String::new(), self.config_path.clone());
+                let mut security = SecurityComponent::new(
+                    self.cluster
+                        .current_context_name()
+                        .unwrap_or_default()
+                        .to_string(),
+                    self.config_path.clone(),
+                );
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {
                     security.set_client(client.clone());
                 }
-
-                if let Err(e) = security.refresh().await {
-                    tracing::error!("Security refresh error: {:?}", e);
-                    security.set_error(e.to_string());
-                }
+                security.set_query_node(self.cluster.control_plane_ip());
+                self.refresh_job = Some(RefreshJob::Security(spawn_refresh!(security)));
 
                 self.security = Some(security);
                 self.view = View::Security;
             }
             Action::ShowLifecycle => {
+                self.cancel_refresh_job();
                 // Switch to lifecycle/version view
                 tracing::info!("Viewing lifecycle/versions");
 
                 // Create lifecycle component
-                let mut lifecycle =
-                    LifecycleComponent::new(String::new(), self.config_path.clone());
+                let mut lifecycle = LifecycleComponent::new(
+                    self.cluster
+                        .current_context_name()
+                        .unwrap_or_default()
+                        .to_string(),
+                    self.config_path.clone(),
+                );
 
                 // Set the client and refresh data
                 if let Some(client) = self.cluster.client() {
                     lifecycle.set_client(client.clone());
                 }
 
-                if let Err(e) = lifecycle.refresh().await {
-                    tracing::error!("Lifecycle refresh error: {:?}", e);
-                    lifecycle.set_error(e.to_string());
-                }
+                self.refresh_job = Some(RefreshJob::Lifecycle(spawn_refresh!(lifecycle)));
 
                 self.lifecycle = Some(lifecycle);
                 self.view = View::Lifecycle;
             }
-            Action::ShowWorkloads => {
-                // Switch to workload health view
-                tracing::info!("Viewing workload health");
+            Action::ShowWorkloads(title, nodes) => {
+                self.cancel_refresh_job();
+                tracing::info!(
+                    "ShowWorkloads: '{}' ({})",
+                    title,
+                    nodes
+                        .as_ref()
+                        .map(|n| format!("{} node(s)", n.len()))
+                        .unwrap_or_else(|| "whole cluster".to_string())
+                );
 
-                // Create workloads component
-                let mut workloads = WorkloadHealthComponent::new();
+                let mut workloads = WorkloadHealthComponent::new(title, nodes);
 
-                // Create K8s client from Talos client. Pin to a control plane
-                // node of the launched context so we read the right cluster's
-                // workloads, not whatever an ambient KUBECONFIG points at.
+                // The K8s client is created by the first refresh, which runs in
+                // the background; the view shows "Loading workloads..." until
+                // it lands
                 let cp_ip = self.cluster.control_plane_ip();
                 if let Some(talos_client) = self.cluster.client() {
-                    match crate::components::diagnostics::k8s::create_k8s_client_with_source(
-                        talos_client,
-                        cp_ip.as_deref(),
-                        None,
-                    )
-                    .await
-                    {
-                        Ok((k8s_client, _source)) => {
-                            workloads.set_k8s_client(k8s_client);
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to create K8s client: {:?}", e);
-                            workloads.set_error(format!("Failed to connect to Kubernetes: {}", e));
-                        }
-                    }
-                }
-
-                if let Err(e) = workloads.refresh().await {
-                    tracing::error!("Workloads refresh error: {:?}", e);
-                    workloads.set_error(e.to_string());
+                    workloads.set_k8s_source(talos_client.clone(), cp_ip);
+                    workloads.start_loading();
+                    self.refresh_job = Some(RefreshJob::Workloads(spawn_refresh!(workloads)));
+                } else {
+                    workloads.set_error("Not connected".to_string());
                 }
 
                 self.workloads = Some(workloads);
                 self.view = View::Workloads;
             }
             Action::ShowStorage(hostname, address) => {
+                self.cancel_refresh_job();
                 // Switch to storage view for a node
                 tracing::info!(
                     "ShowStorage: hostname='{}', address='{}'",
@@ -1242,10 +1400,7 @@ impl App {
                     // Create a client configured for this specific node
                     let node_client = client.with_node(&address);
                     storage.set_client(node_client);
-                    if let Err(e) = storage.refresh().await {
-                        tracing::error!("Storage refresh error: {:?}", e);
-                        storage.set_error(e.to_string());
-                    }
+                    self.refresh_job = Some(RefreshJob::Storage(spawn_refresh!(storage)));
                 }
 
                 self.storage = Some(storage);
@@ -1263,11 +1418,8 @@ impl App {
                     node_ops.set_client(talos_client.clone());
                 }
 
-                // Refresh to load safety checks
-                if let Err(e) = node_ops.refresh().await {
-                    tracing::error!("Node operations refresh error: {:?}", e);
-                    node_ops.set_error(e.to_string());
-                }
+                // Load safety checks (in the background)
+                node_ops.refresh();
 
                 self.node_operations = Some(node_ops);
                 self.view = View::NodeOperations;
@@ -1301,16 +1453,27 @@ impl App {
                     // context. Rolling ops cordon/drain by node name through this
                     // client — targeting the wrong cluster (an ambient KUBECONFIG)
                     // would drain the wrong nodes.
-                    if let Ok((k8s, _source)) =
-                        crate::components::diagnostics::k8s::create_k8s_client_with_source(
-                            talos_client,
-                            cp_ip.as_deref(),
-                            None,
-                        )
-                        .await
-                    {
-                        rolling_ops.set_k8s_client(k8s);
+                    //
+                    // Created in the background (see `poll_view_setup`).
+                    let talos_client = talos_client.clone();
+                    if let Some(h) = self.rolling_k8s_fetch.take() {
+                        h.abort();
                     }
+                    self.rolling_k8s_fetch = Some(tokio::spawn(async move {
+                        let created = tokio::time::timeout(
+                            Duration::from_secs(15),
+                            crate::components::diagnostics::k8s::create_k8s_client_with_source(
+                                &talos_client,
+                                cp_ip.as_deref(),
+                                None,
+                            ),
+                        )
+                        .await;
+                        match created {
+                            Ok(Ok((k8s, _source))) => Some(k8s),
+                            _ => None,
+                        }
+                    }));
                 }
 
                 self.rolling_operations = Some(rolling_ops);

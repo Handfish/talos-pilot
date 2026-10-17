@@ -63,6 +63,7 @@ pub struct DiagnosticsData {
 }
 
 /// Diagnostics component for node health checks
+#[derive(Clone)]
 pub struct DiagnosticsComponent {
     /// Async state for loaded data
     state: AsyncState<DiagnosticsData>,
@@ -104,6 +105,8 @@ pub struct DiagnosticsComponent {
     controlplane_endpoint: Option<String>,
     /// Custom config file path (from --config flag)
     config_path: Option<String>,
+    /// Talosconfig context of the active cluster (for talosctl commands)
+    talos_context: Option<String>,
 }
 
 impl Default for DiagnosticsComponent {
@@ -126,6 +129,7 @@ impl DiagnosticsComponent {
         context.node_role = node_role.clone();
         context.hostname = hostname.clone();
         context.node_endpoint = Some(address.clone());
+        context.config_path = config_path.clone();
 
         let initial_data = DiagnosticsData {
             hostname,
@@ -135,7 +139,12 @@ impl DiagnosticsComponent {
         };
 
         Self {
-            state: AsyncState::with_data(initial_data),
+            // Loading until the first (background) refresh lands
+            state: {
+                let mut state = AsyncState::with_data(initial_data);
+                state.start_loading();
+                state
+            },
             selected_category: 0,
             selected_check: 0,
             table_state,
@@ -152,6 +161,7 @@ impl DiagnosticsComponent {
             client: None,
             controlplane_endpoint: None,
             config_path,
+            talos_context: None,
         }
     }
 
@@ -173,6 +183,14 @@ impl DiagnosticsComponent {
     /// Set the control plane endpoint for fetching kubeconfig (used for worker nodes)
     pub fn set_controlplane_endpoint(&mut self, endpoint: Option<String>) {
         self.controlplane_endpoint = endpoint;
+    }
+
+    /// Set the talosconfig context used for talosctl commands
+    pub fn set_talos_context(&mut self, context: Option<String>) {
+        if let Some(data) = self.data_mut() {
+            data.context.talos_context = context.clone();
+        }
+        self.talos_context = context;
     }
 
     /// Set an error message
@@ -299,6 +317,14 @@ impl DiagnosticsComponent {
         }
     }
 
+    /// Show the pending fix as being applied, while a clone applies it in
+    /// the background; `adopt_refresh` takes over its result
+    pub fn begin_apply_fix(&mut self) {
+        self.applying_fix = true;
+        self.show_confirmation = false;
+        self.pending_action = None;
+    }
+
     /// Apply the pending fix action
     pub async fn apply_pending_fix(&mut self) -> Result<()> {
         tracing::info!("apply_pending_fix called");
@@ -326,42 +352,31 @@ impl DiagnosticsComponent {
                 let patch_yaml =
                     format!("machine:\n  kernel:\n    modules:\n      - name: {}", name);
 
-                let patch_file = "/tmp/talos-pilot-patch.yaml";
-                if let Err(e) = std::fs::write(patch_file, &patch_yaml) {
-                    tracing::error!("Failed to write patch file: {}", e);
-                    self.apply_result = Some(Err(format!("Failed to write patch file: {}", e)));
-                } else {
-                    let output = std::process::Command::new("talosctl")
-                        .args([
-                            "-n",
-                            &address,
-                            "patch",
-                            "machineconfig",
-                            "--mode=reboot",
-                            "-p",
-                            &format!("@{}", patch_file),
-                        ])
-                        .output();
+                // Without a context talosctl would fall back to its default
+                // context, which may be a different cluster than the one shown.
+                let Some(context) = self.talos_context.as_deref() else {
+                    tracing::error!("No talosconfig context for patch");
+                    self.apply_result = Some(Err("No talosconfig context available".to_string()));
+                    self.applying_fix = false;
+                    return Ok(());
+                };
 
-                    match output {
-                        Ok(result) => {
-                            if result.status.success() {
-                                let stdout = String::from_utf8_lossy(&result.stdout);
-                                tracing::info!("Patch succeeded: {}", stdout);
-                                self.apply_result = Some(Ok(vec![]));
-                            } else {
-                                let stderr = String::from_utf8_lossy(&result.stderr);
-                                tracing::error!("Patch failed: {}", stderr);
-                                self.apply_result = Some(Err(stderr.to_string()));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to run talosctl: {}", e);
-                            self.apply_result = Some(Err(format!("Failed to run talosctl: {}", e)));
-                        }
+                match talos_rs::patch_machineconfig_for_node(
+                    context,
+                    &address,
+                    self.config_path.as_deref(),
+                    &patch_yaml,
+                )
+                .await
+                {
+                    Ok(stdout) => {
+                        tracing::info!("Patch succeeded: {}", stdout);
+                        self.apply_result = Some(Ok(vec![]));
                     }
-
-                    let _ = std::fs::remove_file(patch_file);
+                    Err(e) => {
+                        tracing::error!("Patch failed: {}", e);
+                        self.apply_result = Some(Err(e.to_string()));
+                    }
                 }
             }
             FixAction::ApplyConfigPatch {
@@ -1017,6 +1032,14 @@ impl Component for DiagnosticsComponent {
             let error_msg =
                 Paragraph::new(format!("Error: {}", error)).style(Style::default().fg(Color::Red));
             frame.render_widget(error_msg, chunks[1]);
+        } else if self.state.is_loading()
+            && self
+                .data()
+                .is_none_or(|d| d.system_checks.is_empty() && d.service_checks.is_empty())
+        {
+            let loading = Paragraph::new("Running diagnostics...")
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(loading, chunks[1]);
         } else if let Some(data) = self.data() {
             // Dynamically size Addons section based on whether addons are detected
             let addons_height = if data.detected_addons.any_detected() {
@@ -1107,5 +1130,17 @@ impl Component for DiagnosticsComponent {
         }
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for DiagnosticsComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        // A fix applied in the background (see `begin_apply_fix`)
+        if self.applying_fix {
+            self.applying_fix = false;
+            self.apply_result = refreshed.apply_result;
+        }
+        self.state = refreshed.state;
+        self.ensure_valid_selection();
     }
 }
