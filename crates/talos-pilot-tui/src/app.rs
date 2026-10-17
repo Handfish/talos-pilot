@@ -1298,13 +1298,18 @@ impl App {
                 self.lifecycle = Some(lifecycle);
                 self.view = View::Lifecycle;
             }
-            Action::ShowWorkloads => {
+            Action::ShowWorkloads(title, nodes) => {
                 self.cancel_refresh_job();
-                // Switch to workload health view
-                tracing::info!("Viewing workload health");
+                tracing::info!(
+                    "ShowWorkloads: '{}' ({})",
+                    title,
+                    nodes
+                        .as_ref()
+                        .map(|n| format!("{} node(s)", n.len()))
+                        .unwrap_or_else(|| "whole cluster".to_string())
+                );
 
-                // Create workloads component
-                let mut workloads = WorkloadHealthComponent::new();
+                let mut workloads = WorkloadHealthComponent::new(title, nodes);
 
                 // Create K8s client from Talos client. Pin to a control plane
                 // node of the launched context so we read the right cluster's
@@ -1320,17 +1325,19 @@ impl App {
                     {
                         Ok((k8s_client, _source)) => {
                             workloads.set_k8s_client(k8s_client);
+                            // First load in the background; the view shows
+                            // "Loading workloads..." until it lands
+                            workloads.start_loading();
+                            self.refresh_job =
+                                Some(RefreshJob::Workloads(spawn_refresh!(workloads)));
                         }
                         Err(e) => {
                             tracing::error!("Failed to create K8s client: {:?}", e);
                             workloads.set_error(format!("Failed to connect to Kubernetes: {}", e));
                         }
                     }
-                }
-
-                if let Err(e) = workloads.refresh().await {
-                    tracing::error!("Workloads refresh error: {:?}", e);
-                    workloads.set_error(e.to_string());
+                } else {
+                    workloads.set_error("Not connected".to_string());
                 }
 
                 self.workloads = Some(workloads);

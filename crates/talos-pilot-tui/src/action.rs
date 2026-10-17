@@ -43,8 +43,9 @@ pub enum Action {
     ShowSecurity,
     /// Show lifecycle/version view
     ShowLifecycle,
-    /// Show workload health view
-    ShowWorkloads,
+    /// Show workload health view: (title, nodes to limit it to, or `None`
+    /// for the whole cluster)
+    ShowWorkloads(String, Option<Vec<String>>),
     /// Show storage/disks view for a node: (hostname, address)
     ShowStorage(String, String),
     /// Show node operations overlay: (hostname, address, is_controlplane)

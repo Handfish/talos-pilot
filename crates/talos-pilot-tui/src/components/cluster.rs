@@ -1019,6 +1019,34 @@ impl ClusterComponent {
         (!nodes.is_empty()).then_some(Action::ShowProcesses(title, nodes))
     }
 
+    /// Workloads view for the selection: the whole cluster for a cluster
+    /// header, otherwise only the pods on the selected node(s). Offline nodes
+    /// stay in scope, since their pods are the ones most likely in trouble.
+    fn workloads_action(&self) -> Action {
+        let selected = self
+            .selected_nodes()
+            .and_then(|(idx, names)| Some((self.clusters.get(idx)?, names)));
+        match (selected, &self.selected_item) {
+            (Some((cluster, _)), NodeListItem::ClusterHeader(_)) => {
+                Action::ShowWorkloads(cluster.name.clone(), None)
+            }
+            (Some((cluster, names)), item) if !names.is_empty() => {
+                let title = match item {
+                    NodeListItem::ControlPlaneHeader(_) => {
+                        format!("{} control plane", cluster.name)
+                    }
+                    NodeListItem::WorkersHeader(_) => format!("{} workers", cluster.name),
+                    _ => names[0].clone(),
+                };
+                Action::ShowWorkloads(title, Some(names))
+            }
+            _ => Action::ShowWorkloads(
+                self.current_context_name().unwrap_or("cluster").to_string(),
+                None,
+            ),
+        }
+    }
+
     /// Whether a node is a control plane node (see `ClusterData::is_controlplane`)
     fn node_is_controlplane(&self, cluster_idx: usize, node: &str) -> bool {
         self.clusters
@@ -1905,7 +1933,7 @@ impl ClusterComponent {
             }
             NavMenuItem::Certs => Ok(Some(Action::ShowSecurity)),
             NavMenuItem::Lifecycle => Ok(Some(Action::ShowLifecycle)),
-            NavMenuItem::Workloads => Ok(Some(Action::ShowWorkloads)),
+            NavMenuItem::Workloads => Ok(Some(self.workloads_action())),
         }
     }
 }
@@ -2223,7 +2251,7 @@ impl Component for ClusterComponent {
             }
             KeyCode::Char('c') => Ok(Some(Action::ShowSecurity)),
             KeyCode::Char('y') => Ok(Some(Action::ShowLifecycle)),
-            KeyCode::Char('w') => Ok(Some(Action::ShowWorkloads)),
+            KeyCode::Char('w') => Ok(Some(self.workloads_action())),
             KeyCode::Char('o') => {
                 // Show node operations overlay for selected node
                 if let Some(node_name) = self.current_node_name() {
