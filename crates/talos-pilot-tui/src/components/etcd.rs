@@ -48,6 +48,7 @@ pub struct EtcdData {
 }
 
 /// Etcd cluster status component
+#[derive(Clone)]
 pub struct EtcdComponent {
     /// Async state wrapping all etcd data (loading, error, data)
     state: AsyncState<EtcdData>,
@@ -724,5 +725,18 @@ impl Component for EtcdComponent {
         }
 
         Ok(())
+    }
+}
+
+impl crate::components::BackgroundRefresh for EtcdComponent {
+    fn adopt_refresh(&mut self, refreshed: Self) {
+        // Keep the member the user moved to while the refresh ran
+        let selected = self.data().map(|d| d.members.selected_index());
+        self.state = refreshed.state;
+        if let (Some(index), Some(data)) = (selected, self.state.data_mut()) {
+            data.members.select(index);
+        }
+        let index = self.data().map(|d| d.members.selected_index()).unwrap_or(0);
+        self.table_state.select(Some(index));
     }
 }

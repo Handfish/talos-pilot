@@ -17,6 +17,32 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 /// waits when every configured endpoint is unreachable.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// TCP keepalive: idle time before the first probe, the gap between probes,
+/// and how many unanswered probes drop the connection.
+///
+/// Detects a connection that silently died (e.g. a network path that started
+/// dropping packets) in about 30s, so requests fail and the channel
+/// reconnects instead of waiting on it forever. This is done at the TCP
+/// level on purpose: apid uses grpc-go's default keepalive policy, which
+/// answers HTTP/2 pings more often than every 5 minutes with a
+/// `too_many_pings` GOAWAY that would cut long-lived streams such as logs.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// TCP connector for an endpoint, with `TCP_KEEPALIVE_*` probing
+fn tcp_connector() -> hyper_util::client::legacy::connect::HttpConnector {
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    // tonic dials https:// URLs through this and adds TLS on top
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    http.set_keepalive(Some(TCP_KEEPALIVE_IDLE));
+    http.set_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL));
+    http.set_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
+    http
+}
+
 /// Convert Ed25519 private key PEM to standard PKCS8 format
 /// Talos uses "ED25519 PRIVATE KEY" header but tonic/rustls expects "PRIVATE KEY"
 fn convert_ed25519_key_to_pkcs8(pem: &[u8]) -> Vec<u8> {
@@ -79,8 +105,7 @@ pub async fn create_channel(ctx: &Context) -> Result<Channel, TalosError> {
             .map_err(|e| TalosError::Connection(format!("Invalid endpoint URL '{}': {}", url, e)))?
             .tls_config(tls_config.clone())
             .map_err(|e| TalosError::Tls(format!("TLS config error: {:?}", e)))?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_keepalive(Some(Duration::from_secs(60)));
+            .connect_timeout(CONNECT_TIMEOUT);
         endpoints.push((url.clone(), endpoint));
     }
 
@@ -100,7 +125,7 @@ pub async fn create_channel(ctx: &Context) -> Result<Channel, TalosError> {
         .into_iter()
         .map(|(url, endpoint)| {
             Box::pin(async move {
-                match endpoint.connect().await {
+                match endpoint.connect_with_connector(tcp_connector()).await {
                     Ok(channel) => Ok((url, channel)),
                     Err(e) => {
                         tracing::warn!("Endpoint {} not reachable: {}", url, e);

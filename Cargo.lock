@@ -2837,6 +2837,7 @@ dependencies = [
  "fastrand",
  "flate2",
  "futures",
+ "hyper-util",
  "prost",
  "prost-types",
  "rustls",

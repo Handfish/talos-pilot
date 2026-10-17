@@ -798,6 +798,8 @@ pub struct ClusterComponent {
     network_info: HashMap<(String, String), (std::time::Instant, Option<NodeNetworkInfo>)>,
     /// In-flight network summary fetch for the selected node(s) (see `poll_network_info`)
     network_fetch: Option<NetworkFetch>,
+    /// In-flight stats fetch for the selected node (see `refresh_selected_node`)
+    node_stats_fetch: Option<tokio::task::JoinHandle<NodeStatsFetch>>,
     /// Screen regions from the last draw, for mapping mouse clicks
     hits: std::cell::RefCell<HitMap>,
 }
@@ -823,6 +825,22 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
 }
 
 /// Background `get_node_network_info` calls, keyed by (context, node name)
+/// Stats of one node, fetched in the background for the selected node.
+/// A call that failed or timed out is `None`, keeping the previous values.
+struct NodeStatsFetch {
+    /// Context of the cluster the node belongs to
+    context: String,
+    node: String,
+    services: Option<Vec<NodeServices>>,
+    memory: Option<Vec<NodeMemory>>,
+    load_avg: Option<Vec<NodeLoadAvg>>,
+    system_stat: Option<Vec<NodeSystemStat>>,
+    mounts: Option<Vec<NodeMounts>>,
+}
+
+/// How long each selected-node stats call may take
+const NODE_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 type NetworkFetch = tokio::task::JoinHandle<
     Vec<(
         (String, String),
@@ -989,6 +1007,7 @@ impl ClusterComponent {
             cluster_refreshed_at: Vec::new(),
             network_info: HashMap::new(),
             network_fetch: None,
+            node_stats_fetch: None,
             hits: std::cell::RefCell::new(HitMap::default()),
         }
     }
@@ -1526,90 +1545,122 @@ impl ClusterComponent {
         }
     }
 
-    /// Refresh only the selected node's stats (memory, load, services)
-    /// This is lighter weight than a full refresh
-    pub async fn refresh_selected_node(&mut self) -> Result<()> {
-        let cluster_idx = self.active_cluster;
-        let Some(cluster) = self.clusters.get(cluster_idx) else {
-            return Ok(());
-        };
-        let Some(client) = &cluster.client else {
-            return Ok(());
-        };
-        let client = client.clone();
+    /// Refresh only the selected node's stats (memory, load, services).
+    /// This is lighter weight than a full refresh.
+    ///
+    /// The calls run concurrently in a spawned task, each bounded by
+    /// `NODE_STATS_TIMEOUT`, so a node with network trouble never blocks the
+    /// event loop; `poll_selected_node_refresh` merges the results.
+    pub fn refresh_selected_node(&mut self) {
+        self.poll_selected_node_refresh();
+        if self.node_stats_fetch.is_some() {
+            return;
+        }
+        // Counts as an attempt, so a failing node is retried on schedule
+        self.last_auto_refresh = Some(std::time::Instant::now());
 
-        // Get the selected node's name and IP
-        let Some(node_name) = self.current_node_name() else {
-            return Ok(());
+        let Some(cluster) = self.clusters.get(self.active_cluster) else {
+            return;
         };
-        let Some(cluster) = self.clusters.get(cluster_idx) else {
-            return Ok(());
+        let Some(client) = cluster.client.clone() else {
+            return;
+        };
+        let Some(node_name) = self.current_node_name() else {
+            return;
         };
         let Some(node_ip) = cluster.node_ips.get(&node_name).cloned() else {
-            return Ok(());
+            return;
         };
         // Offline nodes are re-checked by the cluster refresh; querying one
         // here would only wait out a timeout.
         if cluster.offline.contains_key(&node_name) {
-            return Ok(());
+            return;
         }
+        let context = cluster.name.clone();
 
         let node_client = client.with_node(&node_ip);
+        self.node_stats_fetch = Some(tokio::spawn(async move {
+            async fn bounded<T>(
+                call: impl std::future::Future<Output = Result<T, talos_rs::TalosError>>,
+            ) -> Option<T> {
+                tokio::time::timeout(NODE_STATS_TIMEOUT, call)
+                    .await
+                    .ok()?
+                    .ok()
+            }
+            let (services, memory, load_avg, system_stat, mounts) = tokio::join!(
+                bounded(node_client.services()),
+                bounded(node_client.memory()),
+                bounded(node_client.load_avg()),
+                bounded(node_client.system_stat()),
+                bounded(node_client.mounts()),
+            );
+            NodeStatsFetch {
+                context,
+                node: node_name,
+                services,
+                memory,
+                load_avg,
+                system_stat,
+                mounts,
+            }
+        }));
+    }
 
-        // Fetch services, memory, and load for this node
-        if let Ok(mut node_services) = node_client.services().await {
+    /// Merge a finished selected-node stats fetch into its cluster's data
+    pub fn poll_selected_node_refresh(&mut self) {
+        use futures::FutureExt;
+
+        if !self
+            .node_stats_fetch
+            .as_ref()
+            .is_some_and(|f| f.is_finished())
+        {
+            return;
+        }
+        let Some(Some(Ok(fetch))) = self.node_stats_fetch.take().map(|f| f.now_or_never()) else {
+            return;
+        };
+        let Some(cluster) = self.clusters.iter_mut().find(|c| c.name == fetch.context) else {
+            return;
+        };
+        let node = fetch.node;
+
+        if let Some(mut node_services) = fetch.services {
             for s in &mut node_services {
-                s.node = node_name.clone();
+                s.node = node.clone();
             }
-            // Update the services for this node
-            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
-                cluster.services.retain(|s| s.node != node_name);
-                cluster.services.extend(node_services);
-            }
+            cluster.services.retain(|s| s.node != node);
+            cluster.services.extend(node_services);
         }
-
-        if let Ok(mut node_memory) = node_client.memory().await {
+        if let Some(mut node_memory) = fetch.memory {
             for m in &mut node_memory {
-                m.node = node_name.clone();
+                m.node = node.clone();
             }
-            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
-                cluster.memory.retain(|m| m.node != node_name);
-                cluster.memory.extend(node_memory);
-            }
+            cluster.memory.retain(|m| m.node != node);
+            cluster.memory.extend(node_memory);
         }
-
-        if let Ok(mut node_load) = node_client.load_avg().await {
+        if let Some(mut node_load) = fetch.load_avg {
             for l in &mut node_load {
-                l.node = node_name.clone();
+                l.node = node.clone();
             }
-            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
-                cluster.load_avg.retain(|l| l.node != node_name);
-                cluster.load_avg.extend(node_load);
-            }
+            cluster.load_avg.retain(|l| l.node != node);
+            cluster.load_avg.extend(node_load);
         }
-
-        if let Ok(mut node_stat) = node_client.system_stat().await {
+        if let Some(mut node_stat) = fetch.system_stat {
             for s in &mut node_stat {
-                s.node = node_name.clone();
+                s.node = node.clone();
             }
-            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
-                cluster.system_stat.retain(|s| s.node != node_name);
-                cluster.system_stat.extend(node_stat);
-            }
+            cluster.system_stat.retain(|s| s.node != node);
+            cluster.system_stat.extend(node_stat);
         }
-
-        if let Ok(mut node_mounts) = node_client.mounts().await {
+        if let Some(mut node_mounts) = fetch.mounts {
             for m in &mut node_mounts {
-                m.node = node_name.clone();
+                m.node = node.clone();
             }
-            if let Some(cluster) = self.clusters.get_mut(cluster_idx) {
-                cluster.mounts.retain(|m| m.node != node_name);
-                cluster.mounts.extend(node_mounts);
-            }
+            cluster.mounts.retain(|m| m.node != node);
+            cluster.mounts.extend(node_mounts);
         }
-
-        self.last_auto_refresh = Some(std::time::Instant::now());
-        Ok(())
     }
 
     /// Check if auto-refresh should trigger (every 5 seconds)

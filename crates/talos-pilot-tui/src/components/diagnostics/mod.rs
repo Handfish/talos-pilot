@@ -139,7 +139,12 @@ impl DiagnosticsComponent {
         };
 
         Self {
-            state: AsyncState::with_data(initial_data),
+            // Loading until the first (background) refresh lands
+            state: {
+                let mut state = AsyncState::with_data(initial_data);
+                state.start_loading();
+                state
+            },
             selected_category: 0,
             selected_check: 0,
             table_state,
@@ -310,6 +315,14 @@ impl DiagnosticsComponent {
                 self.show_details = true;
             }
         }
+    }
+
+    /// Show the pending fix as being applied, while a clone applies it in
+    /// the background; `adopt_refresh` takes over its result
+    pub fn begin_apply_fix(&mut self) {
+        self.applying_fix = true;
+        self.show_confirmation = false;
+        self.pending_action = None;
     }
 
     /// Apply the pending fix action
@@ -1019,6 +1032,14 @@ impl Component for DiagnosticsComponent {
             let error_msg =
                 Paragraph::new(format!("Error: {}", error)).style(Style::default().fg(Color::Red));
             frame.render_widget(error_msg, chunks[1]);
+        } else if self.state.is_loading()
+            && self
+                .data()
+                .is_none_or(|d| d.system_checks.is_empty() && d.service_checks.is_empty())
+        {
+            let loading = Paragraph::new("Running diagnostics...")
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(loading, chunks[1]);
         } else if let Some(data) = self.data() {
             // Dynamically size Addons section based on whether addons are detected
             let addons_height = if data.detected_addons.any_detected() {
@@ -1114,6 +1135,11 @@ impl Component for DiagnosticsComponent {
 
 impl crate::components::BackgroundRefresh for DiagnosticsComponent {
     fn adopt_refresh(&mut self, refreshed: Self) {
+        // A fix applied in the background (see `begin_apply_fix`)
+        if self.applying_fix {
+            self.applying_fix = false;
+            self.apply_result = refreshed.apply_result;
+        }
         self.state = refreshed.state;
         self.ensure_valid_selection();
     }

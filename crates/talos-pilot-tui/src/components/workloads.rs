@@ -224,6 +224,9 @@ pub struct WorkloadHealthComponent {
 
     /// Kubernetes client
     k8s_client: Option<Client>,
+    /// Where to get a Kubernetes client when there is none yet: the Talos
+    /// client and a control plane node to fetch the kubeconfig from
+    k8s_source: Option<(talos_rs::TalosClient, Option<String>)>,
 
     /// What the view covers, e.g. the cluster or node name
     title: String,
@@ -253,6 +256,7 @@ impl WorkloadHealthComponent {
         Self {
             state: AsyncState::new(),
             k8s_client: None,
+            k8s_source: None,
             title,
             scope: nodes.map(|n| n.into_iter().collect()),
             selected_namespace: 0,
@@ -273,6 +277,12 @@ impl WorkloadHealthComponent {
         self.k8s_client = Some(client);
     }
 
+    /// Create the Kubernetes client during the (background) refresh, from
+    /// the kubeconfig of `cp_ip`, so a slow fetch never blocks the UI
+    pub fn set_k8s_source(&mut self, talos_client: talos_rs::TalosClient, cp_ip: Option<String>) {
+        self.k8s_source = Some((talos_client, cp_ip));
+    }
+
     /// Show the loading state until the first background refresh lands
     pub fn start_loading(&mut self) {
         self.state.start_loading();
@@ -285,6 +295,37 @@ impl WorkloadHealthComponent {
 
     /// Refresh workload data from the cluster
     pub async fn refresh(&mut self) -> Result<()> {
+        if self.k8s_client.is_none()
+            && let Some((talos_client, cp_ip)) = &self.k8s_source
+        {
+            // Pin to a control plane node of the launched context so we read
+            // the right cluster's workloads, not whatever an ambient
+            // KUBECONFIG points at.
+            let created = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                crate::components::diagnostics::k8s::create_k8s_client_with_source(
+                    talos_client,
+                    cp_ip.as_deref(),
+                    None,
+                ),
+            )
+            .await;
+            match created {
+                Ok(Ok((k8s_client, _source))) => self.k8s_client = Some(k8s_client),
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to create K8s client: {:?}", e);
+                    self.set_error(format!("Failed to connect to Kubernetes: {}", e));
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.set_error(
+                        "Failed to connect to Kubernetes: timed out fetching the kubeconfig"
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+            }
+        }
         let Some(client) = &self.k8s_client else {
             self.set_error("No Kubernetes client configured".to_string());
             return Ok(());

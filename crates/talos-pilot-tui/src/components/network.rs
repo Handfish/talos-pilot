@@ -19,9 +19,85 @@ use talos_pilot_core::constants::MAX_CAPTURE_SIZE;
 use talos_pilot_core::{AsyncState, format_bytes};
 use talos_rs::{
     ConnectionCounts, ConnectionInfo, ConnectionState, KubeSpanPeerStatus, NetDevRate, NetDevStats,
-    NetstatFilter, ServiceInfo, TalosClient, get_kubespan_peers_for_node,
+    NetstatFilter, NodeConnections, NodeNetworkStats, NodeServices, ServiceInfo,
+    ServiceRestartResult, TalosClient, TalosError, get_kubespan_peers_for_node,
     is_kubespan_enabled_for_node,
 };
+use tokio::task::JoinHandle;
+
+/// How long one network call may take before it counts as failed
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run a Talos call with `CALL_TIMEOUT`, turning a timeout into an error
+async fn with_timeout<T>(
+    call: impl std::future::Future<Output = std::result::Result<T, TalosError>>,
+) -> std::result::Result<T, TalosError> {
+    match tokio::time::timeout(CALL_TIMEOUT, call).await {
+        Ok(result) => result,
+        Err(_) => Err(TalosError::Connection(format!(
+            "request timed out after {}s",
+            CALL_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Results of one background stats fetch: interface stats, netstat, services
+type StatsFetch = (
+    std::result::Result<Vec<NodeNetworkStats>, TalosError>,
+    std::result::Result<Vec<NodeConnections>, TalosError>,
+    std::result::Result<Vec<NodeServices>, TalosError>,
+);
+
+/// A service restart's id and outcome
+type RestartResult = (
+    String,
+    std::result::Result<Vec<ServiceRestartResult>, TalosError>,
+);
+
+/// A file viewer fetch: viewer, path, and content
+type FileResult = (
+    FileViewerType,
+    &'static str,
+    std::result::Result<String, TalosError>,
+);
+
+/// An opened packet capture stream
+type CaptureResult = std::result::Result<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, TalosError>;
+
+/// Network calls running in spawned tasks, so a node that stops answering
+/// never blocks the event loop. Each is picked up on `Tick`.
+#[derive(Default)]
+struct NetworkTasks {
+    stats: Option<JoinHandle<StatsFetch>>,
+    restart: Option<JoinHandle<RestartResult>>,
+    file: Option<JoinHandle<FileResult>>,
+    capture: Option<JoinHandle<CaptureResult>>,
+}
+
+impl Drop for NetworkTasks {
+    fn drop(&mut self) {
+        // Results only feed this view. A restart already sent is left to finish.
+        if let Some(t) = &self.stats {
+            t.abort();
+        }
+        if let Some(t) = &self.file {
+            t.abort();
+        }
+        if let Some(t) = &self.capture {
+            t.abort();
+        }
+    }
+}
+
+/// Take a task's result once it has finished, without waiting
+fn take_finished<T>(task: &mut Option<JoinHandle<T>>) -> Option<T> {
+    use futures::FutureExt;
+
+    if !task.as_ref().is_some_and(|t| t.is_finished()) {
+        return None;
+    }
+    task.take()?.now_or_never()?.ok()
+}
 
 /// Well-known Talos/Kubernetes service ports
 fn port_to_service(port: u32) -> Option<&'static str> {
@@ -107,7 +183,7 @@ pub enum PendingAction {
 }
 
 /// File viewer overlay type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FileViewerType {
     /// DNS configuration (/etc/resolv.conf)
     DnsConfig,
@@ -286,6 +362,9 @@ pub struct NetworkStatsComponent {
     kubespan_selected: usize,
     /// KubeSpan table state
     kubespan_table_state: TableState,
+
+    /// In-flight network calls
+    tasks: NetworkTasks,
 }
 
 impl Default for NetworkStatsComponent {
@@ -337,6 +416,7 @@ impl NetworkStatsComponent {
                 state.select(Some(0));
                 state
             },
+            tasks: NetworkTasks::default(),
         }
     }
 
@@ -367,12 +447,27 @@ impl NetworkStatsComponent {
         self.state.set_error(error);
     }
 
-    /// Refresh network data from the node
-    pub async fn refresh(&mut self) -> Result<()> {
+    /// Refresh network data from the node: start any requested action
+    /// (service restart, file view, packet capture) and a stats fetch, each in
+    /// a spawned task. Returns at once; `update(Tick)` applies the results.
+    pub fn refresh(&mut self) {
         let Some(client) = self.client.clone() else {
             self.set_error("No client configured".to_string());
-            return Ok(());
+            return;
         };
+
+        self.perform_pending_restart();
+        if self.file_viewer_needs_fetch() {
+            self.fetch_file_content();
+        }
+        if self.needs_capture_start() {
+            self.start_capture_async();
+        }
+
+        self.poll_tasks();
+        if self.tasks.stats.is_some() {
+            return;
+        }
 
         self.state.start_loading();
 
@@ -381,22 +476,37 @@ impl NetworkStatsComponent {
             self.state.set_data(NetworkData::default());
         }
 
-        let timeout = std::time::Duration::from_secs(10);
-
         // Fetch interface stats, netstat data, and services concurrently
-        let dev_future = client.network_device_stats();
-        let conn_future = client.netstat(NetstatFilter::All);
-        let svc_future = client.services();
+        self.tasks.stats = Some(tokio::spawn(async move {
+            tokio::join!(
+                with_timeout(client.network_device_stats()),
+                with_timeout(client.netstat(NetstatFilter::All)),
+                with_timeout(client.services())
+            )
+        }));
+    }
 
-        let (dev_result, conn_result, svc_result) = tokio::join!(
-            tokio::time::timeout(timeout, dev_future),
-            tokio::time::timeout(timeout, conn_future),
-            tokio::time::timeout(timeout, svc_future)
-        );
+    /// Apply whatever background network calls have finished
+    fn poll_tasks(&mut self) {
+        if let Some(fetch) = take_finished(&mut self.tasks.stats) {
+            self.apply_stats(fetch);
+        }
+        if let Some((service_id, result)) = take_finished(&mut self.tasks.restart) {
+            self.apply_restart(service_id, result);
+        }
+        if let Some((viewer_type, path, result)) = take_finished(&mut self.tasks.file) {
+            self.apply_file_content(viewer_type, path, result);
+        }
+        if let Some(result) = take_finished(&mut self.tasks.capture) {
+            self.apply_capture_start(result);
+        }
+    }
 
+    /// Apply a finished stats fetch
+    fn apply_stats(&mut self, (dev_result, conn_result, svc_result): StatsFetch) {
         // Process interface stats
         match dev_result {
-            Ok(Ok(stats)) => {
+            Ok(stats) => {
                 if let Some(node_data) = stats.into_iter().next() {
                     self.update_devices(node_data.devices);
                 } else if let Some(data) = self.data_mut() {
@@ -404,22 +514,18 @@ impl NetworkStatsComponent {
                     data.rates.clear();
                 }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 self.set_error(format!(
                     "Failed to fetch network stats: {} (node: {})",
                     e, self.address
                 ));
-                return Ok(());
-            }
-            Err(_) => {
-                self.set_error(format!("Request timed out after {}s", timeout.as_secs()));
-                return Ok(());
+                return;
             }
         }
 
         // Process netstat data (don't fail if this errors, connection data is supplementary)
         match conn_result {
-            Ok(Ok(conn_data)) => {
+            Ok(conn_data) => {
                 if let Some(node_conns) = conn_data.into_iter().next() {
                     self.update_connections(node_conns.connections);
                 } else if let Some(data) = self.data_mut() {
@@ -427,15 +533,9 @@ impl NetworkStatsComponent {
                     data.conn_counts = ConnectionCounts::default();
                 }
             }
-            Ok(Err(_)) => {
-                // Silently ignore netstat errors - interface data still useful
-                if let Some(data) = self.data_mut() {
-                    data.connections.clear();
-                    data.conn_counts = ConnectionCounts::default();
-                }
-            }
             Err(_) => {
-                // Timeout on netstat - continue with interface data
+                // Silently ignore netstat errors and timeouts - interface
+                // data still useful
                 if let Some(data) = self.data_mut() {
                     data.connections.clear();
                     data.conn_counts = ConnectionCounts::default();
@@ -445,7 +545,7 @@ impl NetworkStatsComponent {
 
         // Process services data (don't fail if this errors)
         match svc_result {
-            Ok(Ok(svc_data)) => {
+            Ok(svc_data) => {
                 if let Some(node_svcs) = svc_data.into_iter().next() {
                     if let Some(data) = self.data_mut() {
                         data.services = node_svcs
@@ -458,7 +558,7 @@ impl NetworkStatsComponent {
                     data.services.clear();
                 }
             }
-            Ok(Err(_)) | Err(_) => {
+            Err(_) => {
                 // Silently ignore service errors
                 if let Some(data) = self.data_mut() {
                     data.services.clear();
@@ -480,8 +580,6 @@ impl NetworkStatsComponent {
         self.table_state.select(Some(self.selected));
 
         self.state.mark_loaded();
-
-        Ok(())
     }
 
     /// Apply a finished KubeSpan fetch and start the next one when due.
@@ -2837,6 +2935,16 @@ impl Component for NetworkStatsComponent {
                 self.status_message = None;
             }
 
+            // Start a requested file view or capture without waiting for the
+            // next refresh, and apply finished background calls
+            if self.file_viewer_needs_fetch() {
+                self.fetch_file_content();
+            }
+            if self.needs_capture_start() {
+                self.start_capture_async();
+            }
+            self.poll_tasks();
+
             // Poll packet capture for new data
             if self.is_capturing() {
                 self.poll_capture();
@@ -2915,13 +3023,13 @@ impl Component for NetworkStatsComponent {
 
 // Service action methods
 impl NetworkStatsComponent {
-    /// Perform the service restart (called from app.rs after refresh)
-    pub async fn perform_pending_restart(&mut self) -> Result<Option<String>> {
+    /// Start the pending service restart in the background (from `refresh`)
+    fn perform_pending_restart(&mut self) {
         let Some(service_id) = self.pending_restart_service.take() else {
-            return Ok(None);
+            return;
         };
 
-        let Some(client) = &self.client else {
+        let Some(client) = self.client.clone() else {
             let output = CommandOutput {
                 command: format!("Restart {}", service_id),
                 lines: vec!["Error: No client configured".to_string()],
@@ -2930,10 +3038,23 @@ impl NetworkStatsComponent {
             };
             self.command_output = Some(output);
             self.show_output_pane = true;
-            return Ok(None);
+            return;
         };
 
-        match client.service_restart(&service_id).await {
+        self.status_message = Some((format!("Restarting {}...", service_id), Instant::now()));
+        self.tasks.restart = Some(tokio::spawn(async move {
+            let result = with_timeout(client.service_restart(&service_id)).await;
+            (service_id, result)
+        }));
+    }
+
+    /// Show the outcome of a finished service restart
+    fn apply_restart(
+        &mut self,
+        service_id: String,
+        result: std::result::Result<Vec<ServiceRestartResult>, TalosError>,
+    ) {
+        match result {
             Ok(results) => {
                 let mut lines = Vec::new();
                 lines.push(format!("Restarting service: {}", service_id));
@@ -2962,8 +3083,6 @@ impl NetworkStatsComponent {
                 self.command_output = Some(output);
                 self.show_output_pane = true;
                 self.status_message = None; // Clear status message, using output pane instead
-
-                Ok(Some(format!("Service '{}' restarted", service_id)))
             }
             Err(e) => {
                 let lines = vec![
@@ -2983,8 +3102,6 @@ impl NetworkStatsComponent {
                 self.command_output = Some(output);
                 self.show_output_pane = true;
                 self.status_message = None;
-
-                Ok(Some(format!("Failed to restart '{}': {}", service_id, e)))
             }
         }
     }
@@ -3242,30 +3359,39 @@ impl NetworkStatsComponent {
         });
     }
 
-    /// Fetch file content for the file viewer
-    pub async fn fetch_file_content(&mut self) {
-        // Get viewer type and path first
-        let (viewer_type, path) = {
-            let Some(ref viewer) = self.file_viewer else {
-                return;
-            };
-            let path = match viewer.viewer_type {
-                FileViewerType::DnsConfig => "/etc/resolv.conf",
-                FileViewerType::RoutingTable => "/proc/net/route",
-            };
-            (viewer.viewer_type.clone(), path)
+    /// Fetch file content for the file viewer in the background
+    fn fetch_file_content(&mut self) {
+        let Some(viewer_type) = self.file_viewer.as_ref().map(|v| v.viewer_type.clone()) else {
+            return;
+        };
+        let path = match viewer_type {
+            FileViewerType::DnsConfig => "/etc/resolv.conf",
+            FileViewerType::RoutingTable => "/proc/net/route",
         };
 
-        let Some(client) = &self.client else {
+        let Some(client) = self.client.clone() else {
             if let Some(ref mut viewer) = self.file_viewer {
                 viewer.lines = vec!["Error: No client configured".to_string()];
             }
             return;
         };
+        if self.tasks.file.is_some() {
+            return;
+        }
 
-        let result = client.read_file(path).await;
+        self.tasks.file = Some(tokio::spawn(async move {
+            let result = with_timeout(client.read_file(path)).await;
+            (viewer_type, path, result)
+        }));
+    }
 
-        // Now parse and update
+    /// Show fetched file content in the file viewer
+    fn apply_file_content(
+        &mut self,
+        viewer_type: FileViewerType,
+        path: &str,
+        result: std::result::Result<String, TalosError>,
+    ) {
         let lines = match result {
             Ok(content) => match viewer_type {
                 FileViewerType::DnsConfig => Self::parse_dns_config_static(&content),
@@ -3274,7 +3400,9 @@ impl NetworkStatsComponent {
             Err(e) => vec![format!("Error reading {}: {}", path, e)],
         };
 
-        if let Some(ref mut viewer) = self.file_viewer {
+        if let Some(ref mut viewer) = self.file_viewer
+            && viewer.viewer_type == viewer_type
+        {
             viewer.lines = lines;
         }
     }
@@ -3539,51 +3667,61 @@ impl NetworkStatsComponent {
         }
     }
 
-    /// Start the async capture (called from app.rs)
-    pub async fn start_capture_async(&mut self) {
-        if let CaptureState::Capturing(ref interface, _) = self.capture.state {
-            if self.capture.receiver.is_some() {
-                return; // Already started
-            }
+    /// Open the packet capture stream in the background (from `refresh`)
+    fn start_capture_async(&mut self) {
+        let CaptureState::Capturing(ref interface, _) = self.capture.state else {
+            return;
+        };
+        if self.capture.receiver.is_some() || self.tasks.capture.is_some() {
+            return; // Already started
+        }
 
-            let Some(client) = &self.client else {
-                self.status_message =
-                    Some(("Error: No client configured".to_string(), Instant::now()));
-                self.capture.state = CaptureState::Idle;
-                return;
-            };
+        let Some(client) = self.client.clone() else {
+            self.status_message = Some(("Error: No client configured".to_string(), Instant::now()));
+            self.capture.state = CaptureState::Idle;
+            return;
+        };
 
-            // Use snap_len=65535 to capture full packets
-            // Optionally use BPF filter to exclude port 50000 (Talos API)
-            // to prevent feedback loop when capturing on management interface
-            let capture_result = if self.capture.use_bpf_filter {
-                client
-                    .packet_capture_exclude_api(interface, false, 65535)
-                    .await
+        // Use snap_len=65535 to capture full packets
+        // Optionally use BPF filter to exclude port 50000 (Talos API)
+        // to prevent feedback loop when capturing on management interface
+        let interface = interface.clone();
+        let use_bpf_filter = self.capture.use_bpf_filter;
+        self.tasks.capture = Some(tokio::spawn(async move {
+            if use_bpf_filter {
+                with_timeout(client.packet_capture_exclude_api(&interface, false, 65535)).await
             } else {
-                client.packet_capture(interface, false, 65535).await
-            };
+                with_timeout(client.packet_capture(&interface, false, 65535)).await
+            }
+        }));
+    }
 
-            match capture_result {
-                Ok(receiver) => {
-                    self.capture.receiver = Some(receiver);
-                    let filter_status = if self.capture.use_bpf_filter {
-                        " [BPF filter on]"
-                    } else {
-                        " [NO filter]"
-                    };
-                    self.status_message = Some((
-                        format!(
-                            "Capturing on {}{} (save with 's')",
-                            interface, filter_status
-                        ),
-                        Instant::now(),
-                    ));
-                }
-                Err(e) => {
-                    self.status_message = Some((format!("Capture failed: {}", e), Instant::now()));
-                    self.capture.state = CaptureState::Idle;
-                }
+    /// Hook up an opened capture stream, unless the capture was stopped
+    /// while it opened
+    fn apply_capture_start(&mut self, result: CaptureResult) {
+        let CaptureState::Capturing(ref interface, _) = self.capture.state else {
+            return;
+        };
+        let interface = interface.clone();
+        match result {
+            Ok(receiver) => {
+                self.capture.receiver = Some(receiver);
+                let filter_status = if self.capture.use_bpf_filter {
+                    " [BPF filter on]"
+                } else {
+                    " [NO filter]"
+                };
+                self.status_message = Some((
+                    format!(
+                        "Capturing on {}{} (save with 's')",
+                        interface, filter_status
+                    ),
+                    Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.status_message = Some((format!("Capture failed: {}", e), Instant::now()));
+                self.capture.state = CaptureState::Idle;
             }
         }
     }

@@ -473,6 +473,155 @@ pub struct NodeOperationsData {
     pub drain_safety: SafetyStatus,
 }
 
+/// How long each safety check call may take before it counts as failed
+const SAFETY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Results of a background safety check run
+struct SafetyChecks {
+    /// etcd quorum info (`None` if it could not be fetched)
+    etcd_info: Option<NodeEtcdInfo>,
+    /// A Kubernetes client created by this run, or why it couldn't be
+    new_k8s: Option<std::result::Result<Client, String>>,
+    /// PDB info (`None` if it could not be fetched)
+    pdb_info: Option<PdbHealthInfo>,
+}
+
+/// Fetch etcd quorum information for the node at `address`
+async fn fetch_etcd_info(client: &TalosClient, address: &str) -> Option<NodeEtcdInfo> {
+    let members = match tokio::time::timeout(SAFETY_CHECK_TIMEOUT, client.etcd_members()).await {
+        Ok(Ok(members)) => members,
+        Ok(Err(e)) => {
+            tracing::warn!("Failed to fetch etcd members: {}", e);
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("Timed out fetching etcd members");
+            return None;
+        }
+    };
+    let total = members.len();
+    let quorum_needed = total / 2 + 1;
+
+    // Check if this node is a member
+    let node_addr = address.split(':').next().unwrap_or(address);
+    let is_member = members
+        .iter()
+        .any(|m| m.peer_urls.iter().any(|url| url.contains(node_addr)));
+
+    // Extract control plane IPs to target status calls (hostnames may not be resolvable)
+    let cp_ips: Vec<String> = members.iter().filter_map(|m| m.ip_address()).collect();
+
+    // Get status from all control planes (single call for both is_leader and healthy)
+    let statuses =
+        tokio::time::timeout(SAFETY_CHECK_TIMEOUT, client.etcd_status_for_nodes(&cp_ips))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+
+    // Check if this node is the leader
+    let is_leader = statuses.iter().any(|s| {
+        let member = members.iter().find(|m| m.id == s.member_id);
+        if let Some(m) = member {
+            m.peer_urls.iter().any(|url| url.contains(node_addr)) && s.is_leader()
+        } else {
+            false
+        }
+    });
+
+    // Calculate members after this node goes down
+    let members_after = if is_member { total - 1 } else { total };
+    let quorum_maintained = members_after >= quorum_needed;
+
+    // Count healthy members (those with status)
+    // If no statuses returned, assume all healthy
+    let healthy = if statuses.is_empty() {
+        total
+    } else {
+        members
+            .iter()
+            .filter(|m| statuses.iter().any(|s| s.member_id == m.id))
+            .count()
+    };
+
+    Some(NodeEtcdInfo {
+        is_member,
+        is_leader,
+        total_members: total,
+        healthy_members: healthy,
+        quorum_needed,
+        members_after,
+        quorum_maintained,
+    })
+}
+
+/// Fetch PDB information, creating a Kubernetes client first when there is
+/// none yet. Returns the newly created client (or why it couldn't be) and the
+/// PDB info.
+///
+/// The kubeconfig is fetched from a control plane node (via etcd member IPs).
+/// This mirrors the diagnostics/lifecycle path and matters because the
+/// environment kubeconfig can be unusable here — kube-rs is built without the
+/// exec/oidc auth features, so an EKS/OIDC kubeconfig that `kubectl` accepts
+/// fails — whereas the Talos-served kubeconfig uses client-cert auth that
+/// always works. Without a CP target the fetch fell back to the VIP and
+/// failed, leaving no client (and a later drain/reboot reporting the generic
+/// "No K8s client available").
+async fn fetch_pdb_info(
+    client: &TalosClient,
+    k8s_client: Option<Client>,
+) -> (
+    Option<std::result::Result<Client, String>>,
+    Option<PdbHealthInfo>,
+) {
+    let (new_k8s, k8s) = match k8s_client {
+        Some(k8s) => (None, k8s),
+        None => {
+            let cp_node_ip =
+                match tokio::time::timeout(SAFETY_CHECK_TIMEOUT, client.etcd_members()).await {
+                    Ok(Ok(members)) => members.first().and_then(|m| m.ip_address()),
+                    _ => None,
+                };
+            let created = tokio::time::timeout(
+                SAFETY_CHECK_TIMEOUT,
+                create_k8s_client_with_source(client, cp_node_ip.as_deref(), None),
+            )
+            .await;
+            match created {
+                Ok(Ok((k8s, source))) => {
+                    tracing::info!("K8s client created from: {:?}", source);
+                    (Some(Ok(k8s.clone())), k8s)
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to create K8s client: {}", e);
+                    return (Some(Err(e.to_string())), None);
+                }
+                Err(_) => {
+                    let e = format!(
+                        "timed out after {}s fetching the kubeconfig",
+                        SAFETY_CHECK_TIMEOUT.as_secs()
+                    );
+                    tracing::warn!("Failed to create K8s client: {}", e);
+                    return (Some(Err(e)), None);
+                }
+            }
+        }
+    };
+
+    let pdb_info = match tokio::time::timeout(SAFETY_CHECK_TIMEOUT, check_pdb_health(&k8s)).await {
+        Ok(Ok(info)) => Some(info),
+        Ok(Err(e)) => {
+            tracing::warn!("Failed to fetch PDB info: {}", e);
+            None
+        }
+        Err(_) => {
+            tracing::warn!("Timed out fetching PDB info");
+            None
+        }
+    };
+    (new_k8s, pdb_info)
+}
+
 /// Node operations overlay component
 pub struct NodeOperationsComponent {
     /// Node hostname
@@ -507,6 +656,18 @@ pub struct NodeOperationsComponent {
 
     /// Drain options (configurable timeouts, force delete, etc.)
     drain_options: DrainOptions,
+
+    /// In-flight safety check run (see `refresh`)
+    safety_task: Option<JoinHandle<SafetyChecks>>,
+}
+
+impl Drop for NodeOperationsComponent {
+    fn drop(&mut self) {
+        // The safety checks only feed this overlay
+        if let Some(task) = self.safety_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl Default for NodeOperationsComponent {
@@ -530,6 +691,7 @@ impl NodeOperationsComponent {
             operation_task: None,
             operation_progress: Arc::new(Mutex::new(OperationProgress::default())),
             drain_options: DrainOptions::default(),
+            safety_task: None,
         }
     }
 
@@ -654,13 +816,26 @@ impl NodeOperationsComponent {
         self.operation_state = OperationState::Executing(op_type, "Starting...".to_string());
     }
 
-    /// Refresh safety check data
-    pub async fn refresh(&mut self) -> Result<()> {
+    /// Refresh safety check data.
+    ///
+    /// The checks run in a spawned task (`safety_task`), so a node or API
+    /// that stops answering never blocks the event loop; this starts one when
+    /// none is in flight and `update(Tick)` picks up the result.
+    pub fn refresh(&mut self) {
         // If we're executing, just poll the operation
         if matches!(self.operation_state, OperationState::Executing(_, _)) {
             self.poll_operation();
-            return Ok(());
+            return;
         }
+        self.poll_safety_checks();
+        if self.safety_task.is_some() {
+            return;
+        }
+
+        let Some(client) = self.client.clone() else {
+            self.state.set_error("No client configured");
+            return;
+        };
 
         self.state.start_loading();
 
@@ -669,148 +844,55 @@ impl NodeOperationsComponent {
             self.state.set_data(NodeOperationsData::default());
         }
 
-        let Some(client) = self.client.clone() else {
-            self.state.set_error("No client configured");
-            return Ok(());
-        };
-
-        // Fetch etcd info for control plane nodes
-        if self.is_controlplane {
-            self.fetch_etcd_info(&client).await;
-        } else {
+        let address = self.address.clone();
+        let is_controlplane = self.is_controlplane;
+        let k8s_client = self.k8s_client.clone();
+        self.safety_task = Some(tokio::spawn(async move {
             // Worker nodes are not etcd members
-            if let Some(data) = self.data_mut() {
-                data.etcd_info = Some(NodeEtcdInfo {
+            let etcd_info = if is_controlplane {
+                fetch_etcd_info(&client, &address).await
+            } else {
+                Some(NodeEtcdInfo {
                     is_member: false,
                     ..Default::default()
-                });
-            }
-        }
-
-        // Fetch PDB info
-        self.fetch_pdb_info(&client).await;
-
-        // Calculate overall safety status
-        self.calculate_safety_status();
-
-        self.state.mark_loaded();
-        Ok(())
-    }
-
-    /// Fetch etcd information
-    async fn fetch_etcd_info(&mut self, client: &TalosClient) {
-        // Get etcd members
-        match client.etcd_members().await {
-            Ok(members) => {
-                let total = members.len();
-                let quorum_needed = total / 2 + 1;
-
-                // Check if this node is a member
-                let node_addr = self.address.split(':').next().unwrap_or(&self.address);
-                let is_member = members
-                    .iter()
-                    .any(|m| m.peer_urls.iter().any(|url| url.contains(node_addr)));
-
-                // Extract control plane IPs to target status calls (hostnames may not be resolvable)
-                let cp_ips: Vec<String> = members.iter().filter_map(|m| m.ip_address()).collect();
-
-                // Get status from all control planes (single call for both is_leader and healthy)
-                let statuses = client
-                    .etcd_status_for_nodes(&cp_ips)
-                    .await
-                    .unwrap_or_default();
-
-                // Check if this node is the leader
-                let is_leader = statuses.iter().any(|s| {
-                    let member = members.iter().find(|m| m.id == s.member_id);
-                    if let Some(m) = member {
-                        m.peer_urls.iter().any(|url| url.contains(node_addr)) && s.is_leader()
-                    } else {
-                        false
-                    }
-                });
-
-                // Calculate members after this node goes down
-                let members_after = if is_member { total - 1 } else { total };
-                let quorum_maintained = members_after >= quorum_needed;
-
-                // Count healthy members (those with status)
-                // If no statuses returned, assume all healthy
-                let healthy = if statuses.is_empty() {
-                    total
-                } else {
-                    members
-                        .iter()
-                        .filter(|m| statuses.iter().any(|s| s.member_id == m.id))
-                        .count()
-                };
-
-                if let Some(data) = self.data_mut() {
-                    data.etcd_info = Some(NodeEtcdInfo {
-                        is_member,
-                        is_leader,
-                        total_members: total,
-                        healthy_members: healthy,
-                        quorum_needed,
-                        members_after,
-                        quorum_maintained,
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch etcd members: {}", e);
-                if let Some(data) = self.data_mut() {
-                    data.etcd_info = None;
-                }
-            }
-        }
-    }
-
-    /// Fetch PDB information
-    async fn fetch_pdb_info(&mut self, client: &TalosClient) {
-        // Initialize K8s client if needed.
-        //
-        // Target a control plane node for the kubeconfig fetch (via etcd member
-        // IPs). This mirrors the diagnostics/lifecycle path and matters because
-        // the environment kubeconfig can be unusable here — kube-rs is built
-        // without the exec/oidc auth features, so an EKS/OIDC kubeconfig that
-        // `kubectl` accepts fails — whereas the Talos-served kubeconfig uses
-        // client-cert auth that always works. Without a CP target the fetch
-        // fell back to the VIP and failed, leaving no client (and a later
-        // drain/reboot reporting the generic "No K8s client available").
-        if self.k8s_client.is_none() {
-            let cp_node_ip = match client.etcd_members().await {
-                Ok(members) => members.first().and_then(|m| m.ip_address()),
-                Err(_) => None,
+                })
             };
+            let (new_k8s, pdb_info) = fetch_pdb_info(&client, k8s_client).await;
+            SafetyChecks {
+                etcd_info,
+                new_k8s,
+                pdb_info,
+            }
+        }));
+    }
 
-            match create_k8s_client_with_source(client, cp_node_ip.as_deref(), None).await {
-                Ok((k8s, source)) => {
-                    tracing::info!("K8s client created from: {:?}", source);
-                    self.k8s_client = Some(k8s);
-                    self.k8s_error = None;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to create K8s client: {}", e);
-                    self.k8s_error = Some(e.to_string());
-                    return;
-                }
+    /// Apply finished safety checks, if any
+    fn poll_safety_checks(&mut self) {
+        use futures::FutureExt;
+
+        if !self.safety_task.as_ref().is_some_and(|t| t.is_finished()) {
+            return;
+        }
+        let Some(Some(Ok(checks))) = self.safety_task.take().map(|t| t.now_or_never()) else {
+            return;
+        };
+        match checks.new_k8s {
+            Some(Ok(k8s)) => {
+                self.k8s_client = Some(k8s);
+                self.k8s_error = None;
+            }
+            Some(Err(e)) => self.k8s_error = Some(e),
+            None => {}
+        }
+        if let Some(data) = self.data_mut() {
+            data.etcd_info = checks.etcd_info;
+            // A failed PDB query keeps the last known result
+            if checks.pdb_info.is_some() {
+                data.pdb_info = checks.pdb_info;
             }
         }
-
-        // Fetch PDB info
-        if let Some(k8s) = &self.k8s_client {
-            match check_pdb_health(k8s).await {
-                Ok(info) => {
-                    if let Some(data) = self.data_mut() {
-                        data.pdb_info = Some(info);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to fetch PDB info: {}", e);
-                }
-            }
-        }
+        self.calculate_safety_status();
+        self.state.mark_loaded();
     }
 
     /// Calculate overall safety status
@@ -1351,10 +1433,11 @@ impl Component for NodeOperationsComponent {
 
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         // Poll operation on every tick while executing
-        if matches!(action, Action::Tick)
-            && matches!(self.operation_state, OperationState::Executing(_, _))
-        {
-            self.poll_operation();
+        if matches!(action, Action::Tick) {
+            if matches!(self.operation_state, OperationState::Executing(_, _)) {
+                self.poll_operation();
+            }
+            self.poll_safety_checks();
         }
         Ok(None)
     }

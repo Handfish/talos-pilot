@@ -123,7 +123,12 @@ impl StorageComponent {
         };
 
         Self {
-            state: AsyncState::with_data(initial_data),
+            // Loading until the first (background) refresh lands
+            state: {
+                let mut state = AsyncState::with_data(initial_data);
+                state.start_loading();
+                state
+            },
             view_mode: StorageViewMode::Disks,
             disk_table_state,
             volume_table_state,
@@ -586,7 +591,12 @@ impl Component for StorageComponent {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
         // Check loading state
-        if self.state.is_loading() && !self.state.has_data() {
+        if self.state.is_loading()
+            && self
+                .state
+                .data()
+                .is_none_or(|d| d.disks.is_empty() && d.volumes.is_empty())
+        {
             let loading = Paragraph::new("Loading storage info...")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(loading, area);
